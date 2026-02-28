@@ -30,6 +30,7 @@ dependencies:
   - cryptography>=41.0.2
   - eth-account>=0.13.0
 #  - injective-py==1.12.*
+  - lighter-sdk>=2.0.0  # Required by lighter connector for order signing
   - libta-lib>=0.6.4
   - msgpack-python
   - numba>=0.61.2
