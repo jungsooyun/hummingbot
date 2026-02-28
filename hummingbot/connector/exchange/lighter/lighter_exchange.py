@@ -49,6 +49,7 @@ class LighterExchange(ExchangePyBase):
         self._account_index = int(lighter_account_index)
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
+        self._market_id_map: Dict[str, int] = {}  # exchange_symbol -> market_id
 
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         self.real_time_balance_update = False
@@ -436,6 +437,9 @@ class LighterExchange(ExchangePyBase):
             base = symbol_data["base_token"]
             quote = symbol_data["quote_token"]
             mapping[exchange_symbol] = combine_to_hb_trading_pair(base=base, quote=quote)
+            # Store market_id mapping for WS subscriptions and REST order book requests
+            if "market_id" in symbol_data:
+                self._market_id_map[exchange_symbol] = int(symbol_data["market_id"])
         self._set_trading_pair_symbol_map(mapping)
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
