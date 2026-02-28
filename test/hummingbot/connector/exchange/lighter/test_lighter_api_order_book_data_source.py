@@ -26,7 +26,7 @@ class LighterAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         cls.base_asset = "COINALPHA"
         cls.quote_asset = "HBOT"
         cls.trading_pair = f"{cls.base_asset}-{cls.quote_asset}"
-        cls.ex_trading_pair = f"{cls.base_asset}_{cls.quote_asset}"
+        cls.ex_trading_pair = f"{cls.base_asset}/{cls.quote_asset}"
         cls.market_id = 0
 
     async def asyncSetUp(self) -> None:
@@ -66,8 +66,11 @@ class LighterAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
     def _order_book_snapshot_rest_example(self):
         return {
-            "asks": [{"price": "10500.0000", "remaining_base_amount": "0.50"}],
-            "bids": [{"price": "10400.0000", "remaining_base_amount": "0.30"}],
+            "code": 200,
+            "total_asks": 1,
+            "asks": [{"price": "10500.0000", "remaining_base_amount": "0.50", "order_id": "281476452537901"}],
+            "total_bids": 1,
+            "bids": [{"price": "10400.0000", "remaining_base_amount": "0.30", "order_id": "562948495433943"}],
         }
 
     def _trade_event_ws_example(self):

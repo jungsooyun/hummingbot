@@ -198,7 +198,7 @@ class LighterExchange(ExchangePyBase):
 
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
         result = []
-        for rule in exchange_info_dict.get("orderBooks", []):
+        for rule in exchange_info_dict.get("order_books", []):
             if lighter_utils.is_exchange_information_valid(rule):
                 try:
                     trading_pair = await self.trading_pair_associated_to_exchange_symbol(rule["symbol"])
@@ -206,12 +206,14 @@ class LighterExchange(ExchangePyBase):
                     # Symbol not tracked by connector
                     continue
                 try:
+                    tick_size = Decimal(10) ** (-int(rule["supported_price_decimals"]))
+                    step_size = Decimal(10) ** (-int(rule["supported_size_decimals"]))
                     result.append(
                         TradingRule(
                             trading_pair=trading_pair,
                             min_order_size=Decimal(str(rule["min_base_amount"])),
-                            min_price_increment=Decimal(str(rule["tick_size"])),
-                            min_base_amount_increment=Decimal(str(rule["step_size"])),
+                            min_price_increment=tick_size,
+                            min_base_amount_increment=step_size,
                         )
                     )
                 except Exception:
@@ -432,10 +434,18 @@ class LighterExchange(ExchangePyBase):
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
         mapping = bidict()
-        for symbol_data in filter(lighter_utils.is_exchange_information_valid, exchange_info.get("orderBooks", [])):
+        for symbol_data in filter(lighter_utils.is_exchange_information_valid, exchange_info.get("order_books", [])):
             exchange_symbol = symbol_data["symbol"]
-            base = symbol_data["base_token"]
-            quote = symbol_data["quote_token"]
+            market_type = symbol_data.get("market_type", "")
+            if market_type == "spot" and "/" in exchange_symbol:
+                # Spot symbols use "BASE/QUOTE" format (e.g., "AAVE/USDC")
+                parts = exchange_symbol.split("/")
+                base = parts[0]
+                quote = parts[1]
+            else:
+                # Perp symbols are just the base name (e.g., "ETH"); default quote is USDC
+                base = exchange_symbol
+                quote = "USDC"
             mapping[exchange_symbol] = combine_to_hb_trading_pair(base=base, quote=quote)
             # Store market_id mapping for WS subscriptions and REST order book requests
             if "market_id" in symbol_data:
@@ -449,7 +459,12 @@ class LighterExchange(ExchangePyBase):
 
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
 
-        for detail in resp_json.get("orderBookDetails", []):
+        # Search both perp and spot detail lists
+        all_details = (
+            resp_json.get("order_book_details", [])
+            + resp_json.get("spot_order_book_details", [])
+        )
+        for detail in all_details:
             if detail.get("symbol") == symbol:
                 return float(detail["last_trade_price"])
 

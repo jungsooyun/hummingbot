@@ -49,18 +49,21 @@ class LighterExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
     @property
     def all_symbols_request_mock_response(self):
         return {
-            "orderBooks": [
+            "code": 200,
+            "order_books": [
                 {
                     "market_id": 0,
                     "symbol": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
-                    "base_token": self.base_asset,
-                    "quote_token": self.quote_asset,
+                    "market_type": "spot",
+                    "base_asset_id": 0,
+                    "quote_asset_id": 1,
                     "supported_price_decimals": 4,
                     "supported_size_decimals": 2,
-                    "tick_size": "0.0001",
-                    "step_size": "0.01",
                     "min_base_amount": "0.01",
+                    "min_quote_amount": "10.000000",
                     "status": "active",
+                    "taker_fee": "0.0000",
+                    "maker_fee": "0.0000",
                 },
             ]
         }
@@ -68,14 +71,19 @@ class LighterExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
     @property
     def latest_prices_request_mock_response(self):
         return {
-            "orderBookDetails": [
+            "code": 200,
+            "order_book_details": [],
+            "spot_order_book_details": [
                 {
                     "market_id": 0,
                     "symbol": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
-                    "last_trade_price": str(self.expected_latest_price),
-                    "daily_price_high": "10500.0000",
-                    "daily_price_low": "9500.0000",
-                    "daily_base_token_volume": "1250.50",
+                    "last_trade_price": self.expected_latest_price,
+                    "daily_price_high": 10500.0,
+                    "daily_price_low": 9500.0,
+                    "daily_base_token_volume": 1250.50,
+                    "daily_quote_token_volume": 12505000.0,
+                    "daily_trades_count": 100,
+                    "daily_price_change": 0.5,
                 },
             ]
         }
@@ -83,30 +91,35 @@ class LighterExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
     @property
     def all_symbols_including_invalid_pair_mock_response(self) -> Tuple[str, Any]:
         response = {
-            "orderBooks": [
+            "code": 200,
+            "order_books": [
                 {
                     "market_id": 0,
                     "symbol": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
-                    "base_token": self.base_asset,
-                    "quote_token": self.quote_asset,
+                    "market_type": "spot",
+                    "base_asset_id": 0,
+                    "quote_asset_id": 1,
                     "supported_price_decimals": 4,
                     "supported_size_decimals": 2,
-                    "tick_size": "0.0001",
-                    "step_size": "0.01",
                     "min_base_amount": "0.01",
+                    "min_quote_amount": "10.000000",
                     "status": "active",
+                    "taker_fee": "0.0000",
+                    "maker_fee": "0.0000",
                 },
                 {
                     "market_id": 1,
                     "symbol": self.exchange_symbol_for_tokens("INVALID", "PAIR"),
-                    "base_token": "INVALID",
-                    "quote_token": "PAIR",
+                    "market_type": "spot",
+                    "base_asset_id": 2,
+                    "quote_asset_id": 3,
                     "supported_price_decimals": 4,
                     "supported_size_decimals": 2,
-                    "tick_size": "0.0001",
-                    "step_size": "0.01",
                     "min_base_amount": "0.01",
+                    "min_quote_amount": "10.000000",
                     "status": "inactive",
+                    "taker_fee": "0.0000",
+                    "maker_fee": "0.0000",
                 },
             ]
         }
@@ -115,18 +128,21 @@ class LighterExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
     @property
     def network_status_request_successful_mock_response(self):
         return {
-            "orderBooks": [
+            "code": 200,
+            "order_books": [
                 {
                     "market_id": 0,
-                    "symbol": "ETH_USDC",
-                    "base_token": "ETH",
-                    "quote_token": "USDC",
-                    "supported_price_decimals": 4,
-                    "supported_size_decimals": 2,
-                    "tick_size": "0.01",
-                    "step_size": "0.01",
-                    "min_base_amount": "0.01",
+                    "symbol": "ETH",
+                    "market_type": "perp",
+                    "base_asset_id": 0,
+                    "quote_asset_id": 0,
+                    "supported_price_decimals": 2,
+                    "supported_size_decimals": 4,
+                    "min_base_amount": "0.0050",
+                    "min_quote_amount": "10.000000",
                     "status": "active",
+                    "taker_fee": "0.0000",
+                    "maker_fee": "0.0000",
                 },
             ]
         }
@@ -134,18 +150,21 @@ class LighterExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
     @property
     def trading_rules_request_mock_response(self):
         return {
-            "orderBooks": [
+            "code": 200,
+            "order_books": [
                 {
                     "market_id": 0,
                     "symbol": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
-                    "base_token": self.base_asset,
-                    "quote_token": self.quote_asset,
+                    "market_type": "spot",
+                    "base_asset_id": 0,
+                    "quote_asset_id": 1,
                     "supported_price_decimals": 4,
                     "supported_size_decimals": 2,
-                    "tick_size": "0.0001",
-                    "step_size": "0.01",
                     "min_base_amount": "0.01",
+                    "min_quote_amount": "10.000000",
                     "status": "active",
+                    "taker_fee": "0.0000",
+                    "maker_fee": "0.0000",
                 },
             ]
         }
@@ -153,12 +172,12 @@ class LighterExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
     @property
     def trading_rules_request_erroneous_mock_response(self):
         return {
-            "orderBooks": [
+            "code": 200,
+            "order_books": [
                 {
                     "market_id": 0,
                     "symbol": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
-                    "base_token": self.base_asset,
-                    "quote_token": self.quote_asset,
+                    "market_type": "spot",
                     "status": "active",
                 },
             ]
@@ -237,22 +256,19 @@ class LighterExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
 
     @property
     def expected_trading_rule(self):
+        rule = self.trading_rules_request_mock_response["order_books"][0]
+        tick_size = Decimal(10) ** (-int(rule["supported_price_decimals"]))
+        step_size = Decimal(10) ** (-int(rule["supported_size_decimals"]))
         return TradingRule(
             trading_pair=self.trading_pair,
-            min_order_size=Decimal(
-                self.trading_rules_request_mock_response["orderBooks"][0]["min_base_amount"]
-            ),
-            min_price_increment=Decimal(
-                self.trading_rules_request_mock_response["orderBooks"][0]["tick_size"]
-            ),
-            min_base_amount_increment=Decimal(
-                self.trading_rules_request_mock_response["orderBooks"][0]["step_size"]
-            ),
+            min_order_size=Decimal(rule["min_base_amount"]),
+            min_price_increment=tick_size,
+            min_base_amount_increment=step_size,
         )
 
     @property
     def expected_logged_error_for_erroneous_trading_rule(self):
-        erroneous_rule = self.trading_rules_request_erroneous_mock_response["orderBooks"][0]
+        erroneous_rule = self.trading_rules_request_erroneous_mock_response["order_books"][0]
         return f"Error parsing the trading pair rule {erroneous_rule}. Skipping."
 
     @property
@@ -287,7 +303,7 @@ class LighterExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
         return "30000"
 
     def exchange_symbol_for_tokens(self, base_token: str, quote_token: str) -> str:
-        return f"{base_token}_{quote_token}"
+        return f"{base_token}/{quote_token}"
 
     def create_exchange_instance(self):
         return LighterExchange(
