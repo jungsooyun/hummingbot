@@ -432,6 +432,10 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
     ) -> str:
         url = web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH)
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        # KIS uses the same endpoint for fills and status. Add an empty fill
+        # response first (consumed by _all_trade_updates_for_order), then the
+        # actual status response (consumed by _request_order_status).
+        mock_api.get(regex_url, body=json.dumps(self._empty_fill_mock_response()))
         response = self._order_status_request_canceled_mock_response(order=order)
         mock_api.get(regex_url, body=json.dumps(response), callback=callback)
         return url
@@ -444,6 +448,8 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
     ) -> str:
         url = web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH)
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        # Add empty fill response for _all_trade_updates_for_order
+        mock_api.get(regex_url, body=json.dumps(self._empty_fill_mock_response()))
         response = self._order_status_request_open_mock_response(order=order)
         mock_api.get(regex_url, body=json.dumps(response), callback=callback)
         return url
@@ -456,6 +462,8 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
     ) -> str:
         url = web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH)
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        # Add empty fill response for _all_trade_updates_for_order
+        mock_api.get(regex_url, body=json.dumps(self._empty_fill_mock_response()))
         mock_api.get(regex_url, status=401, callback=callback)
         return url
 
@@ -702,6 +710,16 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                     "clientOrderId": order.client_order_id,
                 }
             ]
+        }
+
+    @staticmethod
+    def _empty_fill_mock_response() -> dict:
+        """Return an empty fill list response consumed by _all_trade_updates_for_order."""
+        return {
+            "rt_cd": "0",
+            "msg_cd": "MCA00000",
+            "msg1": "\uc815\uc0c1\ucc98\ub9ac \ub418\uc5c8\uc2b5\ub2c8\ub2e4.",
+            "output": []
         }
 
     def _order_fills_request_partial_fill_mock_response(self, order: InFlightOrder) -> Any:

@@ -94,27 +94,41 @@ class KisMarketType:
 RATE_LIMITS = [
     # Token refresh (conservative)
     RateLimit(limit_id=TOKEN_PATH_URL, limit=1, time_interval=60),
-    # Domestic Stock
+    # Domestic Stock — by TR_ID
     RateLimit(limit_id=DOMESTIC_STOCK_TICKER_TR_ID, limit=20, time_interval=1),
     RateLimit(limit_id=DOMESTIC_STOCK_ORDERBOOK_TR_ID, limit=20, time_interval=1),
-    # Domestic Futures/Options
+    # Domestic Futures/Options — by TR_ID
     RateLimit(limit_id=DOMESTIC_FUTURES_TICKER_TR_ID, limit=20, time_interval=1),
     RateLimit(limit_id=DOMESTIC_FUTURES_ORDERBOOK_TR_ID, limit=20, time_interval=1),
-    # Overseas Stock
+    # Overseas Stock — by TR_ID
     RateLimit(limit_id=OVERSEAS_STOCK_TICKER_TR_ID, limit=20, time_interval=1),
     RateLimit(limit_id=OVERSEAS_STOCK_ORDERBOOK_TR_ID, limit=20, time_interval=1),
-    # Overseas Futures
+    # Overseas Futures — by TR_ID
     RateLimit(limit_id=OVERSEAS_FUTURES_TICKER_TR_ID, limit=20, time_interval=1),
     RateLimit(limit_id=OVERSEAS_FUTURES_ORDERBOOK_TR_ID, limit=20, time_interval=1),
-    # Overseas Options
+    # Overseas Options — by TR_ID
     RateLimit(limit_id=OVERSEAS_OPTIONS_TICKER_TR_ID, limit=20, time_interval=1),
     RateLimit(limit_id=OVERSEAS_OPTIONS_ORDERBOOK_TR_ID, limit=20, time_interval=1),
-    # Domestic Stock Trading
+    # Domestic Stock Trading — by TR_ID
     RateLimit(limit_id=DOMESTIC_STOCK_ORDER_BUY_TR_ID, limit=5, time_interval=1),
     RateLimit(limit_id=DOMESTIC_STOCK_ORDER_SELL_TR_ID, limit=5, time_interval=1),
     RateLimit(limit_id=DOMESTIC_STOCK_CANCEL_TR_ID, limit=5, time_interval=1),
     RateLimit(limit_id=DOMESTIC_STOCK_BALANCE_TR_ID, limit=10, time_interval=1),
     RateLimit(limit_id=DOMESTIC_STOCK_ORDER_DETAIL_TR_ID, limit=10, time_interval=1),
+    # Path-based rate limits (used by ExchangePyBase._api_request as default limit_id)
+    RateLimit(limit_id=DOMESTIC_STOCK_TICKER_PATH, limit=20, time_interval=1),
+    RateLimit(limit_id=DOMESTIC_STOCK_ORDERBOOK_PATH, limit=20, time_interval=1),
+    RateLimit(limit_id=DOMESTIC_FUTURES_TICKER_PATH, limit=20, time_interval=1),
+    RateLimit(limit_id=DOMESTIC_FUTURES_ORDERBOOK_PATH, limit=20, time_interval=1),
+    RateLimit(limit_id=OVERSEAS_STOCK_TICKER_PATH, limit=20, time_interval=1),
+    RateLimit(limit_id=OVERSEAS_STOCK_ORDERBOOK_PATH, limit=20, time_interval=1),
+    RateLimit(limit_id=OVERSEAS_FUTURES_TICKER_PATH, limit=20, time_interval=1),
+    RateLimit(limit_id=OVERSEAS_FUTURES_ORDERBOOK_PATH, limit=20, time_interval=1),
+    RateLimit(limit_id=OVERSEAS_OPTIONS_TICKER_PATH, limit=20, time_interval=1),
+    RateLimit(limit_id=OVERSEAS_OPTIONS_ORDERBOOK_PATH, limit=20, time_interval=1),
+    RateLimit(limit_id=DOMESTIC_STOCK_ORDER_PATH, limit=5, time_interval=1),
+    RateLimit(limit_id=DOMESTIC_STOCK_BALANCE_PATH, limit=10, time_interval=1),
+    RateLimit(limit_id=DOMESTIC_STOCK_ORDER_DETAIL_PATH, limit=10, time_interval=1),
 ]
 
 # --------------------------------------------------------------------------- #

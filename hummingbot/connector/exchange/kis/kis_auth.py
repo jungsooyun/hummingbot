@@ -35,14 +35,16 @@ class KisAuth(AuthBase):
     endpoint and is added by the exchange class on a per-request basis.
     """
 
-    def __init__(self, app_key: str, app_secret: str, sandbox: bool = False):
+    def __init__(self, app_key: str, app_secret: str, sandbox: bool = False,
+                 initial_token: Optional[str] = None):
         self._app_key = app_key
         self._app_secret = app_secret
         self._sandbox = sandbox
 
         # Token cache
-        self._access_token: Optional[str] = None
-        self._token_expires_at: float = 0.0
+        self._access_token: Optional[str] = initial_token
+        # If an initial token is provided, set a far-future expiry
+        self._token_expires_at: float = (time.time() + 86400) if initial_token else 0.0
 
     # ------------------------------------------------------------------
     # Public properties
