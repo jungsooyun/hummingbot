@@ -89,8 +89,15 @@ class XEMMExecutor(ExecutorBase):
 
         taker_connector = strategy.connectors[self.taker_connector]
         if not self.is_amm_connector(exchange=self.taker_connector):
-            if OrderType.MARKET not in taker_connector.supported_order_types():
-                raise ValueError(f"{self.taker_connector} does not support market orders.")
+            supported_taker_order_types = taker_connector.supported_order_types()
+            if self.config.taker_order_type not in supported_taker_order_types:
+                raise ValueError(
+                    f"{self.taker_connector} does not support {self.config.taker_order_type.name} orders."
+                )
+            if self.config.taker_fallback_to_market and OrderType.MARKET not in supported_taker_order_types:
+                raise ValueError(
+                    f"{self.taker_connector} does not support MARKET orders required by taker_fallback_to_market."
+                )
         self._taker_result_price = Decimal("1")
         self._maker_target_price = Decimal("1")
         self._tx_cost = Decimal("1")
@@ -100,7 +107,8 @@ class XEMMExecutor(ExecutorBase):
         self.taker_order = None
         self.failed_orders = []
         self._current_retries = 0
-        self._max_retries = max_retries
+        self._max_retries = config.taker_max_retries if config.taker_max_retries is not None else max_retries
+        self._force_market_taker = False
         super().__init__(strategy=strategy,
                          connectors=[config.buying_market.connector_name, config.selling_market.connector_name],
                          config=config, update_interval=update_interval)
@@ -118,7 +126,7 @@ class XEMMExecutor(ExecutorBase):
         taker_order_candidate = OrderCandidate(
             trading_pair=self.taker_trading_pair,
             is_maker=False,
-            order_type=OrderType.MARKET,
+            order_type=self._effective_taker_order_type(),
             order_side=self.taker_order_side,
             amount=self.config.order_amount,
             price=mid_price,)
@@ -164,7 +172,7 @@ class XEMMExecutor(ExecutorBase):
         taker_fee_task = asyncio.create_task(self.get_tx_cost_in_asset(
             exchange=self.taker_connector,
             trading_pair=self.taker_trading_pair,
-            order_type=OrderType.MARKET,
+            order_type=self._effective_taker_order_type(),
             is_buy=self.taker_order_side == TradeType.BUY,
             order_amount=self.config.order_amount,
             asset=base_without_wrapped
@@ -226,7 +234,28 @@ class XEMMExecutor(ExecutorBase):
         self.logger().info(f"Created maker order {order_id} at price {self._maker_target_price}.")
 
     async def control_shutdown_process(self):
-        if self.maker_order.is_done and self.taker_order.is_done:
+        if self._should_refresh_taker_limit_order():
+            if self.taker_order and self.taker_order.order and self.taker_order.order.is_open:
+                self._strategy.cancel(self.taker_connector, self.taker_trading_pair, self.taker_order.order_id)
+            self._current_retries += 1
+            if self._current_retries > self._max_retries:
+                if self.config.taker_fallback_to_market and not self._force_market_taker:
+                    self.logger().warning(
+                        f"Taker {self.config.taker_order_type.name} retries exceeded. Fallback to MARKET for {self.taker_connector}."
+                    )
+                    self._force_market_taker = True
+                    self._current_retries = 0
+                else:
+                    self.close_type = CloseType.FAILED
+                    self.logger().error("Taker order retries exceeded while already using MARKET. Stopping executor.")
+                    self.stop()
+                    return
+            self.place_taker_order()
+            return
+
+        maker_done = self.maker_order is not None and self.maker_order.is_done
+        taker_done = self.taker_order is not None and self.taker_order.is_done
+        if maker_done and taker_done:
             self.logger().info("Both orders are done, executor terminated.")
             self.stop()
 
@@ -283,12 +312,17 @@ class XEMMExecutor(ExecutorBase):
             self._status = RunnableStatus.SHUTTING_DOWN
 
     def place_taker_order(self):
+        taker_order_type = self._effective_taker_order_type()
+        taker_price = Decimal("NaN")
+        if taker_order_type == OrderType.LIMIT:
+            taker_price = self._get_taker_limit_price(self.config.order_amount)
         taker_order_id = self.place_order(
             connector_name=self.taker_connector,
             trading_pair=self.taker_trading_pair,
-            order_type=OrderType.MARKET,
+            order_type=taker_order_type,
             side=self.taker_order_side,
-            amount=self.config.order_amount)
+            amount=self.config.order_amount,
+            price=taker_price)
         self.taker_order = TrackedOrder(order_id=taker_order_id)
 
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
@@ -299,6 +333,18 @@ class XEMMExecutor(ExecutorBase):
         elif self.taker_order and self.taker_order.order_id == event.order_id:
             self.failed_orders.append(self.taker_order)
             self._current_retries += 1
+            if self._current_retries > self._max_retries:
+                if self.config.taker_fallback_to_market and not self._force_market_taker:
+                    self.logger().warning(
+                        f"Taker {self.config.taker_order_type.name} failed repeatedly. Fallback to MARKET."
+                    )
+                    self._force_market_taker = True
+                    self._current_retries = 0
+                else:
+                    self.close_type = CloseType.FAILED
+                    self.logger().error("Taker order retries exceeded while using MARKET. Stopping executor.")
+                    self.stop()
+                    return
             self.place_taker_order()
 
     def get_custom_info(self) -> Dict:
@@ -320,6 +366,12 @@ class XEMMExecutor(ExecutorBase):
             "maker_target_price": self._maker_target_price,
             "net_profitability": self._current_trade_profitability - self._tx_cost_pct,
             "order_amount": self.config.order_amount,
+            "taker_order_type": self._effective_taker_order_type().name,
+            "taker_slippage_buffer_bps": self.config.taker_slippage_buffer_bps,
+            "taker_order_max_age_seconds": self.config.taker_order_max_age_seconds,
+            "taker_max_retries": self._max_retries,
+            "taker_retries": self._current_retries,
+            "taker_fallback_to_market": self.config.taker_fallback_to_market,
         }
 
     def early_stop(self, keep_position: bool = False):
@@ -367,8 +419,38 @@ class XEMMExecutor(ExecutorBase):
 Maker Side: {self.maker_order_side}
 -----------------------------------------------------------------------------------------------------------------------
     - Maker: {self.maker_connector} {self.maker_trading_pair} | Taker: {self.taker_connector} {self.taker_trading_pair}
+    - Taker order type: {self._effective_taker_order_type().name} | Slippage buffer (bps): {self.config.taker_slippage_buffer_bps} | Taker retries: {self._current_retries}/{self._max_retries}
+    - Taker fallback to market: {self.config.taker_fallback_to_market}
     - Min profitability: {self.config.min_profitability * 100:.2f}% | Target profitability: {self.config.target_profitability * 100:.2f}% | Max profitability: {self.config.max_profitability * 100:.2f}% | Current profitability: {(self._current_trade_profitability - self._tx_cost_pct) * 100:.2f}%
     - Trade profitability: {self._current_trade_profitability * 100:.2f}% | Tx cost: {self._tx_cost_pct * 100:.2f}%
     - Taker result price: {self._taker_result_price:.3f} | Tx cost: {self._tx_cost:.3f} {self.maker_trading_pair.split('-')[-1]} | Order amount (Base): {self.config.order_amount:.2f}
 -----------------------------------------------------------------------------------------------------------------------
 """
+
+    def _effective_taker_order_type(self) -> OrderType:
+        return OrderType.MARKET if self._force_market_taker else self.config.taker_order_type
+
+    def _get_taker_limit_price(self, amount: Decimal) -> Decimal:
+        price_result = self.connectors[self.taker_connector].get_price_for_volume(
+            self.taker_trading_pair,
+            self.taker_order_side == TradeType.BUY,
+            amount,
+        )
+        reference_price = price_result.result_price if price_result.result_price is not None else self._taker_result_price
+        slippage_multiplier = self.config.taker_slippage_buffer_bps / Decimal("10000")
+        if self.taker_order_side == TradeType.BUY:
+            limit_price = reference_price * (Decimal("1") + slippage_multiplier)
+        else:
+            limit_price = reference_price * (Decimal("1") - slippage_multiplier)
+        return self.connectors[self.taker_connector].quantize_order_price(self.taker_trading_pair, limit_price)
+
+    def _should_refresh_taker_limit_order(self) -> bool:
+        if self._effective_taker_order_type() != OrderType.LIMIT:
+            return False
+        if self.taker_order is None or self.taker_order.order is None:
+            return False
+        taker_in_flight_order = self.taker_order.order
+        if not taker_in_flight_order.is_open:
+            return False
+        order_age = self._strategy.current_timestamp - taker_in_flight_order.creation_timestamp
+        return order_age >= self.config.taker_order_max_age_seconds

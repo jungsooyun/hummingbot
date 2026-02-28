@@ -9,7 +9,7 @@ from typing import List
 
 from pydantic import Field
 
-from hummingbot.core.data_type.common import MarketDict, TradeType
+from hummingbot.core.data_type.common import MarketDict, PriceType, TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
@@ -80,7 +80,21 @@ class KrnXemmController(ControllerBase):
             trading_pair=self.config.taker_trading_pair,
         )
 
+        mid_price = self.market_data_provider.get_price_by_type(
+            self.config.maker_connector,
+            self.config.maker_trading_pair,
+            PriceType.MidPrice,
+        )
+        if mid_price is None or mid_price <= Decimal("0"):
+            return actions
         half_quote = self.config.total_amount_quote / Decimal("2")
+        order_amount = self.market_data_provider.quantize_order_amount(
+            self.config.maker_connector,
+            self.config.maker_trading_pair,
+            half_quote / mid_price,
+        )
+        if order_amount <= Decimal("0"):
+            return actions
 
         # Buy side: maker buys, taker sells (hedge)
         if len(active_buys) < self.config.max_executors_per_side:
@@ -90,7 +104,7 @@ class KrnXemmController(ControllerBase):
                     buying_market=maker,
                     selling_market=taker,
                     maker_side=TradeType.BUY,
-                    order_amount=half_quote,
+                    order_amount=order_amount,
                     min_profitability=self.config.min_profitability,
                     target_profitability=self.config.target_profitability,
                     max_profitability=self.config.max_profitability,
@@ -107,7 +121,7 @@ class KrnXemmController(ControllerBase):
                     buying_market=taker,
                     selling_market=maker,
                     maker_side=TradeType.SELL,
-                    order_amount=half_quote,
+                    order_amount=order_amount,
                     min_profitability=self.config.min_profitability,
                     target_profitability=self.config.target_profitability,
                     max_profitability=self.config.max_profitability,

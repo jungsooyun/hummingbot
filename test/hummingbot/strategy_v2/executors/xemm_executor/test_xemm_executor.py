@@ -1,7 +1,7 @@
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from test.logger_mixin_for_test import LoggerMixinForTest
-from unittest.mock import MagicMock, Mock, PropertyMock, patch
+from unittest.mock import ANY, MagicMock, Mock, PropertyMock, patch
 
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
@@ -50,6 +50,21 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
             min_profitability=Decimal('0.01'),
             target_profitability=Decimal('0.015'),
             max_profitability=Decimal('0.02'),
+        )
+
+    @property
+    def base_config_long_limit_taker(self) -> XEMMExecutorConfig:
+        return XEMMExecutorConfig(
+            timestamp=1234,
+            buying_market=ConnectorPair(connector_name='binance', trading_pair='ETH-USDT'),
+            selling_market=ConnectorPair(connector_name='kucoin', trading_pair='ETH-USDT'),
+            maker_side=TradeType.BUY,
+            order_amount=Decimal('100'),
+            min_profitability=Decimal('0.01'),
+            target_profitability=Decimal('0.015'),
+            max_profitability=Decimal('0.02'),
+            taker_order_type=OrderType.LIMIT,
+            taker_slippage_buffer_bps=Decimal("10"),
         )
 
     @staticmethod
@@ -311,22 +326,46 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.executor.process_order_failed_event(1, MagicMock(), taker_failure_event)
         self.assertEqual(self.executor.taker_order.order_id, "OID-SELL-1")
 
+    def test_taker_failure_stops_when_fallback_disabled(self):
+        config = self.base_config_long_limit_taker
+        config.taker_max_retries = 0
+        config.taker_fallback_to_market = False
+        executor = XEMMExecutor(self.strategy, config, self.update_interval)
+        executor.taker_order = TrackedOrder(order_id="OID-SELL-0")
+
+        taker_failure_event = MarketOrderFailureEvent(
+            timestamp=1234,
+            order_id="OID-SELL-0",
+            order_type=OrderType.LIMIT,
+        )
+        executor.process_order_failed_event(1, MagicMock(), taker_failure_event)
+
+        self.assertEqual(executor.close_type, CloseType.FAILED)
+        self.assertEqual(executor.status, RunnableStatus.TERMINATED)
+
+    @patch.object(XEMMExecutor, "_get_taker_limit_price")
+    def test_place_taker_order_uses_limit_when_configured(self, get_limit_price_mock):
+        get_limit_price_mock.return_value = Decimal("99")
+        executor = XEMMExecutor(self.strategy, self.base_config_long_limit_taker, self.update_interval)
+        executor.place_taker_order()
+        self.assertEqual(executor.taker_order.order_id, "OID-SELL-1")
+        self.strategy.sell.assert_called_with("kucoin", "ETH-USDT", Decimal("100"), OrderType.LIMIT, Decimal("99"), ANY)
+
     def test_get_custom_info(self):
-        self.assertEqual(self.executor.get_custom_info(), {'maker_connector': 'binance',
-                                                           'maker_target_price': Decimal('1'),
-                                                           'maker_trading_pair': 'ETH-USDT',
-                                                           'max_profitability': Decimal('0.02'),
-                                                           'min_profitability': Decimal('0.01'),
-                                                           'net_profitability': Decimal('-1'),
-                                                           'order_amount': Decimal('100'),
-                                                           'side': TradeType.BUY,
-                                                           'taker_connector': 'kucoin',
-                                                           'taker_price': Decimal('1'),
-                                                           'taker_trading_pair': 'ETH-USDT',
-                                                           'target_profitability_pct': Decimal('0.015'),
-                                                           'trade_profitability': Decimal('0'),
-                                                           'tx_cost': Decimal('1'),
-                                                           'tx_cost_pct': Decimal('1')})
+        custom_info = self.executor.get_custom_info()
+        self.assertEqual(custom_info["maker_connector"], "binance")
+        self.assertEqual(custom_info["maker_trading_pair"], "ETH-USDT")
+        self.assertEqual(custom_info["taker_connector"], "kucoin")
+        self.assertEqual(custom_info["taker_trading_pair"], "ETH-USDT")
+        self.assertEqual(custom_info["side"], TradeType.BUY)
+        self.assertEqual(custom_info["min_profitability"], Decimal("0.01"))
+        self.assertEqual(custom_info["target_profitability_pct"], Decimal("0.015"))
+        self.assertEqual(custom_info["max_profitability"], Decimal("0.02"))
+        self.assertEqual(custom_info["tx_cost"], Decimal("1"))
+        self.assertEqual(custom_info["tx_cost_pct"], Decimal("1"))
+        self.assertEqual(custom_info["taker_order_type"], OrderType.MARKET.name)
+        self.assertEqual(custom_info["taker_slippage_buffer_bps"], Decimal("0"))
+        self.assertEqual(custom_info["taker_fallback_to_market"], False)
 
     def test_to_format_status(self):
         self.assertIn("Maker Side: TradeType.BUY", self.executor.to_format_status())

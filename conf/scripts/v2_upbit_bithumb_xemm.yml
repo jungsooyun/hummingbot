@@ -1,0 +1,10 @@
+# Strategy entry: scripts/v2_with_controllers.py
+script_file_name: v2_with_controllers.py
+
+markets: "bithumb.BTC-KRW,XRP-KRW:upbit.BTC-KRW,XRP-KRW"
+candles_config: ""
+controllers_config: "upbit_bithumb_xemm_btc.yml,upbit_bithumb_xemm_xrp.yml"
+
+# optional risk guardrails
+max_global_drawdown_quote: null
+max_controller_drawdown_quote: null

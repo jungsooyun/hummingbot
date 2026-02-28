@@ -1,0 +1,33 @@
+# Upbit/Bithumb XEMM (BTC-KRW)
+controller_type: generic
+controller_name: upbit_bithumb_xemm_controller
+
+# per-pair quote budget
+# (buy/sell 각 50%로 분할)
+total_amount_quote: "300000"
+
+maker_connector: bithumb
+maker_trading_pair: BTC-KRW
+taker_connector: upbit
+taker_trading_pair: BTC-KRW
+
+# 가까운 호가(작은 weight), 먼 호가(큰 weight)
+buy_levels_targets_amount: "0.0008,1-0.0015,2-0.0025,4"
+sell_levels_targets_amount: "0.0008,1-0.0015,2-0.0025,4"
+
+min_profitability_delta: "0.0004"
+max_profitability_delta: "0.006"
+
+max_executors_per_side: 3
+delay_between_creations: 2
+
+# maker(빗썸)-taker(업비트) 베이스 불균형 허용치
+inventory_target_base: "0"
+max_inventory_skew_base: "0.02"
+
+# taker는 기본 LIMIT (슬리피지 보호)
+taker_order_type: LIMIT
+taker_slippage_buffer_bps: "8"
+taker_order_max_age_seconds: 4
+taker_max_retries: 3
+taker_fallback_to_market: false

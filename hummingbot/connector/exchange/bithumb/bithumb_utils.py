@@ -11,8 +11,8 @@ CENTRALIZED = True
 EXAMPLE_PAIR = "BTC-KRW"
 
 DEFAULT_FEES = TradeFeeSchema(
-    maker_percent_fee_decimal=Decimal("0.0004"),
-    taker_percent_fee_decimal=Decimal("0.0004"),
+    maker_percent_fee_decimal=Decimal("0.00025"),
+    taker_percent_fee_decimal=Decimal("0.0003"),
 )
 
 

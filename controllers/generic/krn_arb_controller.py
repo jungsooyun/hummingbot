@@ -110,7 +110,7 @@ class KrnArbController(ControllerBase):
         rate = self.market_data_provider.get_rate(
             f"{self.base_asset}-{self.config.quote_conversion_asset}"
         )
-        if rate == Decimal("0"):
+        if rate is None or rate <= Decimal("0"):
             return None
         amount = self.market_data_provider.quantize_order_amount(
             buying.connector_name,

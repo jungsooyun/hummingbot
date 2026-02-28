@@ -1,0 +1,28 @@
+# Upbit/Bithumb XEMM (XRP-KRW)
+controller_type: generic
+controller_name: upbit_bithumb_xemm_controller
+
+total_amount_quote: "200000"
+
+maker_connector: bithumb
+maker_trading_pair: XRP-KRW
+taker_connector: upbit
+taker_trading_pair: XRP-KRW
+
+buy_levels_targets_amount: "0.0010,1-0.0018,2-0.0028,4"
+sell_levels_targets_amount: "0.0010,1-0.0018,2-0.0028,4"
+
+min_profitability_delta: "0.0005"
+max_profitability_delta: "0.007"
+
+max_executors_per_side: 3
+delay_between_creations: 2
+
+inventory_target_base: "0"
+max_inventory_skew_base: "400"
+
+taker_order_type: LIMIT
+taker_slippage_buffer_bps: "10"
+taker_order_max_age_seconds: 4
+taker_max_retries: 3
+taker_fallback_to_market: false
