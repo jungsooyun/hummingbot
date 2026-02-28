@@ -1,0 +1,15 @@
+# hummingbot/conf/controllers/krn_arb_controller.yml
+controller_type: generic
+controller_name: krn_arb_controller
+total_amount_quote: "100"
+global_exchange:
+  connector_name: binance
+  trading_pair: BTC-USDT
+krn_exchange:
+  connector_name: upbit
+  trading_pair: BTC-KRW
+min_profitability: "0.005"
+max_executors_imbalance: 1
+delay_between_executors: 10
+rate_connector: binance
+quote_conversion_asset: USDT

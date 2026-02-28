@@ -1,0 +1,12 @@
+# hummingbot/conf/controllers/krn_xemm_controller.yml
+controller_type: generic
+controller_name: krn_xemm_controller
+total_amount_quote: "100"
+maker_connector: upbit
+maker_trading_pair: BTC-KRW
+taker_connector: binance
+taker_trading_pair: BTC-USDT
+min_profitability: "0.002"
+target_profitability: "0.005"
+max_profitability: "0.01"
+max_executors_per_side: 1
