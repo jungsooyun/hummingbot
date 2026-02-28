@@ -67,6 +67,8 @@ DOMESTIC_STOCK_ORDER_SELL_TR_ID = "TTTC0801U"
 DOMESTIC_STOCK_CANCEL_TR_ID = "TTTC0803U"
 DOMESTIC_STOCK_BALANCE_PATH = "uapi/domestic-stock/v1/trading/inquire-balance"
 DOMESTIC_STOCK_BALANCE_TR_ID = "TTTC8434R"
+DOMESTIC_STOCK_ORDER_DETAIL_PATH = "uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+DOMESTIC_STOCK_ORDER_DETAIL_TR_ID = "TTTC8001R"
 
 # --------------------------------------------------------------------------- #
 # Network check — reuse token endpoint for lightweight ping
@@ -112,6 +114,7 @@ RATE_LIMITS = [
     RateLimit(limit_id=DOMESTIC_STOCK_ORDER_SELL_TR_ID, limit=5, time_interval=1),
     RateLimit(limit_id=DOMESTIC_STOCK_CANCEL_TR_ID, limit=5, time_interval=1),
     RateLimit(limit_id=DOMESTIC_STOCK_BALANCE_TR_ID, limit=10, time_interval=1),
+    RateLimit(limit_id=DOMESTIC_STOCK_ORDER_DETAIL_TR_ID, limit=10, time_interval=1),
 ]
 
 # --------------------------------------------------------------------------- #
