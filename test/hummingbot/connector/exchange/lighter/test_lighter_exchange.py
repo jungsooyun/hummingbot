@@ -257,7 +257,7 @@ class LighterExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
 
     @property
     def expected_exchange_order_id(self):
-        return "0x1234abcd"
+        return "305441741"
 
     @property
     def is_order_fill_http_update_included_in_status_update(self) -> bool:
