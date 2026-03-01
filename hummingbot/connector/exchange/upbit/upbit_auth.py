@@ -1,4 +1,5 @@
 import hashlib
+import json
 import time
 import uuid
 from typing import Any, Dict, Optional
@@ -55,9 +56,24 @@ class UpbitAuth(AuthBase):
         if request.data:
             data: Any = request.data
             if isinstance(data, bytes):
-                parts.append(data.decode("utf-8"))
+                data = data.decode("utf-8")
+                try:
+                    parsed = json.loads(data)
+                    if isinstance(parsed, dict):
+                        parts.append(cls._encode_params(parsed))
+                    else:
+                        parts.append(data)
+                except Exception:
+                    parts.append(data)
             elif isinstance(data, str):
-                parts.append(data)
+                try:
+                    parsed = json.loads(data)
+                    if isinstance(parsed, dict):
+                        parts.append(cls._encode_params(parsed))
+                    else:
+                        parts.append(data)
+                except Exception:
+                    parts.append(data)
             elif isinstance(data, dict):
                 parts.append(cls._encode_params(data))
 

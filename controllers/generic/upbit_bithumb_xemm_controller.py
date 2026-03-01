@@ -229,6 +229,7 @@ class UpbitBithumbXemmController(ControllerBase):
 
         side_budget_quote = self.config.total_amount_quote / Decimal("2")
         actions: List[ExecutorAction] = []
+        controller_id = self._controller_id()
 
         for target_profitability, weight in levels:
             if remaining_slots <= 0:
@@ -265,9 +266,9 @@ class UpbitBithumbXemmController(ControllerBase):
                     taker_order_max_age_seconds=self.config.taker_order_max_age_seconds,
                     taker_max_retries=self.config.taker_max_retries,
                     taker_fallback_to_market=self.config.taker_fallback_to_market,
-                    controller_id=self.config.id,
+                    controller_id=controller_id,
                 ),
-                controller_id=self.config.id,
+                controller_id=controller_id,
             )
             actions.append(action)
             remaining_slots -= 1
@@ -283,6 +284,9 @@ class UpbitBithumbXemmController(ControllerBase):
         if side == TradeType.BUY:
             return maker, taker
         return taker, maker
+
+    def _controller_id(self) -> str:
+        return self.config.id or self.config.controller_name or "main"
 
     def _inventory_delta(self) -> Decimal:
         base_asset, _ = split_hb_trading_pair(self.config.maker_trading_pair)
