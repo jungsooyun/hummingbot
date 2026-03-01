@@ -1,0 +1,30 @@
+# Upbit/Bithumb XEMM (USDT-KRW)
+controller_type: generic
+controller_name: upbit_bithumb_xemm_controller
+
+# 소액 테스트
+total_amount_quote: "150000"
+
+maker_connector: bithumb
+maker_trading_pair: USDT-KRW
+taker_connector: upbit
+taker_trading_pair: USDT-KRW
+
+# USDT는 거의 본전 레벨까지 허용 (수수료/슬리피지 주의)
+buy_levels_targets_amount: "0.0001,1-0.00025,2-0.00045,3"
+sell_levels_targets_amount: "0.0001,1-0.00025,2-0.00045,3"
+
+min_profitability_delta: "0.00015"
+max_profitability_delta: "0.003"
+
+max_executors_per_side: 1
+delay_between_creations: 2
+
+inventory_target_base: "0"
+max_inventory_skew_base: "800"
+
+taker_order_type: LIMIT
+taker_slippage_buffer_bps: "6"
+taker_order_max_age_seconds: 3
+taker_max_retries: 5
+taker_fallback_to_market: false

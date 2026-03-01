@@ -56,6 +56,17 @@ class TestUpbitBithumbXemmController(IsolatedAsyncioWrapperTestCase):
         parsed = self.config.buy_levels_targets_amount
         self.assertEqual(parsed, [[Decimal("0.001"), Decimal("1")], [Decimal("0.002"), Decimal("2")]])
 
+    def test_taker_order_type_accepts_string(self):
+        config = UpbitBithumbXemmControllerConfig(
+            id="string-order-type",
+            maker_connector="bithumb",
+            maker_trading_pair="BTC-KRW",
+            taker_connector="upbit",
+            taker_trading_pair="BTC-KRW",
+            taker_order_type="LIMIT",
+        )
+        self.assertEqual(config.taker_order_type, OrderType.LIMIT)
+
     def test_determine_executor_actions_creates_both_sides(self):
         self.controller.executors_info = []
         actions = self.controller.determine_executor_actions()

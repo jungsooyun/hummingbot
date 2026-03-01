@@ -9,13 +9,13 @@ maker_trading_pair: XRP-KRW
 taker_connector: upbit
 taker_trading_pair: XRP-KRW
 
-buy_levels_targets_amount: "0.0010,1-0.0018,2-0.0028,4"
-sell_levels_targets_amount: "0.0010,1-0.0018,2-0.0028,4"
+buy_levels_targets_amount: "0.0010,1-0.0015,2-0.0022,3"
+sell_levels_targets_amount: "0.0010,1-0.0015,2-0.0022,3"
 
-min_profitability_delta: "0.0005"
+min_profitability_delta: "0.0002"
 max_profitability_delta: "0.007"
 
-max_executors_per_side: 3
+max_executors_per_side: 1
 delay_between_creations: 2
 
 inventory_target_base: "0"

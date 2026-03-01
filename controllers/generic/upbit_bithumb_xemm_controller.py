@@ -109,6 +109,23 @@ class UpbitBithumbXemmControllerConfig(ControllerConfigBase):
             return [[Decimal(str(level[0])), Decimal(str(level[1]))] for level in value]
         raise ValueError("Invalid levels format. Expected string or list.")
 
+    @field_validator("taker_order_type", mode="before")
+    @classmethod
+    def validate_taker_order_type(cls, value):
+        if isinstance(value, OrderType):
+            return value
+        if isinstance(value, int):
+            return OrderType(value)
+        if isinstance(value, str):
+            normalized = value.strip().upper()
+            if normalized.isdigit():
+                return OrderType(int(normalized))
+            try:
+                return OrderType[normalized]
+            except KeyError as e:
+                raise ValueError(f"Invalid taker_order_type: {value}") from e
+        raise ValueError(f"Invalid taker_order_type type: {type(value)}")
+
     @model_validator(mode="after")
     def post_validations(self):
         maker_base, maker_quote = split_hb_trading_pair(self.maker_trading_pair)

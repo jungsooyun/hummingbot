@@ -11,14 +11,14 @@ maker_trading_pair: BTC-KRW
 taker_connector: upbit
 taker_trading_pair: BTC-KRW
 
-# 가까운 호가(작은 weight), 먼 호가(큰 weight)
-buy_levels_targets_amount: "0.0008,1-0.0015,2-0.0025,4"
-sell_levels_targets_amount: "0.0008,1-0.0015,2-0.0025,4"
+# 소액 테스트용 (보수적 시작: 약 0.10%대)
+buy_levels_targets_amount: "0.0010,1-0.0014,2-0.0020,3"
+sell_levels_targets_amount: "0.0010,1-0.0014,2-0.0020,3"
 
-min_profitability_delta: "0.0004"
+min_profitability_delta: "0.0002"
 max_profitability_delta: "0.006"
 
-max_executors_per_side: 3
+max_executors_per_side: 1
 delay_between_creations: 2
 
 # maker(빗썸)-taker(업비트) 베이스 불균형 허용치
