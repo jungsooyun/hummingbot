@@ -54,6 +54,23 @@ class TestUpbitAuth(unittest.TestCase):
         self.assertNotIn("query_hash", payload)
         self.assertNotIn("query_hash_alg", payload)
 
+    def test_rest_authenticate_hashes_stringified_json_post_body(self):
+        request = RESTRequest(
+            method=RESTMethod.POST,
+            url="https://api.upbit.com/v1/orders",
+            data='{"market":"KRW-BTC","side":"bid","price":"1000","volume":"0.1","ord_type":"limit"}',
+        )
+
+        loop = asyncio.get_event_loop()
+        authenticated = loop.run_until_complete(self.auth.rest_authenticate(request))
+
+        token = authenticated.headers["Authorization"].split(" ", 1)[1]
+        payload = jwt.decode(token, self.secret_key, algorithms=["HS512"])
+
+        expected_query = "market=KRW-BTC&side=bid&price=1000&volume=0.1&ord_type=limit"
+        expected_hash = hashlib.sha512(expected_query.encode("utf-8")).hexdigest()
+        self.assertEqual(payload["query_hash"], expected_hash)
+
     def test_ws_authenticate_passthrough(self):
         class DummyRequest:
             pass

@@ -1,5 +1,6 @@
 import asyncio
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, PropertyMock
 
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
@@ -9,6 +10,7 @@ from controllers.generic.upbit_bithumb_xemm_controller import (
     UpbitBithumbXemmControllerConfig,
 )
 from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
 
 
 class TestUpbitBithumbXemmController(IsolatedAsyncioWrapperTestCase):
@@ -34,6 +36,10 @@ class TestUpbitBithumbXemmController(IsolatedAsyncioWrapperTestCase):
         type(self.mock_market_data_provider).ready = PropertyMock(return_value=True)
         self.mock_market_data_provider.time.return_value = 100.0
         self.mock_market_data_provider.get_price_by_type.return_value = Decimal("100")
+        self.freshness_by_connector = {"bithumb": 0.1, "upbit": 0.1}
+        self.mock_market_data_provider.get_order_book_freshness_sec.side_effect = (
+            lambda connector_name, trading_pair: self.freshness_by_connector[connector_name]
+        )
         self.mock_market_data_provider.quantize_order_amount.side_effect = lambda c, p, a: a
 
         bithumb_connector = MagicMock()
@@ -106,3 +112,45 @@ class TestUpbitBithumbXemmController(IsolatedAsyncioWrapperTestCase):
                 taker_connector="upbit",
                 taker_trading_pair="BTC-USDT",
             )
+
+    def test_stale_market_data_triggers_fail_closed_stop_actions_once(self):
+        self.controller.config.market_data_stale_timeout_sec = 2.0
+        self.freshness_by_connector["bithumb"] = 5.0
+        self.freshness_by_connector["upbit"] = 5.0
+        self.controller.executors_info = [
+            SimpleNamespace(
+                id="exec-1",
+                is_done=False,
+                side=TradeType.BUY,
+                config=SimpleNamespace(target_profitability=Decimal("0.001")),
+            )
+        ]
+
+        first_actions = self.controller.determine_executor_actions()
+        self.assertEqual(1, len(first_actions))
+        self.assertIsInstance(first_actions[0], StopExecutorAction)
+        self.assertEqual("exec-1", first_actions[0].executor_id)
+
+        second_actions = self.controller.determine_executor_actions()
+        self.assertEqual(0, len(second_actions))
+
+    def test_recovery_grace_blocks_new_creations_until_elapsed(self):
+        self.controller.config.market_data_stale_timeout_sec = 2.0
+        self.controller.config.market_data_recovery_grace_sec = 2.0
+        self.controller.config.cancel_open_orders_on_stale = True
+
+        self.freshness_by_connector["bithumb"] = 5.0
+        self.freshness_by_connector["upbit"] = 5.0
+        self.controller.executors_info = []
+        self.mock_market_data_provider.time.return_value = 100.0
+        self.controller.determine_executor_actions()  # mark stale
+
+        self.freshness_by_connector["bithumb"] = 0.1
+        self.freshness_by_connector["upbit"] = 0.1
+        self.mock_market_data_provider.time.return_value = 101.0
+        actions_during_grace = self.controller.determine_executor_actions()
+        self.assertEqual(0, len(actions_during_grace))
+
+        self.mock_market_data_provider.time.return_value = 103.5
+        actions_after_grace = self.controller.determine_executor_actions()
+        self.assertGreater(len(actions_after_grace), 0)

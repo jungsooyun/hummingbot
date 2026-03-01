@@ -50,7 +50,7 @@ class TestBithumbAuth(unittest.TestCase):
                 "side": "bid",
                 "volume": "0.1",
                 "price": "1000",
-                "ord_type": "limit",
+                "order_type": "limit",
             },
         )
 
@@ -60,7 +60,24 @@ class TestBithumbAuth(unittest.TestCase):
         token = authenticated.headers["Authorization"].split(" ", 1)[1]
         payload = jwt.decode(token, self.secret_key, algorithms=["HS256"])
 
-        expected_query = "market=KRW-BTC&side=bid&volume=0.1&price=1000&ord_type=limit"
+        expected_query = "market=KRW-BTC&side=bid&volume=0.1&price=1000&order_type=limit"
+        expected_hash = hashlib.sha512(expected_query.encode("utf-8")).hexdigest()
+        self.assertEqual(payload["query_hash"], expected_hash)
+
+    def test_rest_authenticate_hashes_stringified_json_post_body(self):
+        request = RESTRequest(
+            method=RESTMethod.POST,
+            url="https://api.bithumb.com/v1/orders",
+            data='{"market":"KRW-BTC","side":"bid","volume":"0.1","price":"1000","order_type":"limit"}',
+        )
+
+        loop = asyncio.get_event_loop()
+        authenticated = loop.run_until_complete(self.auth.rest_authenticate(request))
+
+        token = authenticated.headers["Authorization"].split(" ", 1)[1]
+        payload = jwt.decode(token, self.secret_key, algorithms=["HS256"])
+
+        expected_query = "market=KRW-BTC&side=bid&volume=0.1&price=1000&order_type=limit"
         expected_hash = hashlib.sha512(expected_query.encode("utf-8")).hexdigest()
         self.assertEqual(payload["query_hash"], expected_hash)
 

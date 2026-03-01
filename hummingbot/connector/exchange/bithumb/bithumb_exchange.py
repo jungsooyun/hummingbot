@@ -96,6 +96,15 @@ class BithumbExchange(ExchangePyBase):
     def supported_order_types(self) -> List[OrderType]:
         return [OrderType.LIMIT, OrderType.MARKET]
 
+    def get_order_price_quantum(self, trading_pair: str, price: Decimal) -> Decimal:
+        _, quote = trading_pair.split("-")
+        if quote == "KRW":
+            inferred_quantum = self._infer_price_quantum_from_order_book(trading_pair)
+            if inferred_quantum is not None:
+                return inferred_quantum
+            return self._krw_price_quantum_from_price(price)
+        return super().get_order_price_quantum(trading_pair, price)
+
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception) -> bool:
         return False
 
@@ -106,6 +115,55 @@ class BithumbExchange(ExchangePyBase):
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
         error_text = str(cancelation_exception).lower()
         return "not found" in error_text
+
+    def _infer_price_quantum_from_order_book(self, trading_pair: str) -> Optional[Decimal]:
+        try:
+            order_book = self.get_order_book(trading_pair)
+            asks = list(order_book.ask_entries())[:20]
+            bids = list(order_book.bid_entries())[:20]
+
+            diffs: List[Decimal] = []
+            for i in range(len(asks) - 1):
+                diff = Decimal(str(asks[i + 1].price)) - Decimal(str(asks[i].price))
+                if diff > Decimal("0"):
+                    diffs.append(diff)
+            for i in range(len(bids) - 1):
+                diff = Decimal(str(bids[i].price)) - Decimal(str(bids[i + 1].price))
+                if diff > Decimal("0"):
+                    diffs.append(diff)
+
+            if len(diffs) == 0:
+                return None
+
+            quantum = min(diffs)
+            return quantum if quantum > Decimal("0") else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _krw_price_quantum_from_price(price: Decimal) -> Decimal:
+        # Fallback table used if order book inference is not available.
+        if price >= Decimal("2000000"):
+            return Decimal("1000")
+        elif price >= Decimal("1000000"):
+            return Decimal("500")
+        elif price >= Decimal("500000"):
+            return Decimal("100")
+        elif price >= Decimal("100000"):
+            return Decimal("50")
+        elif price >= Decimal("10000"):
+            return Decimal("10")
+        elif price >= Decimal("1000"):
+            return Decimal("1")
+        elif price >= Decimal("100"):
+            return Decimal("1")
+        elif price >= Decimal("10"):
+            return Decimal("0.01")
+        elif price >= Decimal("1"):
+            return Decimal("0.001")
+        elif price >= Decimal("0.1"):
+            return Decimal("0.0001")
+        return Decimal("0.00001")
 
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
         return web_utils.build_api_factory(throttler=self._throttler, auth=self._auth)
@@ -162,7 +220,7 @@ class BithumbExchange(ExchangePyBase):
             order_data: Dict[str, Any] = {
                 "market": symbol,
                 "side": side,
-                "ord_type": "limit",
+                "order_type": "limit",
                 "volume": f"{amount:f}",
                 "price": f"{price:f}",
             }
@@ -171,14 +229,14 @@ class BithumbExchange(ExchangePyBase):
                 order_data = {
                     "market": symbol,
                     "side": side,
-                    "ord_type": "price",
+                    "order_type": "price",
                     "price": f"{price:f}",
                 }
             else:
                 order_data = {
                     "market": symbol,
                     "side": side,
-                    "ord_type": "market",
+                    "order_type": "market",
                     "volume": f"{amount:f}",
                 }
 
@@ -197,10 +255,11 @@ class BithumbExchange(ExchangePyBase):
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         cancel_result = await self._api_delete(
             path_url=CONSTANTS.CANCEL_ORDER_PATH_URL,
-            params={"uuid": tracked_order.exchange_order_id},
+            params={"order_id": tracked_order.exchange_order_id},
             is_auth_required=True,
         )
-        return str(cancel_result.get("uuid", "")) != ""
+        exchange_cancel_id = str(cancel_result.get("order_id", cancel_result.get("uuid", "")))
+        return exchange_cancel_id == tracked_order.exchange_order_id or exchange_cancel_id != ""
 
     async def _format_trading_rules(self, exchange_info_dict: Any) -> List[TradingRule]:
         result = []

@@ -63,7 +63,27 @@ class BithumbExchangeTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(kwargs["path_url"], CONSTANTS.CREATE_ORDER_PATH_URL)
         self.assertEqual(kwargs["data"]["market"], "KRW-BTC")
         self.assertEqual(kwargs["data"]["side"], "ask")
-        self.assertEqual(kwargs["data"]["ord_type"], "limit")
+        self.assertEqual(kwargs["data"]["order_type"], "limit")
+
+    async def test_place_cancel_uses_order_id_parameter(self):
+        order = InFlightOrder(
+            client_order_id="OID-3",
+            exchange_order_id="ex-order-3",
+            trading_pair="BTC-KRW",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            price=Decimal("55000000"),
+            amount=Decimal("0.001"),
+            creation_timestamp=self.exchange.current_timestamp,
+        )
+
+        with patch.object(self.exchange, "_api_delete", AsyncMock(return_value={"order_id": "ex-order-3"})) as mock_delete:
+            result = await self.exchange._place_cancel(order.client_order_id, order)
+
+        self.assertTrue(result)
+        kwargs = mock_delete.call_args.kwargs
+        self.assertEqual(kwargs["path_url"], CONSTANTS.CANCEL_ORDER_PATH_URL)
+        self.assertEqual(kwargs["params"]["order_id"], "ex-order-3")
 
     async def test_request_order_status_maps_state(self):
         order = InFlightOrder(
