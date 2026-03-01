@@ -386,6 +386,39 @@ class MarketDataProvider:
         connector = self.get_connector_with_fallback(connector_name)
         return connector.get_order_book(trading_pair)
 
+    def get_order_book_freshness_sec(self, connector_name: str, trading_pair: str) -> Optional[float]:
+        """
+        Returns the age in seconds of the latest order book update (diff/snapshot) for a trading pair.
+
+        The value is derived from OrderBookTracker metrics timestamps, which use ``time.perf_counter()``.
+        Returns ``None`` when freshness cannot be determined (e.g., no tracker/metrics yet).
+        """
+        connector = self.get_connector_with_fallback(connector_name)
+        tracker = getattr(connector, "order_book_tracker", None)
+        if tracker is None:
+            return None
+
+        metrics = getattr(tracker, "metrics", None)
+        if metrics is None:
+            return None
+
+        pair_metrics = metrics.per_pair_metrics.get(trading_pair)
+        if pair_metrics is None:
+            return None
+
+        last_update_ts = max(pair_metrics.last_diff_timestamp, pair_metrics.last_snapshot_timestamp)
+        if last_update_ts <= 0:
+            return None
+
+        return max(0.0, time.perf_counter() - last_update_ts)
+
+    def is_order_book_fresh(self, connector_name: str, trading_pair: str, max_age_sec: float) -> bool:
+        """
+        Checks if the latest order book update age is within the provided threshold.
+        """
+        freshness = self.get_order_book_freshness_sec(connector_name=connector_name, trading_pair=trading_pair)
+        return freshness is not None and freshness <= max_age_sec
+
     async def initialize_order_book(self, connector_name: str, trading_pair: str) -> bool:
         """
         Dynamically initializes order book for a trading pair on the specified connector.

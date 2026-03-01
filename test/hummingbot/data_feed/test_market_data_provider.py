@@ -1,4 +1,5 @@
 import asyncio
+import time
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
@@ -58,6 +59,36 @@ class TestMarketDataProvider(IsolatedAsyncioWrapperTestCase):
         self.mock_connector.get_order_book.return_value = "mock_order_book"
         result = self.provider.get_order_book("mock_connector", "BTC-USDT")
         self.assertEqual(result, "mock_order_book")
+
+    def test_get_order_book_freshness_sec(self):
+        pair_metrics = MagicMock()
+        pair_metrics.last_diff_timestamp = 0.0
+        pair_metrics.last_snapshot_timestamp = time.perf_counter() - 1.5
+        metrics = MagicMock()
+        metrics.per_pair_metrics = {"BTC-USDT": pair_metrics}
+        self.mock_connector.order_book_tracker = MagicMock(metrics=metrics)
+
+        freshness = self.provider.get_order_book_freshness_sec("mock_connector", "BTC-USDT")
+        self.assertIsNotNone(freshness)
+        self.assertGreaterEqual(freshness, 1.4)
+        self.assertLess(freshness, 3.0)
+
+    def test_get_order_book_freshness_sec_returns_none_when_missing_metrics(self):
+        self.mock_connector.order_book_tracker = MagicMock()
+        self.mock_connector.order_book_tracker.metrics = MagicMock(per_pair_metrics={})
+        freshness = self.provider.get_order_book_freshness_sec("mock_connector", "BTC-USDT")
+        self.assertIsNone(freshness)
+
+    def test_is_order_book_fresh(self):
+        pair_metrics = MagicMock()
+        pair_metrics.last_diff_timestamp = time.perf_counter() - 0.2
+        pair_metrics.last_snapshot_timestamp = 0.0
+        metrics = MagicMock()
+        metrics.per_pair_metrics = {"BTC-USDT": pair_metrics}
+        self.mock_connector.order_book_tracker = MagicMock(metrics=metrics)
+
+        self.assertTrue(self.provider.is_order_book_fresh("mock_connector", "BTC-USDT", max_age_sec=1.0))
+        self.assertFalse(self.provider.is_order_book_fresh("mock_connector", "BTC-USDT", max_age_sec=0.01))
 
     def test_get_price_by_type(self):
         self.mock_connector.get_price_by_type.return_value = 10000

@@ -6,6 +6,11 @@ EXCHANGE_NAME = "upbit"
 REST_URL = "https://api.upbit.com"
 WSS_PUBLIC_URL = "wss://api.upbit.com/websocket/v1"
 WSS_PRIVATE_URL = "wss://api.upbit.com/websocket/v1/private"
+WS_HEARTBEAT_TIME_INTERVAL = 30.0
+
+ORDERBOOK_EVENT_TYPE = "orderbook"
+TRADE_EVENT_TYPE = "trade"
+DEFAULT_ORDERBOOK_DEPTH = 15
 
 DEFAULT_DOMAIN = ""
 MAX_ORDER_ID_LEN = 40

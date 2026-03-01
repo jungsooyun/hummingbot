@@ -4,8 +4,13 @@ from hummingbot.core.data_type.in_flight_order import OrderState
 EXCHANGE_NAME = "bithumb"
 
 REST_URL = "https://api.bithumb.com"
-WSS_PUBLIC_URL = "wss://pubwss.bithumb.com/pub/ws"
-WSS_PRIVATE_URL = "wss://pubwss.bithumb.com/pub/ws"
+WSS_PUBLIC_URL = "wss://ws-api.bithumb.com/websocket/v1"
+WSS_PRIVATE_URL = "wss://ws-api.bithumb.com/websocket/v1/private"
+WS_HEARTBEAT_TIME_INTERVAL = 30.0
+
+ORDERBOOK_EVENT_TYPE = "orderbook"
+TRADE_EVENT_TYPE = "trade"
+DEFAULT_ORDERBOOK_DEPTH = 15
 
 DEFAULT_DOMAIN = ""
 MAX_ORDER_ID_LEN = 40

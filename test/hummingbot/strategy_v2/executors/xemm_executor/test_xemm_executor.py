@@ -8,7 +8,13 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.core.data_type.order_candidate import OrderCandidate
-from hummingbot.core.event.events import BuyOrderCompletedEvent, BuyOrderCreatedEvent, MarketOrderFailureEvent
+from hummingbot.core.event.events import (
+    BuyOrderCompletedEvent,
+    BuyOrderCreatedEvent,
+    MarketOrderFailureEvent,
+    OrderCancelledEvent,
+    SellOrderCompletedEvent,
+)
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.executors.xemm_executor.data_types import XEMMExecutorConfig
@@ -79,6 +85,7 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         strategy.buy.side_effect = ["OID-BUY-1", "OID-BUY-2", "OID-BUY-3"]
         strategy.sell.side_effect = ["OID-SELL-1", "OID-SELL-2", "OID-SELL-3"]
         strategy.cancel.return_value = None
+        strategy.current_timestamp = 1300.0
         binance_connector = MagicMock(spec=ExchangePyBase)
         binance_connector.supported_order_types = MagicMock(return_value=[OrderType.LIMIT, OrderType.MARKET])
         kucoin_connector = MagicMock(spec=ExchangePyBase)
@@ -205,7 +212,8 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         )
         await self.executor.control_task()
         self.assertEqual(self.executor._status, RunnableStatus.RUNNING)
-        self.assertEqual(self.executor.maker_order, None)
+        self.assertIsNotNone(self.executor.maker_order)
+        self.assertTrue(self.executor._maker_cancel_in_flight)
 
     @patch.object(XEMMExecutor, "get_resulting_price_for_amount")
     @patch.object(XEMMExecutor, "get_tx_cost_in_asset")
@@ -228,7 +236,32 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         )
         await self.executor.control_task()
         self.assertEqual(self.executor._status, RunnableStatus.RUNNING)
-        self.assertEqual(self.executor.maker_order, None)
+        self.assertIsNotNone(self.executor.maker_order)
+        self.assertTrue(self.executor._maker_cancel_in_flight)
+
+    @patch.object(XEMMExecutor, "get_resulting_price_for_amount")
+    @patch.object(XEMMExecutor, "get_tx_cost_in_asset")
+    async def test_control_pending_maker_cancel_avoids_spamming_cancel(self, tx_cost_mock, resulting_price_mock):
+        tx_cost_mock.return_value = Decimal('0.01')
+        resulting_price_mock.return_value = Decimal("100")
+        self.executor._status = RunnableStatus.RUNNING
+        self.executor.maker_order = Mock(spec=TrackedOrder)
+        self.executor.maker_order.order_id = "OID-BUY-1"
+        self.executor.maker_order.order = InFlightOrder(
+            creation_timestamp=1234,
+            trading_pair="ETH-USDT",
+            client_order_id="OID-BUY-1",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("100"),
+            price=Decimal("99.5"),
+            initial_state=OrderState.OPEN,
+        )
+        self.executor._maker_cancel_in_flight = True
+        self.executor._maker_cancel_requested_timestamp = self.strategy.current_timestamp
+
+        await self.executor.control_task()
+        self.strategy.cancel.assert_not_called()
 
     async def test_control_task_shut_down_process(self):
         self.executor.maker_order = Mock(spec=TrackedOrder)
@@ -238,6 +271,67 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.executor._status = RunnableStatus.SHUTTING_DOWN
         await self.executor.control_task()
         self.assertEqual(self.executor._status, RunnableStatus.TERMINATED)
+
+    async def test_control_shutdown_process_requests_taker_cancel_before_replace(self):
+        executor = XEMMExecutor(self.strategy, self.base_config_long_limit_taker, self.update_interval)
+        executor._status = RunnableStatus.SHUTTING_DOWN
+        executor.maker_order = Mock(spec=TrackedOrder)
+        executor.maker_order.is_done = True
+        executor.taker_order = TrackedOrder(order_id="OID-SELL-0")
+        executor.taker_order.order = InFlightOrder(
+            creation_timestamp=1000,
+            trading_pair="ETH-USDT",
+            client_order_id="OID-SELL-0",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.SELL,
+            amount=Decimal("100"),
+            price=Decimal("100"),
+            initial_state=OrderState.OPEN,
+        )
+        self.strategy.current_timestamp = 1300
+        executor.config.taker_order_max_age_seconds = 10
+
+        await executor.control_task()
+
+        self.assertTrue(executor._taker_cancel_in_flight)
+        self.assertEqual(executor.taker_order.order_id, "OID-SELL-0")
+        self.strategy.cancel.assert_called_once_with("kucoin", "ETH-USDT", "OID-SELL-0")
+
+    def test_process_order_canceled_event_taker_replaces_order(self):
+        executor = XEMMExecutor(self.strategy, self.base_config_long_limit_taker, self.update_interval)
+        executor._status = RunnableStatus.SHUTTING_DOWN
+        executor.taker_order = TrackedOrder(order_id="OID-SELL-0")
+        executor._taker_cancel_in_flight = True
+
+        cancel_event = OrderCancelledEvent(
+            timestamp=1234,
+            order_id="OID-SELL-0",
+            exchange_order_id="12345",
+        )
+        executor.process_order_canceled_event(1, MagicMock(), cancel_event)
+
+        self.assertFalse(executor._taker_cancel_in_flight)
+        self.assertIsNotNone(executor.taker_order)
+        self.assertEqual(executor.taker_order.order_id, "OID-SELL-1")
+
+    def test_process_order_completed_event_taker_clears_cancel_flag(self):
+        executor = XEMMExecutor(self.strategy, self.base_config_long_limit_taker, self.update_interval)
+        executor._status = RunnableStatus.SHUTTING_DOWN
+        executor.taker_order = TrackedOrder(order_id="OID-SELL-1")
+        executor._taker_cancel_in_flight = True
+
+        sell_order_completed_event = SellOrderCompletedEvent(
+            base_asset="ETH",
+            quote_asset="USDT",
+            base_asset_amount=Decimal("100"),
+            quote_asset_amount=Decimal("100"),
+            order_type=OrderType.LIMIT,
+            timestamp=1234,
+            order_id="OID-SELL-1",
+        )
+        executor.process_order_completed_event(1, MagicMock(), sell_order_completed_event)
+
+        self.assertFalse(executor._taker_cancel_in_flight)
 
     @patch.object(XEMMExecutor, "get_in_flight_order")
     def test_process_order_created_event(self, in_flight_order_mock):
@@ -293,6 +387,7 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
     def test_process_order_completed_event(self):
         self.executor._status = RunnableStatus.RUNNING
         self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        self.executor._maker_cancel_in_flight = True
         self.assertEqual(self.executor.taker_order, None)
         buy_order_created_event = BuyOrderCompletedEvent(
             base_asset="ETH",
@@ -305,7 +400,22 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         )
         self.executor.process_order_completed_event(1, MagicMock(), buy_order_created_event)
         self.assertEqual(self.executor.status, RunnableStatus.SHUTTING_DOWN)
-        self.assertEqual(self.executor.taker_order.order_id, "OID-SELL-1")
+        self.assertIsNone(self.executor.taker_order)
+        self.assertFalse(self.executor._maker_cancel_in_flight)
+
+    def test_process_order_canceled_event_clears_maker_state(self):
+        self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        self.executor._maker_cancel_in_flight = True
+
+        cancel_event = OrderCancelledEvent(
+            timestamp=1234,
+            order_id="OID-BUY-1",
+            exchange_order_id="12345",
+        )
+        self.executor.process_order_canceled_event(1, MagicMock(), cancel_event)
+
+        self.assertIsNone(self.executor.maker_order)
+        self.assertFalse(self.executor._maker_cancel_in_flight)
 
     def test_process_order_failed_event(self):
         self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
@@ -372,10 +482,114 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
 
     def test_early_stop(self):
         self.executor._status = RunnableStatus.RUNNING
-        self.executor.maker_order = Mock(spec=TrackedOrder)
-        self.executor.maker_order.is_open = True
+        self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        self.executor.maker_order.order = InFlightOrder(
+            creation_timestamp=1234,
+            trading_pair="ETH-USDT",
+            client_order_id="OID-BUY-1",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("100"),
+            price=Decimal("100"),
+            initial_state=OrderState.OPEN,
+        )
         self.executor.early_stop()
-        self.assertEqual(self.executor._status, RunnableStatus.TERMINATED)
+        self.assertEqual(self.executor._status, RunnableStatus.SHUTTING_DOWN)
+        self.assertEqual(self.executor.close_type, CloseType.EARLY_STOP)
+        self.strategy.cancel.assert_called_once_with("binance", "ETH-USDT", "OID-BUY-1")
+
+    def test_process_order_canceled_event_taker_does_not_replace_on_early_stop(self):
+        executor = XEMMExecutor(self.strategy, self.base_config_long_limit_taker, self.update_interval)
+        executor._status = RunnableStatus.SHUTTING_DOWN
+        executor.close_type = CloseType.EARLY_STOP
+        executor.taker_order = TrackedOrder(order_id="OID-SELL-0")
+        executor._taker_cancel_in_flight = True
+        self.strategy.sell.reset_mock()
+
+        cancel_event = OrderCancelledEvent(
+            timestamp=1234,
+            order_id="OID-SELL-0",
+            exchange_order_id="12345",
+        )
+        executor.process_order_canceled_event(1, MagicMock(), cancel_event)
+
+        self.assertFalse(executor._taker_cancel_in_flight)
+        self.assertIsNone(executor.taker_order)
+        self.strategy.sell.assert_not_called()
+
+    def test_process_order_completed_event_maker_skips_taker_on_early_stop(self):
+        executor = XEMMExecutor(self.strategy, self.base_config_long_limit_taker, self.update_interval)
+        executor._status = RunnableStatus.SHUTTING_DOWN
+        executor.close_type = CloseType.EARLY_STOP
+        executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        executor._maker_cancel_in_flight = True
+        self.strategy.sell.reset_mock()
+
+        buy_order_completed_event = BuyOrderCompletedEvent(
+            base_asset="ETH",
+            quote_asset="USDT",
+            base_asset_amount=Decimal("100"),
+            quote_asset_amount=Decimal("100"),
+            order_type=OrderType.LIMIT,
+            timestamp=1234,
+            order_id="OID-BUY-1",
+        )
+        executor.process_order_completed_event(1, MagicMock(), buy_order_completed_event)
+
+        self.assertFalse(executor._maker_cancel_in_flight)
+        self.assertIsNone(executor.taker_order)
+        self.strategy.sell.assert_not_called()
+
+    def test_process_order_completed_event_maker_places_market_hedge_on_early_stop_when_configured(self):
+        config = self.base_config_long_limit_taker
+        config.stale_fill_hedge_mode = "market"
+        executor = XEMMExecutor(self.strategy, config, self.update_interval)
+        executor._status = RunnableStatus.SHUTTING_DOWN
+        executor.close_type = CloseType.EARLY_STOP
+        executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        executor._maker_cancel_in_flight = True
+        self.strategy.sell.reset_mock()
+
+        buy_order_completed_event = BuyOrderCompletedEvent(
+            base_asset="ETH",
+            quote_asset="USDT",
+            base_asset_amount=Decimal("2"),
+            quote_asset_amount=Decimal("200"),
+            order_type=OrderType.LIMIT,
+            timestamp=1234,
+            order_id="OID-BUY-1",
+        )
+        executor.process_order_completed_event(1, MagicMock(), buy_order_completed_event)
+
+        self.assertFalse(executor._maker_cancel_in_flight)
+        self.assertIsNotNone(executor.taker_order)
+        self.assertEqual(OrderType.MARKET, executor._effective_taker_order_type())
+        self.assertTrue(executor._early_stop_hedge_initiated)
+
+    async def test_control_early_stop_shutdown_does_not_cancel_emergency_hedge_taker(self):
+        config = self.base_config_long_limit_taker
+        config.stale_fill_hedge_mode = "market"
+        executor = XEMMExecutor(self.strategy, config, self.update_interval)
+        executor._status = RunnableStatus.SHUTTING_DOWN
+        executor.close_type = CloseType.EARLY_STOP
+        executor._early_stop_hedge_initiated = True
+        executor.maker_order = None
+        executor.taker_order = TrackedOrder(order_id="OID-SELL-1")
+        executor.taker_order.order = InFlightOrder(
+            creation_timestamp=1234,
+            trading_pair="ETH-USDT",
+            client_order_id="OID-SELL-1",
+            order_type=OrderType.MARKET,
+            trade_type=TradeType.SELL,
+            amount=Decimal("2"),
+            price=Decimal("100"),
+            initial_state=OrderState.OPEN,
+        )
+
+        await executor.control_early_stop_shutdown()
+
+        self.strategy.cancel.assert_not_called()
+        self.assertEqual(RunnableStatus.SHUTTING_DOWN, executor.status)
 
     def test_get_cum_fees_quote_not_executed(self):
         self.assertEqual(self.executor.get_cum_fees_quote(), Decimal('0'))
