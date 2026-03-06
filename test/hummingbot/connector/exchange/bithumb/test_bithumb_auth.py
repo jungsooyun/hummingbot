@@ -81,6 +81,18 @@ class TestBithumbAuth(unittest.TestCase):
         expected_hash = hashlib.sha512(expected_query.encode("utf-8")).hexdigest()
         self.assertEqual(payload["query_hash"], expected_hash)
 
+    def test_generate_ws_token_returns_valid_jwt(self):
+        token = self.auth.generate_ws_token()
+        payload = jwt.decode(token, self.secret_key, algorithms=["HS256"])
+
+        self.assertEqual(payload["access_key"], self.access_key)
+        self.assertIn("nonce", payload)
+        self.assertIn("timestamp", payload)
+        self.assertIsInstance(payload["timestamp"], int)
+        self.assertGreater(payload["timestamp"], 0)
+        # WS token should NOT contain query_hash
+        self.assertNotIn("query_hash", payload)
+
     def test_ws_authenticate_passthrough(self):
         class DummyRequest:
             pass

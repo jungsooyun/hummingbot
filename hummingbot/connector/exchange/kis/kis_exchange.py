@@ -10,6 +10,8 @@ from hummingbot.connector.exchange.kis import (
     kis_utils,
     kis_web_utils as web_utils,
 )
+from hummingbot.connector.exchange.kis.kis_api_order_book_data_source import KisAPIOrderBookDataSource
+from hummingbot.connector.exchange.kis.kis_api_user_stream_data_source import KisAPIUserStreamDataSource
 from hummingbot.connector.exchange.kis.kis_auth import KisAuth
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
@@ -23,57 +25,6 @@ from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
-class _KisNoOpUserStreamDataSource(UserStreamTrackerDataSource):
-    """No-op user stream data source for KIS (no WebSocket support)."""
-
-    async def listen_for_user_stream(self, output: asyncio.Queue):
-        # KIS has no WS user stream. Block forever to keep the tracker alive.
-        await asyncio.Event().wait()
-
-
-class _KisNoOpOrderBookDataSource(OrderBookTrackerDataSource):
-    """Minimal order book data source placeholder for KIS."""
-
-    def __init__(self, trading_pairs: List[str], connector: "KisExchange"):
-        super().__init__(trading_pairs=trading_pairs)
-        self._connector = connector
-
-    async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
-        return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
-
-    async def _order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
-        return {"bids": [], "asks": []}
-
-    async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
-        return {"bids": [], "asks": []}
-
-    async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        pass
-
-    async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        pass
-
-    async def _parse_order_book_snapshot_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        pass
-
-    async def listen_for_subscriptions(self):
-        await asyncio.Event().wait()
-
-    async def _connected_websocket_assistant(self):
-        raise NotImplementedError("KIS does not support WebSocket order book streams")
-
-    async def _subscribe_channels(self, websocket_assistant):
-        raise NotImplementedError("KIS does not support WebSocket order book streams")
-
-    async def subscribe_to_trading_pair(self, trading_pair: str) -> bool:
-        # KIS has no WS order book streams; no-op
-        return True
-
-    async def unsubscribe_from_trading_pair(self, trading_pair: str) -> bool:
-        # KIS has no WS order book streams; no-op
-        return True
-
-
 class KisExchange(ExchangePyBase):
     """
     KisExchange connects with Korea Investment & Securities (KIS) exchange
@@ -82,8 +33,10 @@ class KisExchange(ExchangePyBase):
 
     KIS-specific characteristics:
     - TR_ID header-based request routing (each API call needs a tr_id header)
-    - OAuth2 Bearer token authentication
-    - No WebSocket support (REST polling only)
+    - OAuth2 Bearer token authentication (REST) + approval_key (WebSocket)
+    - WebSocket for real-time orderbook (H0STASP0), trades (H0STCNT0),
+      and execution notifications (H0STCNI0/H0STCNI9, AES-encrypted)
+    - WS data format: pipe-delimited text with caret (^) field separators
     - Response format: {"rt_cd": "0", "msg1": "...", "output": {...}}
     - No symbols list API (trading pairs configured externally)
     """
@@ -118,6 +71,7 @@ class KisExchange(ExchangePyBase):
         self._acnt_prdt_cd = parts[1] if len(parts) > 1 else "01"
 
         super().__init__()
+        # Balance updates are still REST-polled; order/fill events come via WS
         self.real_time_balance_update = False
 
     # ------------------------------------------------------------------
@@ -205,13 +159,22 @@ class KisExchange(ExchangePyBase):
         )
 
     def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
-        return _KisNoOpOrderBookDataSource(
+        return KisAPIOrderBookDataSource(
             trading_pairs=self._trading_pairs,
             connector=self,
+            api_factory=self._web_assistants_factory,
+            auth=self._auth,
+            domain=self._domain,
         )
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
-        return _KisNoOpUserStreamDataSource()
+        return KisAPIUserStreamDataSource(
+            auth=self._auth,
+            trading_pairs=self._trading_pairs,
+            connector=self,
+            api_factory=self._web_assistants_factory,
+            domain=self._domain,
+        )
 
     # ------------------------------------------------------------------
     # Fee
@@ -531,13 +494,94 @@ class KisExchange(ExchangePyBase):
         return updates
 
     # ------------------------------------------------------------------
-    # User stream (no-op for KIS)
+    # User stream (WebSocket execution notifications)
     # ------------------------------------------------------------------
 
     async def _user_stream_event_listener(self):
-        # KIS has no WebSocket user stream. This is a no-op.
-        # Just wait forever to avoid the base class restarting the loop.
-        await asyncio.Event().wait()
+        """Process KIS WebSocket execution notification events.
+
+        Events from H0STCNI0/H0STCNI9 contain order/fill notifications:
+        - CNTG_YN == "2": fill (체결통보)
+        - CNTG_YN == "1": order acceptance/modification/cancel/reject
+        """
+        async for event_message in self._iter_user_event_queue():
+            try:
+                event_type = event_message.get("type", "")
+                if event_type != "execution_notification":
+                    continue
+
+                data = event_message.get("data", {})
+                cntg_yn = data.get("CNTG_YN", "")
+                order_no = data.get("ODER_NO", "")
+                stock_code = data.get("STCK_SHRN_ISCD", "")
+
+                # Find the tracked order by exchange_order_id
+                tracked_order = self._find_tracked_order_by_exchange_id(order_no)
+                if tracked_order is None:
+                    continue
+
+                if cntg_yn == "2":
+                    # Fill notification
+                    fill_qty = Decimal(str(data.get("CNTG_QTY", "0")))
+                    fill_price = Decimal(str(data.get("CNTG_UNPR", "0")))
+                    fill_amount = fill_qty * fill_price
+
+                    fee = TradeFeeBase.new_spot_fee(
+                        fee_schema=self.trade_fee_schema(),
+                        trade_type=tracked_order.trade_type,
+                        percent_token=tracked_order.quote_asset,
+                        flat_fees=[TokenAmount(amount=Decimal("0"), token=tracked_order.quote_asset)],
+                    )
+                    trade_update = TradeUpdate(
+                        trade_id=f"{order_no}_{data.get('STCK_CNTG_HOUR', '')}",
+                        client_order_id=tracked_order.client_order_id,
+                        exchange_order_id=order_no,
+                        trading_pair=tracked_order.trading_pair,
+                        fee=fee,
+                        fill_base_amount=fill_qty,
+                        fill_quote_amount=fill_amount,
+                        fill_price=fill_price,
+                        fill_timestamp=self.current_timestamp,
+                    )
+                    self._order_tracker.process_trade_update(trade_update)
+
+                elif cntg_yn == "1":
+                    # Order acceptance/cancel/reject
+                    rfus_yn = data.get("RFUS_YN", "N")
+                    acpt_yn = data.get("ACPT_YN", "N")
+
+                    if rfus_yn == "Y":
+                        new_state = OrderState.FAILED
+                    elif acpt_yn == "Y":
+                        rctf_cls = data.get("RCTF_CLS", "")
+                        if rctf_cls == "02":  # cancel
+                            new_state = OrderState.CANCELED
+                        else:
+                            new_state = OrderState.OPEN
+                    else:
+                        continue
+
+                    order_update = OrderUpdate(
+                        client_order_id=tracked_order.client_order_id,
+                        exchange_order_id=order_no,
+                        trading_pair=tracked_order.trading_pair,
+                        update_timestamp=self.current_timestamp,
+                        new_state=new_state,
+                    )
+                    self._order_tracker.process_order_update(order_update)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().exception("Unexpected error in KIS user stream event processing")
+                await self._sleep(1.0)
+
+    def _find_tracked_order_by_exchange_id(self, exchange_order_id: str) -> Optional[InFlightOrder]:
+        """Find a tracked in-flight order by exchange order ID."""
+        for order in self._order_tracker.active_orders.values():
+            if order.exchange_order_id == exchange_order_id:
+                return order
+        return None
 
     # ------------------------------------------------------------------
     # Trading pair symbol map

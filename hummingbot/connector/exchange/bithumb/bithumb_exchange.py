@@ -9,6 +9,7 @@ from hummingbot.connector.exchange.bithumb import bithumb_constants as CONSTANTS
 from hummingbot.connector.exchange.bithumb.bithumb_api_order_book_data_source import BithumbAPIOrderBookDataSource
 from hummingbot.connector.exchange.bithumb.bithumb_api_user_stream_data_source import BithumbAPIUserStreamDataSource
 from hummingbot.connector.exchange.bithumb.bithumb_auth import BithumbAuth
+from hummingbot.connector.exchange.bithumb.bithumb_exceptions import BithumbSelfTradePreventionError
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
@@ -41,9 +42,11 @@ class BithumbExchange(ExchangePyBase):
         self._secret_key = bithumb_secret_key
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs or []
+        self._ws_trade_fallback_timestamps: Dict[str, float] = {}
 
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         self.real_time_balance_update = False
+        self._ws_order_paid_fees: Dict[str, Decimal] = {}  # exchange_order_id → last paid_fee
 
     @property
     def authenticator(self):
@@ -116,6 +119,18 @@ class BithumbExchange(ExchangePyBase):
         error_text = str(cancelation_exception).lower()
         return "not found" in error_text
 
+    @staticmethod
+    def _is_cross_trading_error(error: Exception) -> bool:
+        error_text = str(error).lower()
+        indicators = [
+            "cross_trading",
+            "cross trading",
+            "자전거래",
+            "자전 거래",
+            "자전거래 위험",
+        ]
+        return any(indicator in error_text for indicator in indicators)
+
     def _infer_price_quantum_from_order_book(self, trading_pair: str) -> Optional[Decimal]:
         try:
             order_book = self.get_order_book(trading_pair)
@@ -176,7 +191,12 @@ class BithumbExchange(ExchangePyBase):
         )
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
-        return BithumbAPIUserStreamDataSource()
+        return BithumbAPIUserStreamDataSource(
+            auth=self._auth,
+            trading_pairs=self._trading_pairs,
+            connector=self,
+            api_factory=self._web_assistants_factory,
+        )
 
     async def _make_trading_rules_request(self) -> Any:
         return await self._api_get(
@@ -240,17 +260,39 @@ class BithumbExchange(ExchangePyBase):
                     "volume": f"{amount:f}",
                 }
 
-        order_result = await self._api_post(
-            path_url=CONSTANTS.CREATE_ORDER_PATH_URL,
-            data=order_data,
-            is_auth_required=True,
-        )
+        try:
+            order_result = await self._api_post(
+                path_url=CONSTANTS.CREATE_ORDER_PATH_URL,
+                data=order_data,
+                is_auth_required=True,
+            )
+        except Exception as order_exception:
+            if self._is_cross_trading_error(order_exception):
+                raise BithumbSelfTradePreventionError(str(order_exception)) from order_exception
+            raise
 
-        exchange_order_id = str(order_result.get("uuid", ""))
+        if self._is_cross_trading_error(Exception(str(order_result))):
+            raise BithumbSelfTradePreventionError(str(order_result))
+
+        exchange_order_id = str(order_result.get("order_id", order_result.get("uuid", "")))
         if exchange_order_id == "":
             raise ValueError(f"Failed to place Bithumb order: {order_result}")
 
         return exchange_order_id, self.current_timestamp
+
+    async def _request_order_detail(self, exchange_order_id: str) -> Dict[str, Any]:
+        try:
+            return await self._api_get(
+                path_url=CONSTANTS.GET_ORDER_DETAIL_PATH_URL,
+                params={"order_id": exchange_order_id},
+                is_auth_required=True,
+            )
+        except Exception:
+            return await self._api_get(
+                path_url=CONSTANTS.GET_ORDER_DETAIL_PATH_URL,
+                params={"uuid": exchange_order_id},
+                is_auth_required=True,
+            )
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         cancel_result = await self._api_delete(
@@ -312,11 +354,7 @@ class BithumbExchange(ExchangePyBase):
         trade_updates = []
 
         if order.exchange_order_id is not None:
-            order_data = await self._api_get(
-                path_url=CONSTANTS.GET_ORDER_DETAIL_PATH_URL,
-                params={"uuid": order.exchange_order_id},
-                is_auth_required=True,
-            )
+            order_data = await self._request_order_detail(order.exchange_order_id)
 
             for trade in order_data.get("trades", []):
                 fill_price = Decimal(str(trade.get("price", order_data.get("price", "0"))))
@@ -349,31 +387,265 @@ class BithumbExchange(ExchangePyBase):
         return trade_updates
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
-        order_data = await self._api_get(
-            path_url=CONSTANTS.GET_ORDER_DETAIL_PATH_URL,
-            params={"uuid": tracked_order.exchange_order_id},
-            is_auth_required=True,
-        )
+        order_data = await self._request_order_detail(tracked_order.exchange_order_id)
 
         state = str(order_data.get("state", "wait"))
-        new_state = CONSTANTS.ORDER_STATE.get(state, OrderState.OPEN)
-
-        if state in {"wait", "watch"}:
-            executed = Decimal(str(order_data.get("executed_volume", "0")))
+        executed = Decimal(str(order_data.get("executed_volume", "0")))
+        if "remaining_volume" in order_data:
+            remaining = Decimal(str(order_data.get("remaining_volume", "0")))
+        else:
             total = Decimal(str(order_data.get("volume", tracked_order.amount)))
-            if executed > Decimal("0") and executed < total:
-                new_state = OrderState.PARTIALLY_FILLED
+            remaining = total - executed
+        new_state = self._resolve_order_state(state=state, executed_volume=executed, remaining_volume=remaining)
+        exchange_order_id = str(order_data.get("order_id", order_data.get("uuid", tracked_order.exchange_order_id)))
+
+        if new_state in (OrderState.FILLED, OrderState.CANCELED):
+            self._clear_ws_order_tracking(exchange_order_id)
 
         return OrderUpdate(
             client_order_id=tracked_order.client_order_id,
-            exchange_order_id=str(order_data.get("uuid", tracked_order.exchange_order_id)),
+            exchange_order_id=exchange_order_id,
             trading_pair=tracked_order.trading_pair,
             update_timestamp=self.current_timestamp,
             new_state=new_state,
         )
 
     async def _user_stream_event_listener(self):
-        await asyncio.Event().wait()
+        async for event_message in self._iter_user_event_queue():
+            try:
+                event_type = event_message.get("type", "")
+                if event_type == CONSTANTS.PRIVATE_ORDER_CHANNEL_NAME:
+                    await self._process_order_event(event_message)
+                elif event_type == CONSTANTS.PRIVATE_ASSET_CHANNEL_NAME:
+                    self._process_balance_event(event_message)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().exception("Unexpected error in user stream listener loop.")
+                await self._sleep(5.0)
+
+    async def _process_order_event(self, event_data: Dict[str, Any]):
+        exchange_order_id = str(event_data.get("uuid", ""))
+        if not exchange_order_id:
+            return
+
+        fillable_order = self._order_tracker.all_fillable_orders_by_exchange_order_id.get(exchange_order_id)
+        updatable_order = self._order_tracker.all_updatable_orders_by_exchange_order_id.get(exchange_order_id)
+
+        if fillable_order is None and updatable_order is None:
+            return
+
+        state = str(event_data.get("state", "wait"))
+        reference_order = updatable_order or fillable_order
+        executed = Decimal(str(event_data.get("executed_volume", "0")))
+        if "remaining_volume" in event_data:
+            remaining = Decimal(str(event_data.get("remaining_volume", "0")))
+        else:
+            total = Decimal(str(event_data.get("volume", reference_order.amount)))
+            remaining = total - executed
+
+        if state == "trade" and fillable_order is not None:
+            trade_uuid = event_data.get("trade_uuid")
+            trade_update = self._parse_trade_from_ws_event(event_data, fillable_order)
+            if trade_update is not None:
+                self._order_tracker.process_trade_update(trade_update)
+            elif trade_uuid is None or str(trade_uuid) not in fillable_order.order_fills:
+                await self._reconcile_trades_for_order(
+                    order=fillable_order,
+                    exchange_order_id=exchange_order_id,
+                    reason="invalid_or_anomalous_ws_trade_event",
+                    event_data=event_data,
+                )
+
+        if state == "done" and fillable_order is not None and executed > Decimal("0"):
+            if fillable_order.executed_amount_base < executed:
+                await self._reconcile_trades_for_order(
+                    order=fillable_order,
+                    exchange_order_id=exchange_order_id,
+                    reason="done_mismatch",
+                    force=True,
+                    event_data=event_data,
+                )
+
+        if updatable_order is not None:
+            new_state = self._resolve_order_state(state=state, executed_volume=executed, remaining_volume=remaining)
+            order_update = OrderUpdate(
+                client_order_id=updatable_order.client_order_id,
+                exchange_order_id=exchange_order_id,
+                trading_pair=updatable_order.trading_pair,
+                update_timestamp=self.current_timestamp,
+                new_state=new_state,
+            )
+            self._order_tracker.process_order_update(order_update)
+
+        if state in {"done", "cancel"}:
+            self._clear_ws_order_tracking(exchange_order_id)
+
+    def _parse_trade_from_ws_event(
+        self, event_data: Dict[str, Any], order: InFlightOrder
+    ) -> Optional[TradeUpdate]:
+        trade_uuid = event_data.get("trade_uuid")
+        if not trade_uuid:
+            return None
+        trade_id = str(trade_uuid)
+        if trade_id in order.order_fills:
+            return None
+
+        fill_price = Decimal(str(event_data.get("price", "0")))
+        fill_base_amount = Decimal(str(event_data.get("volume", "0")))
+        if fill_price <= Decimal("0") or fill_base_amount <= Decimal("0"):
+            return None
+        if not self._is_bithumb_ws_trade_sequence_valid(event_data=event_data, order=order):
+            return None
+
+        fill_quote_amount = fill_price * fill_base_amount
+
+        # Bithumb: paid_fee 델타로 per-trade fee 계산
+        exchange_order_id = str(event_data.get("uuid", order.exchange_order_id or ""))
+        current_paid = self._extract_paid_fee(event_data) or Decimal("0")
+        prev_paid = self._ws_order_paid_fees.get(exchange_order_id, Decimal("0"))
+        fee_amount = current_paid - prev_paid
+        if fee_amount < Decimal("0"):
+            return None
+        self._ws_order_paid_fees[exchange_order_id] = max(prev_paid, current_paid)
+        fee_token = order.quote_asset
+
+        fee = TradeFeeBase.new_spot_fee(
+            fee_schema=self.trade_fee_schema(),
+            trade_type=order.trade_type,
+            percent_token=fee_token,
+            flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)],
+        )
+
+        ts = event_data.get("trade_timestamp")
+        fill_ts = float(ts) / 1000.0 if ts else self.current_timestamp
+
+        return TradeUpdate(
+            trade_id=trade_id,
+            client_order_id=order.client_order_id,
+            exchange_order_id=order.exchange_order_id,
+            trading_pair=order.trading_pair,
+            fee=fee,
+            fill_base_amount=fill_base_amount,
+            fill_quote_amount=fill_quote_amount,
+            fill_price=fill_price,
+            fill_timestamp=fill_ts,
+        )
+
+    def _resolve_order_state(
+        self,
+        state: str,
+        executed_volume: Decimal,
+        remaining_volume: Decimal,
+    ) -> OrderState:
+        if state == "done":
+            return OrderState.FILLED
+        elif state == "cancel":
+            return OrderState.CANCELED
+        elif state == "trade":
+            return OrderState.FILLED if remaining_volume <= Decimal("0") else OrderState.PARTIALLY_FILLED
+        else:
+            new_state = CONSTANTS.ORDER_STATE.get(state, OrderState.OPEN)
+            if executed_volume > Decimal("0") and remaining_volume > Decimal("0"):
+                return OrderState.PARTIALLY_FILLED
+            return new_state
+
+    def _should_run_ws_trade_rest_fallback(self, exchange_order_id: str, force: bool = False) -> bool:
+        if force:
+            self._ws_trade_fallback_timestamps[exchange_order_id] = self.current_timestamp
+            return True
+
+        last_ts = self._ws_trade_fallback_timestamps.get(exchange_order_id)
+        if last_ts is None or self.current_timestamp - last_ts >= 5.0:
+            self._ws_trade_fallback_timestamps[exchange_order_id] = self.current_timestamp
+            return True
+        return False
+
+    async def _reconcile_trades_for_order(
+        self,
+        order: InFlightOrder,
+        exchange_order_id: str,
+        reason: str,
+        force: bool = False,
+        event_data: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not self._should_run_ws_trade_rest_fallback(exchange_order_id=exchange_order_id, force=force):
+            self.logger().debug(
+                f"Skipping WS trade reconciliation for {exchange_order_id}: debounce active ({reason})"
+            )
+            return
+
+        self.logger().warning(f"WS trade reconciliation triggered for {exchange_order_id}: {reason}")
+        trade_updates = await self._all_trade_updates_for_order(order)
+        for trade_update in trade_updates:
+            self._order_tracker.process_trade_update(trade_update)
+
+        if event_data is not None:
+            current_paid_fee = self._extract_paid_fee(event_data)
+            if current_paid_fee is not None:
+                prev_paid_fee = self._ws_order_paid_fees.get(exchange_order_id, Decimal("0"))
+                self._ws_order_paid_fees[exchange_order_id] = max(prev_paid_fee, current_paid_fee)
+
+    def _clear_ws_order_tracking(self, exchange_order_id: str) -> None:
+        self._ws_trade_fallback_timestamps.pop(exchange_order_id, None)
+        self._ws_order_paid_fees.pop(exchange_order_id, None)
+
+    def _extract_paid_fee(self, event_data: Dict[str, Any]) -> Optional[Decimal]:
+        raw_paid_fee = event_data.get("paid_fee")
+        if raw_paid_fee is None:
+            return None
+
+        try:
+            return Decimal(str(raw_paid_fee))
+        except Exception:
+            return None
+
+    def _extract_trades_count(self, event_data: Dict[str, Any]) -> Optional[int]:
+        raw_trades_count = event_data.get("trades_count")
+        if raw_trades_count is None:
+            return None
+
+        try:
+            return int(Decimal(str(raw_trades_count)))
+        except Exception:
+            return None
+
+    def _is_bithumb_ws_trade_sequence_valid(
+        self,
+        event_data: Dict[str, Any],
+        order: InFlightOrder,
+    ) -> bool:
+        trade_uuid = event_data.get("trade_uuid")
+        if not trade_uuid:
+            return False
+
+        trade_id = str(trade_uuid)
+        if trade_id in order.order_fills:
+            return True
+
+        exchange_order_id = str(event_data.get("uuid", order.exchange_order_id or ""))
+        current_paid = self._extract_paid_fee(event_data)
+        prev_paid = self._ws_order_paid_fees.get(exchange_order_id, Decimal("0"))
+
+        if current_paid is not None and current_paid < prev_paid:
+            return False
+
+        trades_count = self._extract_trades_count(event_data)
+        if trades_count is not None:
+            expected_count = len(order.order_fills) + 1
+            if trades_count != expected_count:
+                return False
+
+        return True
+
+    def _process_balance_event(self, event_data: Dict[str, Any]):
+        asset = event_data.get("currency", "")
+        if not asset:
+            return
+        available = Decimal(str(event_data.get("balance", "0")))
+        locked = Decimal(str(event_data.get("locked", "0")))
+        self._account_available_balances[asset] = available
+        self._account_balances[asset] = available + locked
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Any):
         mapping = bidict()

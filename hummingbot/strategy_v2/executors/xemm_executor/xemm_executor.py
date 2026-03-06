@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from decimal import Decimal
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 from hummingbot.connector.connector_base import ConnectorBase, Union
 from hummingbot.connector.utils import split_hb_trading_pair
@@ -12,6 +12,7 @@ from hummingbot.core.event.events import (
     BuyOrderCreatedEvent,
     MarketOrderFailureEvent,
     OrderCancelledEvent,
+    OrderFilledEvent,
     SellOrderCompletedEvent,
     SellOrderCreatedEvent,
 )
@@ -99,6 +100,10 @@ class XEMMExecutor(ExecutorBase):
                 raise ValueError(
                     f"{self.taker_connector} does not support MARKET orders required by taker_fallback_to_market."
                 )
+            if self._shadow_maker_active() and OrderType.LIMIT_MAKER not in supported_taker_order_types:
+                raise ValueError(
+                    f"{self.taker_connector} does not support LIMIT_MAKER orders required by shadow_maker_enabled."
+                )
         self._taker_result_price = Decimal("1")
         self._maker_target_price = Decimal("1")
         self._tx_cost = Decimal("1")
@@ -116,12 +121,40 @@ class XEMMExecutor(ExecutorBase):
         self._taker_cancel_in_flight = False
         self._taker_cancel_requested_timestamp = 0.0
         self._taker_cancel_retry_interval = 3.0
+        # Optional shadow maker (on taker connector) state
+        self.shadow_order: Optional[TrackedOrder] = None
+        self._shadow_cancel_in_flight = False
+        self._shadow_cancel_requested_timestamp = 0.0
+        self._shadow_cancel_retry_interval = 3.0
+        # Shadow prefill protection mode state
+        self._shadow_prefill_mode = False
+        self._shadow_prefill_stage: Optional[str] = None  # cancel_maker | cross | unwind
+        self._shadow_prefill_stage_started_ts = 0.0
+        self._shadow_prefill_remaining_base = Decimal("0")
+        self._shadow_prefill_remaining_quote = Decimal("0")
+        self._shadow_prefill_recorded_fills: Dict[str, Decimal] = {}
+        self._shadow_prefill_cross_order_active = False
+        self._shadow_prefill_unwind_order: Optional[TrackedOrder] = None
+        self._shadow_prefill_unwind_cancel_in_flight = False
+        self._shadow_prefill_unwind_cancel_requested_timestamp = 0.0
+        self._shadow_prefill_unwind_cancel_retry_interval = 3.0
+        self._shadow_prefill_unwind_retries = 0
+        self._shadow_prefill_last_guard_block_ts: float = 0.0
+        self._last_one_sided_warning_ts = 0.0
         # Hedging guard state
         self._unhedged_base: Decimal = Decimal("0")
         self._unhedged_quote: Decimal = Decimal("0")
         self._last_fill_timestamp: float = 0.0
         self._hedge_block_reason: str = ""
         self._early_stop_hedge_initiated: bool = False
+        # Bithumb self-trade prevention (STP) guard state
+        self._stp_reject_streak: int = 0
+        self._stp_dynamic_offset_ticks: int = max(1, int(self.config.bithumb_stp_base_offset_ticks))
+        self._stp_cooldown_until_ts: float = 0.0
+        self._stp_pause_until_ts: float = 0.0
+        self._stp_last_error_message: str = ""
+        self._stp_last_blocker_order_id: Optional[str] = None
+        self._stp_last_blocker_price: Optional[Decimal] = None
         super().__init__(strategy=strategy,
                          connectors=[config.buying_market.connector_name, config.selling_market.connector_name],
                          config=config, update_interval=update_interval)
@@ -145,25 +178,227 @@ class XEMMExecutor(ExecutorBase):
             price=mid_price,)
         maker_adjusted_candidate = self.adjust_order_candidates(self.maker_connector, [maker_order_candidate])[0]
         taker_adjusted_candidate = self.adjust_order_candidates(self.taker_connector, [taker_order_candidate])[0]
-        if maker_adjusted_candidate.amount == Decimal("0") or taker_adjusted_candidate.amount == Decimal("0"):
+        maker_has_budget = maker_adjusted_candidate.amount > Decimal("0")
+        taker_has_budget = taker_adjusted_candidate.amount > Decimal("0")
+        if not maker_has_budget:
             self.close_type = CloseType.INSUFFICIENT_BALANCE
-            self.logger().error("Not enough budget to open position.")
+            self.logger().error("Not enough maker-side budget to open position.")
+            self.stop()
+            return
+        if not taker_has_budget:
+            if self.config.allow_one_sided_inventory_mode:
+                self._log_one_sided_mode_warning(
+                    "Taker-side budget is insufficient at start. Continuing in one-sided inventory mode."
+                )
+                return
+            self.close_type = CloseType.INSUFFICIENT_BALANCE
+            self.logger().error("Not enough taker-side budget to open position.")
             self.stop()
 
     async def control_task(self):
         if self.status == RunnableStatus.RUNNING:
             await self.update_prices_and_tx_costs()
+            if self._shadow_prefill_mode:
+                await self.control_shadow_prefill_mode()
+                return
             await self.control_maker_order()
+            await self.control_shadow_order()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
             await self.control_shutdown_process()
 
     async def control_maker_order(self):
         if self.maker_order is None:
+            now = self._strategy.current_timestamp
+            if self._is_stp_pause_active(now):
+                return
+            if self._is_stp_cooldown_active(now):
+                return
             await self.create_maker_order()
         elif self._maker_cancel_in_flight:
             await self.control_pending_maker_cancel()
         else:
             await self.control_update_maker_order()
+
+    def _shadow_maker_active(self) -> bool:
+        return (
+            self.config.shadow_maker_enabled
+            and self.maker_connector == "bithumb"
+            and self.taker_connector == "upbit"
+        )
+
+    def _log_one_sided_mode_warning(self, message: str):
+        now = self._strategy.current_timestamp
+        if now - self._last_one_sided_warning_ts >= 10.0:
+            self.logger().warning(message)
+            self._last_one_sided_warning_ts = now
+
+    def _has_order_budget(
+        self,
+        connector_name: str,
+        trading_pair: str,
+        side: TradeType,
+        amount: Decimal,
+        price: Decimal,
+        order_type: OrderType,
+        is_maker: bool,
+    ) -> bool:
+        try:
+            candidate = OrderCandidate(
+                trading_pair=trading_pair,
+                is_maker=is_maker,
+                order_type=order_type,
+                order_side=side,
+                amount=amount,
+                price=price,
+            )
+            adjusted_candidate = self.adjust_order_candidates(connector_name, [candidate])[0]
+            return adjusted_candidate.amount > Decimal("0")
+        except Exception:
+            return False
+
+    def _bithumb_stp_guard_active(self) -> bool:
+        return (
+            self.config.bithumb_stp_prevention_enabled
+            and self.maker_connector == "bithumb"
+            and not self.is_amm_connector(exchange=self.maker_connector)
+        )
+
+    def _is_stp_pause_active(self, now: float) -> bool:
+        return self._bithumb_stp_guard_active() and now < self._stp_pause_until_ts
+
+    def _is_stp_cooldown_active(self, now: float) -> bool:
+        return self._bithumb_stp_guard_active() and now < self._stp_cooldown_until_ts
+
+    def _reset_stp_state_on_success(self):
+        self._stp_reject_streak = 0
+        self._stp_dynamic_offset_ticks = max(1, int(self.config.bithumb_stp_base_offset_ticks))
+        self._stp_cooldown_until_ts = 0.0
+        self._stp_pause_until_ts = 0.0
+        self._stp_last_error_message = ""
+        self._stp_last_blocker_order_id = None
+        self._stp_last_blocker_price = None
+
+    def _mark_stp_rejection(self, error_message: str):
+        now = self._strategy.current_timestamp
+        self._stp_reject_streak += 1
+        self._stp_last_error_message = error_message
+        self._stp_dynamic_offset_ticks = min(
+            int(self.config.bithumb_stp_max_offset_ticks),
+            max(self._stp_dynamic_offset_ticks + 1, int(self.config.bithumb_stp_base_offset_ticks)),
+        )
+        self._stp_cooldown_until_ts = now + float(self.config.bithumb_stp_retry_cooldown_sec)
+        if self._stp_reject_streak >= int(self.config.bithumb_stp_pause_after_rejects):
+            self._stp_pause_until_ts = now + float(self.config.bithumb_stp_pause_duration_sec)
+            self._stp_cooldown_until_ts = self._stp_pause_until_ts
+
+    def _is_stp_failure_event(self, event: MarketOrderFailureEvent) -> bool:
+        error_type = (event.error_type or "").lower()
+        error_message = (event.error_message or "").lower()
+        return (
+            "selftradeprevention" in error_type
+            or "cross_trading" in error_type
+            or "cross_trading" in error_message
+            or "cross trading" in error_message
+            or "자전거래" in error_message
+            or "자전 거래" in error_message
+            or "자전거래 위험" in error_message
+        )
+
+    def _find_bithumb_stp_conflicting_order(self, candidate_price: Decimal):
+        if not self._bithumb_stp_guard_active():
+            return None
+        connector = self.connectors[self.maker_connector]
+        for in_flight_order in connector.in_flight_orders.values():
+            if in_flight_order.trading_pair != self.maker_trading_pair:
+                continue
+            if in_flight_order.is_done:
+                continue
+            if in_flight_order.trade_type == self.maker_order_side:
+                continue
+            if (
+                not self.config.bithumb_stp_consider_pending_cancel_as_conflict
+                and in_flight_order.is_pending_cancel_confirmation
+            ):
+                continue
+            if self.maker_order is not None and in_flight_order.client_order_id == self.maker_order.order_id:
+                continue
+            if in_flight_order.price is None:
+                continue
+
+            order_price = Decimal(str(in_flight_order.price))
+            if order_price <= Decimal("0"):
+                continue
+
+            if self.maker_order_side == TradeType.BUY and order_price <= candidate_price:
+                return in_flight_order
+            if self.maker_order_side == TradeType.SELL and order_price >= candidate_price:
+                return in_flight_order
+        return None
+
+    def _safe_maker_price_with_stp(self, target_price: Decimal) -> Optional[Decimal]:
+        if not self._bithumb_stp_guard_active():
+            return target_price
+
+        connector = self.connectors[self.maker_connector]
+        quantized_target = connector.quantize_order_price(self.maker_trading_pair, target_price)
+        if quantized_target <= Decimal("0"):
+            return None
+
+        initial_blocker = self._find_bithumb_stp_conflicting_order(quantized_target)
+        force_offset = self._stp_reject_streak > 0
+        if not force_offset and initial_blocker is None:
+            self._stp_last_blocker_order_id = None
+            self._stp_last_blocker_price = None
+            return quantized_target
+
+        if initial_blocker is not None:
+            self._stp_last_blocker_order_id = initial_blocker.client_order_id
+            self._stp_last_blocker_price = initial_blocker.price
+
+        quantum = connector.get_order_price_quantum(self.maker_trading_pair, quantized_target)
+        if quantum <= Decimal("0"):
+            quantum = Decimal("1")
+        max_ticks = max(1, int(self.config.bithumb_stp_max_offset_ticks))
+        start_ticks = max(1, int(self.config.bithumb_stp_base_offset_ticks), int(self._stp_dynamic_offset_ticks))
+        for ticks in range(start_ticks, max_ticks + 1):
+            if self.maker_order_side == TradeType.BUY:
+                candidate_price = quantized_target - (quantum * ticks)
+            else:
+                candidate_price = quantized_target + (quantum * ticks)
+            candidate_price = connector.quantize_order_price(self.maker_trading_pair, candidate_price)
+            if candidate_price <= Decimal("0"):
+                continue
+            blocker = self._find_bithumb_stp_conflicting_order(candidate_price)
+            if blocker is None:
+                return candidate_price
+            self._stp_last_blocker_order_id = blocker.client_order_id
+            self._stp_last_blocker_price = blocker.price
+
+        return None
+
+    async def control_shadow_order(self):
+        if not self._shadow_maker_active():
+            return
+        if self._shadow_prefill_mode:
+            if self._tracked_order_is_open(self.shadow_order):
+                self.request_shadow_cancel()
+            elif self._shadow_cancel_in_flight:
+                await self.control_pending_shadow_cancel()
+            return
+
+        if self.maker_order is None or self._maker_cancel_in_flight:
+            if self._tracked_order_is_open(self.shadow_order):
+                self.request_shadow_cancel()
+            elif self._shadow_cancel_in_flight:
+                await self.control_pending_shadow_cancel()
+            return
+
+        if self.shadow_order is None:
+            await self.create_shadow_order()
+        elif self._shadow_cancel_in_flight:
+            await self.control_pending_shadow_cancel()
+        else:
+            await self.control_update_shadow_order()
 
     def _record_maker_fill(
         self,
@@ -216,6 +451,430 @@ class XEMMExecutor(ExecutorBase):
             self._strategy.cancel(self.maker_connector, self.maker_trading_pair, self.maker_order.order_id)
             self._maker_cancel_requested_timestamp = now
 
+    def request_shadow_cancel(self):
+        if self.shadow_order is None:
+            return
+        if self._shadow_cancel_in_flight:
+            return
+        self._strategy.cancel(self.taker_connector, self.taker_trading_pair, self.shadow_order.order_id)
+        self._shadow_cancel_in_flight = True
+        self._shadow_cancel_requested_timestamp = self._strategy.current_timestamp
+
+    async def control_pending_shadow_cancel(self):
+        if self.shadow_order is None:
+            self._shadow_cancel_in_flight = False
+            return
+        shadow_order = self.shadow_order.order
+        if shadow_order is not None and not shadow_order.is_open:
+            return
+        now = self._strategy.current_timestamp
+        if now - self._shadow_cancel_requested_timestamp >= self._shadow_cancel_retry_interval:
+            self.logger().warning(
+                f"Shadow cancel pending for {self.shadow_order.order_id} after "
+                f"{now - self._shadow_cancel_requested_timestamp:.2f}s. Retrying cancel."
+            )
+            self._strategy.cancel(self.taker_connector, self.taker_trading_pair, self.shadow_order.order_id)
+            self._shadow_cancel_requested_timestamp = now
+
+    def _maker_remaining_base(self) -> Decimal:
+        if self.maker_order is None:
+            return Decimal("0")
+        executed = self.maker_order.executed_amount_base if self.maker_order.executed_amount_base else Decimal("0")
+        remaining = self.config.order_amount - executed
+        return remaining if remaining > 0 else Decimal("0")
+
+    def _shadow_profitability_floor(self) -> Decimal:
+        return max(self.config.shadow_maker_min_profitability, self.config.target_profitability)
+
+    def _compute_shadow_order_spec(self) -> Optional[Tuple[TradeType, Decimal, Decimal]]:
+        if self.maker_order is None:
+            return None
+        maker_price = self.maker_order.price if self.maker_order.price and self.maker_order.price > 0 else self._maker_target_price
+        if maker_price <= 0:
+            return None
+        remaining_base = self._maker_remaining_base()
+        if remaining_base <= 0:
+            return None
+        shadow_amount = self.connectors[self.taker_connector].quantize_order_amount(self.taker_trading_pair, remaining_base)
+        if shadow_amount <= 0:
+            return None
+
+        shadow_side = self.taker_order_side
+        extra_buffer = self.config.shadow_maker_extra_buffer_bps / Decimal("10000")
+        required_profit = self._shadow_profitability_floor() + self._tx_cost_pct + extra_buffer
+
+        if shadow_side == TradeType.SELL:
+            min_safe_price = maker_price * (Decimal("1") + required_profit)
+            best_ask = self.get_price(self.taker_connector, self.taker_trading_pair, PriceType.BestAsk) or self._taker_result_price
+            candidate_price = max(min_safe_price, best_ask)
+        else:
+            max_safe_price = maker_price * (Decimal("1") - required_profit)
+            if max_safe_price <= 0:
+                return None
+            best_bid = self.get_price(self.taker_connector, self.taker_trading_pair, PriceType.BestBid) or self._taker_result_price
+            candidate_price = min(max_safe_price, best_bid)
+        shadow_price = self.connectors[self.taker_connector].quantize_order_price(self.taker_trading_pair, candidate_price)
+        if shadow_price <= 0:
+            return None
+        return shadow_side, shadow_amount, shadow_price
+
+    async def create_shadow_order(self):
+        order_spec = self._compute_shadow_order_spec()
+        if order_spec is None:
+            return
+        shadow_side, shadow_amount, shadow_price = order_spec
+        if self.config.allow_one_sided_inventory_mode:
+            has_budget = self._has_order_budget(
+                connector_name=self.taker_connector,
+                trading_pair=self.taker_trading_pair,
+                side=shadow_side,
+                amount=shadow_amount,
+                price=shadow_price,
+                order_type=OrderType.LIMIT_MAKER,
+                is_maker=True,
+            )
+            if not has_budget:
+                self._log_one_sided_mode_warning(
+                    f"Skipping shadow maker order due to insufficient {self.taker_connector} balance "
+                    f"(side={shadow_side.name}, amount={shadow_amount})."
+                )
+                return
+        shadow_order_id = self.place_order(
+            connector_name=self.taker_connector,
+            trading_pair=self.taker_trading_pair,
+            order_type=OrderType.LIMIT_MAKER,
+            side=shadow_side,
+            amount=shadow_amount,
+            price=shadow_price,
+        )
+        self.shadow_order = TrackedOrder(order_id=shadow_order_id)
+        self.logger().info(
+            f"Created shadow maker order {shadow_order_id} on {self.taker_connector} "
+            f"side={shadow_side.name} amount={shadow_amount} price={shadow_price}."
+        )
+
+    async def control_update_shadow_order(self):
+        should_refresh, refresh_reason = self._should_refresh_shadow_order()
+        if should_refresh:
+            self.logger().info(f"Refreshing shadow maker order {self.shadow_order.order_id}: {refresh_reason}")
+            self.request_shadow_cancel()
+
+    def _amount_refresh_tolerance(self, connector: str, trading_pair: str) -> Decimal:
+        try:
+            trading_rule = self.get_trading_rules(connector, trading_pair)
+            return trading_rule.min_base_amount_increment or Decimal("0")
+        except Exception:
+            return Decimal("0")
+
+    def _should_refresh_shadow_order(self) -> Tuple[bool, str]:
+        if self.shadow_order is None or self.shadow_order.order is None:
+            return False, ""
+        if not self.shadow_order.order.is_open:
+            return False, ""
+        desired_spec = self._compute_shadow_order_spec()
+        if desired_spec is None:
+            return True, "shadow order no longer valid"
+        _, desired_amount, desired_price = desired_spec
+        current_price = self.shadow_order.order.price
+        current_amount = self.shadow_order.order.amount
+        if current_price is None or current_price <= 0:
+            return True, "missing current shadow price"
+        price_deviation = abs(desired_price - current_price) / current_price
+        if price_deviation >= self.config.shadow_maker_price_refresh_pct:
+            return True, (
+                f"price_deviation={price_deviation:.6f} >= "
+                f"shadow_maker_price_refresh_pct={self.config.shadow_maker_price_refresh_pct}"
+            )
+        amount_tolerance = self._amount_refresh_tolerance(self.taker_connector, self.taker_trading_pair)
+        amount_diff = abs(desired_amount - current_amount)
+        if amount_diff > max(amount_tolerance, Decimal("0")):
+            return True, f"shadow amount changed by {amount_diff} (> tolerance={amount_tolerance})"
+        order_age = self._strategy.current_timestamp - self.shadow_order.order.creation_timestamp
+        if order_age >= self.config.shadow_maker_order_max_age_seconds and price_deviation > Decimal("0"):
+            return True, (
+                f"shadow order_age={order_age:.2f}s with stale price deviation={price_deviation:.6f} "
+                f"exceeds shadow_maker_order_max_age_seconds={self.config.shadow_maker_order_max_age_seconds}"
+            )
+        return False, ""
+
+    def _record_prefill_fill(self, order_id: str, amount: Decimal):
+        previous = self._shadow_prefill_recorded_fills.get(order_id, Decimal("0"))
+        self._shadow_prefill_recorded_fills[order_id] = previous + amount
+
+    def _record_prefill_completion_delta(self, order_id: str, completed_base: Decimal) -> Decimal:
+        already = self._shadow_prefill_recorded_fills.get(order_id, Decimal("0"))
+        delta = completed_base - already
+        self._shadow_prefill_recorded_fills.pop(order_id, None)
+        return delta if delta > 0 else Decimal("0")
+
+    def _start_shadow_prefill_mode(self):
+        if not self._shadow_prefill_mode:
+            self.logger().warning(
+                f"Shadow prefill detected. Entering protection mode with remaining_base={self._shadow_prefill_remaining_base}."
+            )
+            self._shadow_prefill_mode = True
+            self._shadow_prefill_stage = "cancel_maker"
+            self._shadow_prefill_stage_started_ts = self._strategy.current_timestamp
+            self._shadow_prefill_cross_order_active = False
+            self._shadow_prefill_unwind_retries = 0
+        if self._tracked_order_is_open(self.shadow_order):
+            self.request_shadow_cancel()
+        if self._tracked_order_is_open(self.maker_order):
+            self.request_maker_cancel()
+
+    def _consume_shadow_prefill_remaining(self, consumed: Decimal):
+        if consumed is None or consumed <= 0:
+            return
+        current_base = self._shadow_prefill_remaining_base
+        if current_base > 0 and self._shadow_prefill_remaining_quote > 0:
+            avg_entry_price = self._shadow_prefill_remaining_quote / current_base
+            quote_consumed = avg_entry_price * consumed
+            self._shadow_prefill_remaining_quote -= quote_consumed
+            if self._shadow_prefill_remaining_quote < 0:
+                self._shadow_prefill_remaining_quote = Decimal("0")
+        self._shadow_prefill_remaining_base -= consumed
+        if self._shadow_prefill_remaining_base < 0:
+            self._shadow_prefill_remaining_base = Decimal("0")
+        if self._shadow_prefill_remaining_base == 0:
+            self._shadow_prefill_remaining_quote = Decimal("0")
+
+    def _add_shadow_prefill_exposure(
+        self,
+        base_amount: Decimal,
+        quote_amount: Decimal = Decimal("0"),
+        price_hint: Decimal = Decimal("0"),
+    ):
+        if base_amount is None or base_amount <= 0:
+            return
+        self._shadow_prefill_remaining_base += base_amount
+        if quote_amount is not None and quote_amount > 0:
+            self._shadow_prefill_remaining_quote += quote_amount
+            return
+        if price_hint is not None and price_hint > 0:
+            self._shadow_prefill_remaining_quote += base_amount * price_hint
+
+    def _shadow_prefill_avg_entry_price(self) -> Decimal:
+        if self._shadow_prefill_remaining_base <= 0 or self._shadow_prefill_remaining_quote <= 0:
+            return Decimal("0")
+        return self._shadow_prefill_remaining_quote / self._shadow_prefill_remaining_base
+
+    def _shadow_prefill_close_profitability(self, close_price: Decimal) -> Decimal:
+        entry_price = self._shadow_prefill_avg_entry_price()
+        if entry_price <= 0 or close_price is None or close_price <= 0:
+            return Decimal("0")
+        if self.maker_order_side == TradeType.BUY:
+            # prefill happened as taker SELL, flatten with BUY
+            return (entry_price - close_price) / entry_price
+        # prefill happened as taker BUY, flatten with SELL
+        return (close_price - entry_price) / entry_price
+
+    def _can_place_shadow_prefill_close_order(self, stage: str, close_price: Decimal) -> bool:
+        if self.config.allow_loss_hedge:
+            return True
+        if close_price is None or close_price <= 0:
+            return True
+        profitability = self._shadow_prefill_close_profitability(close_price)
+        if profitability >= self.config.min_profitability_guard:
+            return True
+        now = self._strategy.current_timestamp
+        if now - self._shadow_prefill_last_guard_block_ts >= 2.0:
+            self.logger().warning(
+                f"Shadow prefill {stage} blocked by profitability guard: "
+                f"estimated_profitability={profitability:.6f} < min_guard={self.config.min_profitability_guard}, "
+                f"entry_avg={self._shadow_prefill_avg_entry_price():.6f}, close_price={close_price:.6f}"
+            )
+            self._shadow_prefill_last_guard_block_ts = now
+        return False
+
+    async def control_shadow_prefill_mode(self):
+        if self._shadow_prefill_remaining_base <= 0:
+            self.logger().info("Shadow prefill fully flattened. Terminating executor.")
+            self.close_type = CloseType.COMPLETED
+            self.stop()
+            return
+
+        if self._shadow_prefill_stage == "cancel_maker":
+            if self._tracked_order_is_open(self.shadow_order):
+                self.request_shadow_cancel()
+            elif self._shadow_cancel_in_flight:
+                await self.control_pending_shadow_cancel()
+
+            if self._tracked_order_is_open(self.maker_order):
+                self.request_maker_cancel()
+                return
+            if self._maker_cancel_in_flight:
+                await self.control_pending_maker_cancel()
+                return
+
+            self._shadow_prefill_stage = "cross"
+            self._shadow_prefill_stage_started_ts = self._strategy.current_timestamp
+            return
+
+        if self._shadow_prefill_stage == "cross":
+            if self.maker_order is None and not self._shadow_prefill_cross_order_active:
+                await self._place_shadow_prefill_cross_order()
+                return
+            if self._tracked_order_is_open(self.maker_order):
+                order_age = self._strategy.current_timestamp - self.maker_order.order.creation_timestamp
+                if order_age >= self.config.shadow_prefill_cross_timeout_sec:
+                    self.request_maker_cancel()
+                return
+            if self._maker_cancel_in_flight:
+                await self.control_pending_maker_cancel()
+                return
+            if self._shadow_prefill_cross_order_active and self.maker_order is None:
+                if self._shadow_prefill_remaining_base > 0:
+                    self._shadow_prefill_stage = "unwind"
+                    self._shadow_prefill_stage_started_ts = self._strategy.current_timestamp
+                return
+
+        if self._shadow_prefill_stage == "unwind":
+            if self._shadow_prefill_remaining_base <= 0:
+                self.close_type = CloseType.COMPLETED
+                self.stop()
+                return
+            if self._shadow_prefill_unwind_retries > self.config.shadow_prefill_max_retries:
+                self.close_type = CloseType.FAILED
+                self.logger().error(
+                    f"Shadow prefill unwind retries exceeded with remaining_base={self._shadow_prefill_remaining_base}"
+                )
+                self.stop()
+                return
+            if self._shadow_prefill_unwind_order is None:
+                await self._place_shadow_prefill_unwind_order()
+                return
+            if self._tracked_order_is_open(self._shadow_prefill_unwind_order):
+                order_age = self._strategy.current_timestamp - self._shadow_prefill_unwind_order.order.creation_timestamp
+                if order_age >= self.config.shadow_prefill_unwind_timeout_sec:
+                    self.request_shadow_prefill_unwind_cancel()
+                return
+            if self._shadow_prefill_unwind_cancel_in_flight:
+                await self.control_pending_shadow_prefill_unwind_cancel()
+                return
+
+    def _get_aggressive_limit_price(
+        self,
+        connector_name: str,
+        trading_pair: str,
+        side: TradeType,
+        amount: Decimal,
+        slippage_buffer_bps: Decimal,
+    ) -> Decimal:
+        connector = self.connectors[connector_name]
+        price_result = connector.get_price_for_volume(trading_pair, side == TradeType.BUY, amount)
+        if side == TradeType.BUY:
+            fallback_price = self.get_price(connector_name, trading_pair, PriceType.BestAsk)
+        else:
+            fallback_price = self.get_price(connector_name, trading_pair, PriceType.BestBid)
+        reference_price = price_result.result_price if price_result.result_price is not None else fallback_price
+        buffer = slippage_buffer_bps / Decimal("10000")
+        if side == TradeType.BUY:
+            price = reference_price * (Decimal("1") + buffer)
+        else:
+            price = reference_price * (Decimal("1") - buffer)
+        return connector.quantize_order_price(trading_pair, price)
+
+    async def _place_shadow_prefill_cross_order(self):
+        amount = self.connectors[self.maker_connector].quantize_order_amount(
+            self.maker_trading_pair, self._shadow_prefill_remaining_base
+        )
+        if amount <= 0:
+            self.close_type = CloseType.COMPLETED
+            self.stop()
+            return
+        price = self._get_aggressive_limit_price(
+            connector_name=self.maker_connector,
+            trading_pair=self.maker_trading_pair,
+            side=self.maker_order_side,
+            amount=amount,
+            slippage_buffer_bps=self.config.taker_slippage_buffer_bps,
+        )
+        if not self._can_place_shadow_prefill_close_order(stage="cross", close_price=price):
+            return
+        order_id = self.place_order(
+            connector_name=self.maker_connector,
+            trading_pair=self.maker_trading_pair,
+            order_type=OrderType.LIMIT,
+            side=self.maker_order_side,
+            amount=amount,
+            price=price,
+        )
+        self.maker_order = TrackedOrder(order_id=order_id)
+        self._shadow_prefill_cross_order_active = True
+        self._shadow_prefill_stage_started_ts = self._strategy.current_timestamp
+        self.logger().warning(
+            f"Shadow prefill cross attempt: order_id={order_id}, connector={self.maker_connector}, "
+            f"side={self.maker_order_side.name}, amount={amount}, price={price}"
+        )
+
+    async def _place_shadow_prefill_unwind_order(self):
+        amount = self.connectors[self.taker_connector].quantize_order_amount(
+            self.taker_trading_pair, self._shadow_prefill_remaining_base
+        )
+        if amount <= 0:
+            self.close_type = CloseType.COMPLETED
+            self.stop()
+            return
+        unwind_side = self.maker_order_side
+        order_type = self._effective_taker_order_type()
+        price = Decimal("NaN")
+        guard_price = Decimal("0")
+        if order_type == OrderType.LIMIT:
+            price = self._get_aggressive_limit_price(
+                connector_name=self.taker_connector,
+                trading_pair=self.taker_trading_pair,
+                side=unwind_side,
+                amount=amount,
+                slippage_buffer_bps=self.config.taker_slippage_buffer_bps,
+            )
+            guard_price = price
+        else:
+            price_result = self.connectors[self.taker_connector].get_price_for_volume(
+                self.taker_trading_pair, unwind_side == TradeType.BUY, amount
+            )
+            if price_result is not None and price_result.result_price is not None:
+                guard_price = Decimal(str(price_result.result_price))
+        if not self._can_place_shadow_prefill_close_order(stage="unwind", close_price=guard_price):
+            return
+        order_id = self.place_order(
+            connector_name=self.taker_connector,
+            trading_pair=self.taker_trading_pair,
+            order_type=order_type,
+            side=unwind_side,
+            amount=amount,
+            price=price,
+        )
+        self._shadow_prefill_unwind_order = TrackedOrder(order_id=order_id)
+        self._shadow_prefill_stage_started_ts = self._strategy.current_timestamp
+        self.logger().warning(
+            f"Shadow prefill unwind attempt: order_id={order_id}, connector={self.taker_connector}, "
+            f"side={unwind_side.name}, amount={amount}, order_type={order_type.name}"
+        )
+
+    def request_shadow_prefill_unwind_cancel(self):
+        if self._shadow_prefill_unwind_order is None:
+            return
+        if self._shadow_prefill_unwind_cancel_in_flight:
+            return
+        self._strategy.cancel(self.taker_connector, self.taker_trading_pair, self._shadow_prefill_unwind_order.order_id)
+        self._shadow_prefill_unwind_cancel_in_flight = True
+        self._shadow_prefill_unwind_cancel_requested_timestamp = self._strategy.current_timestamp
+
+    async def control_pending_shadow_prefill_unwind_cancel(self):
+        if self._shadow_prefill_unwind_order is None:
+            self._shadow_prefill_unwind_cancel_in_flight = False
+            return
+        unwind_order = self._shadow_prefill_unwind_order.order
+        if unwind_order is not None and not unwind_order.is_open:
+            return
+        now = self._strategy.current_timestamp
+        if now - self._shadow_prefill_unwind_cancel_requested_timestamp >= self._shadow_prefill_unwind_cancel_retry_interval:
+            self.logger().warning(
+                f"Shadow prefill unwind cancel pending for {self._shadow_prefill_unwind_order.order_id}. Retrying."
+            )
+            self._strategy.cancel(self.taker_connector, self.taker_trading_pair, self._shadow_prefill_unwind_order.order_id)
+            self._shadow_prefill_unwind_cancel_requested_timestamp = now
+
     async def update_prices_and_tx_costs(self, order_amount: Decimal = None):
         hedge_amount = order_amount if order_amount is not None else self.config.order_amount
         self._taker_result_price = await self.get_resulting_price_for_amount(
@@ -224,6 +883,18 @@ class XEMMExecutor(ExecutorBase):
             is_buy=self.taker_order_side == TradeType.BUY,
             order_amount=hedge_amount)
         await self.update_tx_costs(order_amount=hedge_amount)
+        if getattr(self.config, "maker_price_source", "formula") == "best":
+            connector = self.connectors[self.maker_connector]
+            # is_buy=True -> best ask, is_buy=False -> best bid
+            best_price = connector.get_price(self.maker_trading_pair, self.maker_order_side == TradeType.SELL)
+            if best_price is not None and best_price > Decimal("0") and not best_price.is_nan():
+                self._maker_target_price = connector.quantize_order_price(self.maker_trading_pair, best_price)
+                return
+            self.logger().warning(
+                f"maker_price_source=best but maker best price unavailable for "
+                f"{self.maker_connector} {self.maker_trading_pair}. Falling back to formula pricing."
+            )
+
         if self.taker_order_side == TradeType.BUY:
             # Maker is SELL: profitability = (maker_price - taker_price) / maker_price
             # To achieve target: maker_price = taker_price / (1 - target_profitability - tx_cost_pct)
@@ -290,20 +961,72 @@ class XEMMExecutor(ExecutorBase):
         return await self.connectors[connector].get_quote_price(trading_pair, is_buy, order_amount)
 
     async def create_maker_order(self):
+        maker_price = self._safe_maker_price_with_stp(self._maker_target_price)
+        if maker_price is None:
+            self._stp_last_error_message = (
+                "Bithumb STP guard could not find a safe maker price within configured offset ticks."
+            )
+            self._stp_cooldown_until_ts = self._strategy.current_timestamp + float(self.config.bithumb_stp_retry_cooldown_sec)
+            self.logger().warning(self._stp_last_error_message)
+            return
+
+        estimated_profitability = await self._estimate_profitability_for_maker_price(maker_price)
+        if estimated_profitability is None:
+            self.logger().warning("Could not estimate profitability for maker order. Skipping maker placement.")
+            return
+        if estimated_profitability < self.config.min_profitability:
+            self.logger().info(
+                f"Skipping maker placement at price={maker_price}: estimated profitability "
+                f"{estimated_profitability} < min_profitability {self.config.min_profitability}."
+            )
+            return
+        if estimated_profitability > self.config.max_profitability:
+            self.logger().info(
+                f"Skipping maker placement at price={maker_price}: estimated profitability "
+                f"{estimated_profitability} > max_profitability {self.config.max_profitability}."
+            )
+            return
+
         order_id = self.place_order(
             connector_name=self.maker_connector,
             trading_pair=self.maker_trading_pair,
             order_type=OrderType.LIMIT,
             side=self.maker_order_side,
             amount=self.config.order_amount,
-            price=self._maker_target_price)
+            price=maker_price)
         self.maker_order = TrackedOrder(order_id=order_id)
-        self.logger().info(f"Created maker order {order_id} at price {self._maker_target_price}.")
+        self.logger().info(f"Created maker order {order_id} at price {maker_price}.")
+
+    async def _estimate_profitability_for_maker_price(self, maker_price: Decimal) -> Optional[Decimal]:
+        if maker_price <= Decimal("0") or self._taker_result_price <= Decimal("0"):
+            return None
+        try:
+            conversion_rate = await self.get_quote_asset_conversion_rate()
+            normalized_taker_price = self._taker_result_price * conversion_rate
+            if self.maker_order_side == TradeType.BUY:
+                trade_profitability = (normalized_taker_price - maker_price) / maker_price
+            else:
+                trade_profitability = (maker_price - normalized_taker_price) / maker_price
+            return trade_profitability - self._tx_cost_pct
+        except Exception as e:
+            self.logger().error(f"Error estimating profitability for maker price {maker_price}: {e}")
+            return None
 
     async def control_shutdown_process(self):
         if self.close_type == CloseType.EARLY_STOP:
             await self.control_early_stop_shutdown()
             return
+
+        if self._tracked_order_is_open(self.shadow_order):
+            if not self._shadow_cancel_in_flight:
+                self.request_shadow_cancel()
+            else:
+                await self.control_pending_shadow_cancel()
+        if self._tracked_order_is_open(self._shadow_prefill_unwind_order):
+            if not self._shadow_prefill_unwind_cancel_in_flight:
+                self.request_shadow_prefill_unwind_cancel()
+            else:
+                await self.control_pending_shadow_prefill_unwind_cancel()
 
         if self._should_refresh_taker_limit_order():
             await self._refresh_taker_limit_order()
@@ -314,7 +1037,12 @@ class XEMMExecutor(ExecutorBase):
 
         maker_done = self.maker_order is not None and self.maker_order.is_done
         taker_done = self.taker_order is not None and self.taker_order.is_done
-        if maker_done and taker_done:
+        shadow_closed = not self._tracked_order_is_open(self.shadow_order) and not self._shadow_cancel_in_flight
+        unwind_closed = (
+            not self._tracked_order_is_open(self._shadow_prefill_unwind_order)
+            and not self._shadow_prefill_unwind_cancel_in_flight
+        )
+        if maker_done and taker_done and shadow_closed and unwind_closed:
             self.logger().info("Both orders are done, executor terminated.")
             self.stop()
 
@@ -340,16 +1068,37 @@ class XEMMExecutor(ExecutorBase):
                 else:
                     await self.control_pending_taker_cancel()
 
+        shadow_open = self._tracked_order_is_open(self.shadow_order)
+        if shadow_open:
+            if not self._shadow_cancel_in_flight:
+                self.logger().info(f"Early stop: cancelling shadow order {self.shadow_order.order_id}.")
+                self.request_shadow_cancel()
+            else:
+                await self.control_pending_shadow_cancel()
+        unwind_open = self._tracked_order_is_open(self._shadow_prefill_unwind_order)
+        if unwind_open:
+            if not self._shadow_prefill_unwind_cancel_in_flight:
+                self.logger().info(
+                    f"Early stop: cancelling shadow prefill unwind order {self._shadow_prefill_unwind_order.order_id}."
+                )
+                self.request_shadow_prefill_unwind_cancel()
+            else:
+                await self.control_pending_shadow_prefill_unwind_cancel()
+
         ready_to_stop = (
             not self._tracked_order_is_open(self.maker_order)
             and not self._maker_cancel_in_flight
             and not self._taker_cancel_in_flight
+            and not self._shadow_cancel_in_flight
+            and not self._shadow_prefill_unwind_cancel_in_flight
         )
         if self._early_stop_hedge_initiated:
             taker_done = self.taker_order is not None and self.taker_order.is_done
             ready_to_stop = ready_to_stop and taker_done
         else:
             ready_to_stop = ready_to_stop and (not self._tracked_order_is_open(self.taker_order))
+        ready_to_stop = ready_to_stop and (not self._tracked_order_is_open(self.shadow_order))
+        ready_to_stop = ready_to_stop and (not self._tracked_order_is_open(self._shadow_prefill_unwind_order))
 
         if ready_to_stop:
             self.logger().info("Early stop cleanup completed. Executor terminated.")
@@ -476,6 +1225,30 @@ class XEMMExecutor(ExecutorBase):
             self.logger().info(self._hedge_block_reason)
             return
 
+        taker_order_type = self._effective_taker_order_type()
+        taker_price = self._taker_result_price
+        if taker_order_type == OrderType.LIMIT:
+            taker_price = self._get_taker_limit_price(hedge_amount)
+        has_taker_budget = self._has_order_budget(
+            connector_name=self.taker_connector,
+            trading_pair=self.taker_trading_pair,
+            side=self.taker_order_side,
+            amount=hedge_amount,
+            price=taker_price,
+            order_type=taker_order_type,
+            is_maker=False,
+        )
+        if not has_taker_budget:
+            if self.config.allow_one_sided_inventory_mode:
+                self._hedge_block_reason = "One-sided mode: taker hedge skipped due to insufficient balance."
+                self._log_one_sided_mode_warning(self._hedge_block_reason)
+                self.close_type = CloseType.INSUFFICIENT_BALANCE
+                self.stop()
+                return
+            self._hedge_block_reason = "Taker hedge blocked: insufficient balance."
+            self.logger().warning(self._hedge_block_reason)
+            return
+
         # Place taker hedge for unhedged amount
         self._hedge_block_reason = ""
         self.place_taker_order(order_amount=hedge_amount)
@@ -542,9 +1315,35 @@ class XEMMExecutor(ExecutorBase):
         if self.maker_order and event.order_id == self.maker_order.order_id:
             self.logger().info(f"Maker order {event.order_id} created.")
             self.maker_order.order = self.get_in_flight_order(self.maker_connector, event.order_id)
+            self._reset_stp_state_on_success()
         elif self.taker_order and event.order_id == self.taker_order.order_id:
             self.logger().info(f"Taker order {event.order_id} created.")
             self.taker_order.order = self.get_in_flight_order(self.taker_connector, event.order_id)
+        elif self.shadow_order and event.order_id == self.shadow_order.order_id:
+            self.logger().info(f"Shadow maker order {event.order_id} created.")
+            self.shadow_order.order = self.get_in_flight_order(self.taker_connector, event.order_id)
+        elif self._shadow_prefill_unwind_order and event.order_id == self._shadow_prefill_unwind_order.order_id:
+            self.logger().info(f"Shadow prefill unwind order {event.order_id} created.")
+            self._shadow_prefill_unwind_order.order = self.get_in_flight_order(self.taker_connector, event.order_id)
+
+    def process_order_filled_event(self,
+                                   event_tag: int,
+                                   market: ConnectorBase,
+                                   event: OrderFilledEvent):
+        if self.shadow_order and event.order_id == self.shadow_order.order_id:
+            self._record_prefill_fill(order_id=event.order_id, amount=event.amount)
+            self._add_shadow_prefill_exposure(
+                base_amount=event.amount,
+                quote_amount=event.amount * event.price if event.price is not None else Decimal("0"),
+            )
+            if not self._shadow_prefill_mode and not (self.maker_order and self.maker_order.is_done):
+                self._start_shadow_prefill_mode()
+        elif self._shadow_prefill_mode and self.maker_order and event.order_id == self.maker_order.order_id:
+            self._record_prefill_fill(order_id=event.order_id, amount=event.amount)
+            self._consume_shadow_prefill_remaining(event.amount)
+        elif self._shadow_prefill_unwind_order and event.order_id == self._shadow_prefill_unwind_order.order_id:
+            self._record_prefill_fill(order_id=event.order_id, amount=event.amount)
+            self._consume_shadow_prefill_remaining(event.amount)
 
     def process_order_completed_event(self,
                                       event_tag: int,
@@ -553,6 +1352,23 @@ class XEMMExecutor(ExecutorBase):
         if self.maker_order and event.order_id == self.maker_order.order_id:
             event_executed_base = getattr(event, "base_asset_amount", Decimal("0"))
             event_executed_quote = getattr(event, "quote_asset_amount", Decimal("0"))
+            if self._shadow_prefill_mode:
+                delta = self._record_prefill_completion_delta(event.order_id, event_executed_base)
+                self._consume_shadow_prefill_remaining(delta)
+                self.logger().warning(
+                    f"Shadow prefill cross order {event.order_id} completed. "
+                    f"remaining_prefill_base={self._shadow_prefill_remaining_base}"
+                )
+                self._maker_cancel_in_flight = False
+                self._shadow_prefill_cross_order_active = False
+                self.maker_order = None
+                if self._shadow_prefill_remaining_base <= 0:
+                    self.close_type = CloseType.COMPLETED
+                    self.stop()
+                else:
+                    self._shadow_prefill_stage = "unwind"
+                    self._shadow_prefill_stage_started_ts = self._strategy.current_timestamp
+                return
             if self.close_type == CloseType.EARLY_STOP:
                 self._maker_cancel_in_flight = False
                 self._record_maker_fill(executed_base=event_executed_base, executed_quote=event_executed_quote)
@@ -598,6 +1414,48 @@ class XEMMExecutor(ExecutorBase):
                     if event_executed_quote and not event_executed_quote.is_nan():
                         self._unhedged_quote += event_executed_quote * sign
             self._early_stop_hedge_initiated = False
+        elif self.shadow_order and event.order_id == self.shadow_order.order_id:
+            completed_base = getattr(event, "base_asset_amount", Decimal("0"))
+            completed_quote = getattr(event, "quote_asset_amount", Decimal("0"))
+            delta = self._record_prefill_completion_delta(event.order_id, completed_base)
+            if delta > 0:
+                quote_delta = Decimal("0")
+                if completed_base > 0 and completed_quote > 0:
+                    quote_delta = (completed_quote / completed_base) * delta
+                elif self.shadow_order.average_executed_price and self.shadow_order.average_executed_price > 0:
+                    quote_delta = self.shadow_order.average_executed_price * delta
+                elif self.shadow_order.price and self.shadow_order.price > 0:
+                    quote_delta = self.shadow_order.price * delta
+                self._add_shadow_prefill_exposure(base_amount=delta, quote_amount=quote_delta)
+            self.logger().warning(
+                f"Shadow maker order {event.order_id} completed before maker. "
+                f"prefill_remaining_base={self._shadow_prefill_remaining_base}"
+            )
+            self.shadow_order = None
+            self._shadow_cancel_in_flight = False
+            if self._shadow_prefill_remaining_base > 0:
+                self._start_shadow_prefill_mode()
+        elif self._shadow_prefill_unwind_order and event.order_id == self._shadow_prefill_unwind_order.order_id:
+            completed_base = getattr(event, "base_asset_amount", Decimal("0"))
+            delta = self._record_prefill_completion_delta(event.order_id, completed_base)
+            self._consume_shadow_prefill_remaining(delta)
+            self.logger().warning(
+                f"Shadow prefill unwind order {event.order_id} completed. "
+                f"remaining_prefill_base={self._shadow_prefill_remaining_base}"
+            )
+            self._shadow_prefill_unwind_order = None
+            self._shadow_prefill_unwind_cancel_in_flight = False
+            if self._shadow_prefill_remaining_base <= 0:
+                self.close_type = CloseType.COMPLETED
+                self.stop()
+            else:
+                self._shadow_prefill_unwind_retries += 1
+                if self._shadow_prefill_unwind_retries > self.config.shadow_prefill_max_retries:
+                    self.close_type = CloseType.FAILED
+                    self.logger().error(
+                        f"Shadow prefill unwind retries exceeded with remaining_base={self._shadow_prefill_remaining_base}"
+                    )
+                    self.stop()
 
     def process_order_canceled_event(self,
                                      event_tag: int,
@@ -605,8 +1463,17 @@ class XEMMExecutor(ExecutorBase):
                                      event: OrderCancelledEvent):
         if self.maker_order and event.order_id == self.maker_order.order_id:
             self.logger().info(f"Maker order {event.order_id} cancelled.")
+            executed_base = self.maker_order.executed_amount_base if self.maker_order.executed_amount_base else Decimal("0")
+            if self._shadow_prefill_mode and executed_base > 0:
+                delta = self._record_prefill_completion_delta(event.order_id, executed_base)
+                self._consume_shadow_prefill_remaining(delta)
             self.maker_order = None
             self._maker_cancel_in_flight = False
+            if self._shadow_prefill_mode and self._shadow_prefill_stage == "cross":
+                self._shadow_prefill_cross_order_active = False
+                if self._shadow_prefill_remaining_base > 0:
+                    self._shadow_prefill_stage = "unwind"
+                    self._shadow_prefill_stage_started_ts = self._strategy.current_timestamp
         elif self.taker_order and event.order_id == self.taker_order.order_id:
             self.logger().info(f"Taker order {event.order_id} cancelled.")
             self.taker_order = None
@@ -623,18 +1490,52 @@ class XEMMExecutor(ExecutorBase):
                 self._early_stop_hedge_initiated = False
             if self.status == RunnableStatus.SHUTTING_DOWN and self.close_type != CloseType.EARLY_STOP:
                 self._replace_taker_order_after_cancel()
+        elif self.shadow_order and event.order_id == self.shadow_order.order_id:
+            self.logger().info(f"Shadow maker order {event.order_id} cancelled.")
+            executed_base = self.shadow_order.executed_amount_base if self.shadow_order.executed_amount_base else Decimal("0")
+            if executed_base > 0:
+                delta = self._record_prefill_completion_delta(event.order_id, executed_base)
+                quote_delta = Decimal("0")
+                if self.shadow_order.average_executed_price and self.shadow_order.average_executed_price > 0:
+                    quote_delta = self.shadow_order.average_executed_price * delta
+                elif self.shadow_order.price and self.shadow_order.price > 0:
+                    quote_delta = self.shadow_order.price * delta
+                self._add_shadow_prefill_exposure(base_amount=delta, quote_amount=quote_delta)
+                if self._shadow_prefill_remaining_base > 0:
+                    self._start_shadow_prefill_mode()
+            self.shadow_order = None
+            self._shadow_cancel_in_flight = False
+        elif self._shadow_prefill_unwind_order and event.order_id == self._shadow_prefill_unwind_order.order_id:
+            self.logger().info(f"Shadow prefill unwind order {event.order_id} cancelled.")
+            executed_base = (
+                self._shadow_prefill_unwind_order.executed_amount_base
+                if self._shadow_prefill_unwind_order.executed_amount_base else Decimal("0")
+            )
+            if executed_base > 0:
+                delta = self._record_prefill_completion_delta(event.order_id, executed_base)
+                self._consume_shadow_prefill_remaining(delta)
+            self._shadow_prefill_unwind_order = None
+            self._shadow_prefill_unwind_cancel_in_flight = False
+            self._shadow_prefill_unwind_retries += 1
+            if self._shadow_prefill_unwind_retries > self.config.shadow_prefill_max_retries and self._shadow_prefill_remaining_base > 0:
+                self.close_type = CloseType.FAILED
+                self.logger().error(
+                    f"Shadow prefill unwind retries exceeded after cancel with remaining_base={self._shadow_prefill_remaining_base}"
+                )
+                self.stop()
 
-    def place_taker_order(self, order_amount: Decimal = None):
+    def place_taker_order(self, order_amount: Decimal = None, side: TradeType = None):
         taker_order_type = self._effective_taker_order_type()
         taker_price = Decimal("NaN")
         amount = order_amount if order_amount is not None else self.config.order_amount
+        effective_side = side if side is not None else self.taker_order_side
         if taker_order_type == OrderType.LIMIT:
-            taker_price = self._get_taker_limit_price(amount)
+            taker_price = self._get_taker_limit_price(amount, side=effective_side)
         taker_order_id = self.place_order(
             connector_name=self.taker_connector,
             trading_pair=self.taker_trading_pair,
             order_type=taker_order_type,
-            side=self.taker_order_side,
+            side=effective_side,
             amount=amount,
             price=taker_price)
         self.taker_order = TrackedOrder(order_id=taker_order_id)
@@ -644,7 +1545,24 @@ class XEMMExecutor(ExecutorBase):
             self.failed_orders.append(self.maker_order)
             self.maker_order = None
             self._maker_cancel_in_flight = False
+            is_stp_reject = self._is_stp_failure_event(event)
+            if is_stp_reject:
+                error_message = event.error_message or "Bithumb self-trade prevention rejection."
+                self._mark_stp_rejection(error_message)
+                self.logger().warning(
+                    f"Bithumb STP rejection on maker order {event.order_id}. "
+                    f"streak={self._stp_reject_streak}, offset_ticks={self._stp_dynamic_offset_ticks}, "
+                    f"cooldown_until={self._stp_cooldown_until_ts}, pause_until={self._stp_pause_until_ts}. "
+                    f"error={error_message}"
+                )
+            if self._shadow_prefill_mode:
+                self._shadow_prefill_cross_order_active = False
+                self._shadow_prefill_stage = "unwind"
+                self._shadow_prefill_stage_started_ts = self._strategy.current_timestamp
+                return
             if self.close_type == CloseType.EARLY_STOP:
+                return
+            if is_stp_reject:
                 return
             self._current_retries += 1
         elif self.taker_order and self.taker_order.order_id == event.order_id:
@@ -678,6 +1596,23 @@ class XEMMExecutor(ExecutorBase):
                     self.stop()
                     return
             self.place_taker_order()
+        elif self.shadow_order and self.shadow_order.order_id == event.order_id:
+            self.failed_orders.append(self.shadow_order)
+            self.shadow_order = None
+            self._shadow_cancel_in_flight = False
+            if self._shadow_prefill_remaining_base > 0:
+                self._start_shadow_prefill_mode()
+        elif self._shadow_prefill_unwind_order and self._shadow_prefill_unwind_order.order_id == event.order_id:
+            self.failed_orders.append(self._shadow_prefill_unwind_order)
+            self._shadow_prefill_unwind_order = None
+            self._shadow_prefill_unwind_cancel_in_flight = False
+            self._shadow_prefill_unwind_retries += 1
+            if self._shadow_prefill_unwind_retries > self.config.shadow_prefill_max_retries:
+                self.close_type = CloseType.FAILED
+                self.logger().error(
+                    f"Shadow prefill unwind failed repeatedly with remaining_base={self._shadow_prefill_remaining_base}."
+                )
+                self.stop()
 
     def get_custom_info(self) -> Dict:
         # Since we can't make this method async, we'll skip the profitability calculation
@@ -706,13 +1641,34 @@ class XEMMExecutor(ExecutorBase):
             "taker_max_retries": self._max_retries,
             "taker_retries": self._current_retries,
             "taker_fallback_to_market": self.config.taker_fallback_to_market,
+            "allow_one_sided_inventory_mode": self.config.allow_one_sided_inventory_mode,
             "stale_fill_hedge_mode": self.config.stale_fill_hedge_mode,
             "maker_cancel_in_flight": self._maker_cancel_in_flight,
             "taker_cancel_in_flight": self._taker_cancel_in_flight,
+            "shadow_maker_enabled": self.config.shadow_maker_enabled,
+            "shadow_order_id": self.shadow_order.order_id if self.shadow_order else None,
+            "shadow_cancel_in_flight": self._shadow_cancel_in_flight,
+            "shadow_prefill_mode": self._shadow_prefill_mode,
+            "shadow_prefill_stage": self._shadow_prefill_stage,
+            "shadow_prefill_remaining_base": self._shadow_prefill_remaining_base,
+            "shadow_prefill_remaining_quote": self._shadow_prefill_remaining_quote,
+            "shadow_prefill_entry_avg_price": self._shadow_prefill_avg_entry_price(),
+            "shadow_prefill_unwind_order_id": (
+                self._shadow_prefill_unwind_order.order_id if self._shadow_prefill_unwind_order else None
+            ),
+            "shadow_prefill_unwind_retries": self._shadow_prefill_unwind_retries,
             "early_stop_hedge_initiated": self._early_stop_hedge_initiated,
             "unhedged_base": self._unhedged_base,
             "unhedged_quote": self._unhedged_quote,
             "hedge_block_reason": self._hedge_block_reason,
+            "stp_reject_streak": self._stp_reject_streak,
+            "stp_dynamic_offset_ticks": self._stp_dynamic_offset_ticks,
+            "stp_cooldown_until_ts": self._stp_cooldown_until_ts,
+            "stp_pause_until_ts": self._stp_pause_until_ts,
+            "stp_pause_remaining_sec": max(0.0, self._stp_pause_until_ts - self._strategy.current_timestamp),
+            "stp_last_error_message": self._stp_last_error_message,
+            "stp_last_blocker_order_id": self._stp_last_blocker_order_id,
+            "stp_last_blocker_price": self._stp_last_blocker_price,
             "loop_metrics": self.get_loop_metrics(),
         }
 
@@ -732,6 +1688,16 @@ class XEMMExecutor(ExecutorBase):
         if self._tracked_order_is_open(self.taker_order):
             self.logger().info(f"Cancelling taker order {self.taker_order.order_id}.")
             self.request_taker_cancel()
+            should_wait_cancels = True
+        if self._tracked_order_is_open(self.shadow_order):
+            self.logger().info(f"Cancelling shadow order {self.shadow_order.order_id}.")
+            self.request_shadow_cancel()
+            should_wait_cancels = True
+        if self._tracked_order_is_open(self._shadow_prefill_unwind_order):
+            self.logger().info(
+                f"Cancelling shadow prefill unwind order {self._shadow_prefill_unwind_order.order_id}."
+            )
+            self.request_shadow_prefill_unwind_cancel()
             should_wait_cancels = True
 
         if should_wait_cancels:
@@ -773,14 +1739,19 @@ class XEMMExecutor(ExecutorBase):
             raise
 
     def to_format_status(self):
+        now = self._strategy.current_timestamp
+        stp_cooldown_remaining = max(0.0, self._stp_cooldown_until_ts - now)
+        stp_pause_remaining = max(0.0, self._stp_pause_until_ts - now)
         return f"""
 Maker Side: {self.maker_order_side}
 -----------------------------------------------------------------------------------------------------------------------
     - Maker: {self.maker_connector} {self.maker_trading_pair} | Taker: {self.taker_connector} {self.taker_trading_pair}
     - Taker order type: {self._effective_taker_order_type().name} | Slippage buffer (bps): {self.config.taker_slippage_buffer_bps} | Taker retries: {self._current_retries}/{self._max_retries}
     - Taker fallback to market: {self.config.taker_fallback_to_market}
+    - Shadow maker: enabled={self.config.shadow_maker_enabled} | order_id={self.shadow_order.order_id if self.shadow_order else 'n/a'} | prefill_mode={self._shadow_prefill_mode} | prefill_stage={self._shadow_prefill_stage} | prefill_remaining={self._shadow_prefill_remaining_base}
     - Stale fill hedge mode: {self.config.stale_fill_hedge_mode} | Early-stop hedge in-flight: {self._early_stop_hedge_initiated}
     - Maker refresh: price_pct={self.config.maker_price_refresh_pct * 100:.4f}% | max_age={self.config.maker_order_max_age_seconds}s
+    - Bithumb STP: enabled={self.config.bithumb_stp_prevention_enabled} | streak={self._stp_reject_streak} | dynamic_offset_ticks={self._stp_dynamic_offset_ticks} | cooldown_remaining={stp_cooldown_remaining:.2f}s | pause_remaining={stp_pause_remaining:.2f}s
     - Maker cancel in-flight: {self._maker_cancel_in_flight}
     - Taker cancel in-flight: {self._taker_cancel_in_flight}
     - Loop metrics: {self.format_loop_metrics()}
@@ -793,15 +1764,16 @@ Maker Side: {self.maker_order_side}
     def _effective_taker_order_type(self) -> OrderType:
         return OrderType.MARKET if self._force_market_taker else self.config.taker_order_type
 
-    def _get_taker_limit_price(self, amount: Decimal) -> Decimal:
+    def _get_taker_limit_price(self, amount: Decimal, side: TradeType = None) -> Decimal:
+        effective_side = side if side is not None else self.taker_order_side
         price_result = self.connectors[self.taker_connector].get_price_for_volume(
             self.taker_trading_pair,
-            self.taker_order_side == TradeType.BUY,
+            effective_side == TradeType.BUY,
             amount,
         )
         reference_price = price_result.result_price if price_result.result_price is not None else self._taker_result_price
         slippage_multiplier = self.config.taker_slippage_buffer_bps / Decimal("10000")
-        if self.taker_order_side == TradeType.BUY:
+        if effective_side == TradeType.BUY:
             limit_price = reference_price * (Decimal("1") + slippage_multiplier)
         else:
             limit_price = reference_price * (Decimal("1") - slippage_multiplier)

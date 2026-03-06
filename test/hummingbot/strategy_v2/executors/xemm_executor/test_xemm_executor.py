@@ -1,7 +1,8 @@
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from test.logger_mixin_for_test import LoggerMixinForTest
-from unittest.mock import ANY, MagicMock, Mock, PropertyMock, patch
+from types import SimpleNamespace
+from unittest.mock import ANY, AsyncMock, MagicMock, Mock, PropertyMock, patch
 
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
@@ -13,6 +14,7 @@ from hummingbot.core.event.events import (
     BuyOrderCreatedEvent,
     MarketOrderFailureEvent,
     OrderCancelledEvent,
+    OrderFilledEvent,
     SellOrderCompletedEvent,
 )
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
@@ -73,6 +75,21 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
             taker_slippage_buffer_bps=Decimal("10"),
         )
 
+    @property
+    def base_config_shadow(self) -> XEMMExecutorConfig:
+        return XEMMExecutorConfig(
+            timestamp=1234,
+            buying_market=ConnectorPair(connector_name='bithumb', trading_pair='XRP-KRW'),
+            selling_market=ConnectorPair(connector_name='upbit', trading_pair='XRP-KRW'),
+            maker_side=TradeType.BUY,
+            order_amount=Decimal('10'),
+            min_profitability=Decimal('0.001'),
+            target_profitability=Decimal('0.0015'),
+            max_profitability=Decimal('0.01'),
+            taker_order_type=OrderType.LIMIT,
+            shadow_maker_enabled=True,
+        )
+
     @staticmethod
     def create_mock_strategy():
         market = MagicMock()
@@ -96,12 +113,298 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         }
         return strategy
 
+    @staticmethod
+    def create_shadow_mock_strategy(include_limit_maker: bool = True):
+        strategy = TestXEMMExecutor.create_mock_strategy()
+        bithumb_connector = MagicMock(spec=ExchangePyBase)
+        upbit_connector = MagicMock(spec=ExchangePyBase)
+        supported = [OrderType.LIMIT, OrderType.MARKET]
+        if include_limit_maker:
+            supported.append(OrderType.LIMIT_MAKER)
+        bithumb_connector.supported_order_types = MagicMock(return_value=[OrderType.LIMIT, OrderType.MARKET])
+        upbit_connector.supported_order_types = MagicMock(return_value=supported)
+        for connector in [bithumb_connector, upbit_connector]:
+            connector.get_price_by_type.return_value = Decimal("100")
+            connector.quantize_order_amount.side_effect = lambda pair, amount: amount
+            connector.quantize_order_price.side_effect = lambda pair, price: price
+            connector.get_order_price_quantum.side_effect = lambda pair, price: Decimal("1")
+            connector.get_price_for_volume.return_value = SimpleNamespace(result_price=Decimal("100"))
+            connector.in_flight_orders = {}
+        strategy.connectors = {
+            "bithumb": bithumb_connector,
+            "upbit": upbit_connector,
+        }
+        return strategy
+
     def test_is_arbitrage_valid(self):
         self.assertTrue(self.executor.is_arbitrage_valid('ETH-USDT', 'ETH-USDT'))
         self.assertTrue(self.executor.is_arbitrage_valid('ETH-BUSD', 'ETH-USDT'))
         self.assertTrue(self.executor.is_arbitrage_valid('ETH-USDT', 'WETH-USDT'))
         self.assertFalse(self.executor.is_arbitrage_valid('ETH-USDT', 'BTC-USDT'))
         self.assertTrue(self.executor.is_arbitrage_valid('ETH-USDT', 'ETH-BTC'))
+
+    def test_shadow_maker_requires_limit_maker_support(self):
+        strategy = self.create_shadow_mock_strategy(include_limit_maker=False)
+        with self.assertRaises(ValueError):
+            XEMMExecutor(strategy, self.base_config_shadow, self.update_interval)
+
+    @patch.object(XEMMExecutor, "get_resulting_price_for_amount")
+    @patch.object(XEMMExecutor, "get_tx_cost_in_asset")
+    async def test_control_task_creates_shadow_order_when_enabled(self, tx_cost_mock, resulting_price_mock):
+        strategy = self.create_shadow_mock_strategy(include_limit_maker=True)
+        executor = XEMMExecutor(strategy, self.base_config_shadow, self.update_interval)
+        tx_cost_mock.return_value = Decimal("0.01")
+        resulting_price_mock.return_value = Decimal("100")
+        executor._status = RunnableStatus.RUNNING
+
+        await executor.control_task()
+
+        self.assertIsNotNone(executor.maker_order)
+        self.assertIsNotNone(executor.shadow_order)
+        strategy.sell.assert_called()
+        sell_args, _ = strategy.sell.call_args
+        self.assertEqual(sell_args[0], "upbit")
+        self.assertEqual(sell_args[3], OrderType.LIMIT_MAKER)
+
+    def test_shadow_fill_enters_prefill_mode(self):
+        strategy = self.create_shadow_mock_strategy(include_limit_maker=True)
+        executor = XEMMExecutor(strategy, self.base_config_shadow, self.update_interval)
+        executor.shadow_order = TrackedOrder(order_id="OID-SHADOW-1")
+
+        fill_event = OrderFilledEvent(
+            timestamp=1234.0,
+            order_id="OID-SHADOW-1",
+            trading_pair="XRP-KRW",
+            trade_type=TradeType.SELL,
+            order_type=OrderType.LIMIT_MAKER,
+            price=Decimal("100"),
+            amount=Decimal("2"),
+            trade_fee=MagicMock(),
+        )
+        executor.process_order_filled_event(1, MagicMock(), fill_event)
+
+        self.assertTrue(executor._shadow_prefill_mode)
+        self.assertEqual("cancel_maker", executor._shadow_prefill_stage)
+        self.assertEqual(Decimal("2"), executor._shadow_prefill_remaining_base)
+        self.assertEqual(Decimal("200"), executor._shadow_prefill_remaining_quote)
+
+    async def test_shadow_prefill_cross_blocked_by_profit_guard(self):
+        strategy = self.create_shadow_mock_strategy(include_limit_maker=True)
+        config = self.base_config_shadow
+        config.allow_loss_hedge = False
+        config.min_profitability_guard = Decimal("0.001")
+        executor = XEMMExecutor(strategy, config, self.update_interval)
+        executor._shadow_prefill_remaining_base = Decimal("2")
+        executor._shadow_prefill_remaining_quote = Decimal("200")
+
+        with patch.object(executor, "_get_aggressive_limit_price", return_value=Decimal("101")):
+            await executor._place_shadow_prefill_cross_order()
+
+        self.assertIsNone(executor.maker_order)
+        strategy.buy.assert_not_called()
+
+    async def test_shadow_prefill_unwind_allowed_when_loss_hedge_enabled(self):
+        strategy = self.create_shadow_mock_strategy(include_limit_maker=True)
+        config = self.base_config_shadow
+        config.allow_loss_hedge = True
+        config.min_profitability_guard = Decimal("0.01")
+        config.taker_order_type = OrderType.LIMIT
+        executor = XEMMExecutor(strategy, config, self.update_interval)
+        executor._shadow_prefill_remaining_base = Decimal("2")
+        executor._shadow_prefill_remaining_quote = Decimal("200")
+
+        with patch.object(executor, "_get_aggressive_limit_price", return_value=Decimal("101")):
+            await executor._place_shadow_prefill_unwind_order()
+
+        self.assertIsNotNone(executor._shadow_prefill_unwind_order)
+        strategy.buy.assert_called()
+
+    @patch.object(XEMMExecutor, "get_resulting_price_for_amount")
+    @patch.object(XEMMExecutor, "get_tx_cost_in_asset")
+    async def test_update_prices_best_source_uses_best_ask_for_maker_sell(self, tx_cost_mock, resulting_price_mock):
+        strategy = self.create_mock_strategy()
+        config = self.base_config_short
+        config.maker_price_source = "best"
+        executor = XEMMExecutor(strategy, config, self.update_interval)
+        tx_cost_mock.return_value = Decimal("0")
+        resulting_price_mock.return_value = Decimal("100")
+        strategy.connectors[executor.maker_connector].get_price.return_value = Decimal("101")
+        strategy.connectors[executor.maker_connector].quantize_order_price.side_effect = lambda pair, price: price
+
+        await executor.update_prices_and_tx_costs()
+
+        self.assertEqual(Decimal("101"), executor._maker_target_price)
+        strategy.connectors[executor.maker_connector].get_price.assert_called_with(executor.maker_trading_pair, True)
+
+    @patch.object(XEMMExecutor, "get_resulting_price_for_amount")
+    @patch.object(XEMMExecutor, "get_tx_cost_in_asset")
+    async def test_update_prices_best_source_uses_best_bid_for_maker_buy(self, tx_cost_mock, resulting_price_mock):
+        strategy = self.create_mock_strategy()
+        config = self.base_config_long
+        config.maker_price_source = "best"
+        executor = XEMMExecutor(strategy, config, self.update_interval)
+        tx_cost_mock.return_value = Decimal("0")
+        resulting_price_mock.return_value = Decimal("100")
+        strategy.connectors[executor.maker_connector].get_price.return_value = Decimal("99")
+        strategy.connectors[executor.maker_connector].quantize_order_price.side_effect = lambda pair, price: price
+
+        await executor.update_prices_and_tx_costs()
+
+        self.assertEqual(Decimal("99"), executor._maker_target_price)
+        strategy.connectors[executor.maker_connector].get_price.assert_called_with(executor.maker_trading_pair, False)
+
+    async def test_create_maker_order_skips_when_profitability_recheck_fails(self):
+        strategy = self.create_mock_strategy()
+        executor = XEMMExecutor(strategy, self.base_config_long, self.update_interval)
+        executor._maker_target_price = Decimal("100")
+        with (
+            patch.object(executor, "_safe_maker_price_with_stp", return_value=Decimal("100")),
+            patch.object(executor, "_estimate_profitability_for_maker_price", AsyncMock(return_value=Decimal("0"))),
+        ):
+            await executor.create_maker_order()
+
+        self.assertIsNone(executor.maker_order)
+        strategy.buy.assert_not_called()
+        strategy.sell.assert_not_called()
+
+    def test_safe_maker_price_with_stp_offsets_away_from_conflict(self):
+        strategy = self.create_shadow_mock_strategy(include_limit_maker=True)
+        config = self.base_config_shadow
+        config.bithumb_stp_prevention_enabled = True
+        config.bithumb_stp_base_offset_ticks = 1
+        config.bithumb_stp_max_offset_ticks = 3
+        executor = XEMMExecutor(strategy, config, self.update_interval)
+
+        blocker = InFlightOrder(
+            client_order_id="OID-SELL-BLOCKER",
+            exchange_order_id="EX-OID-SELL-BLOCKER",
+            trading_pair="XRP-KRW",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.SELL,
+            amount=Decimal("1"),
+            price=Decimal("100"),
+            creation_timestamp=1234,
+            initial_state=OrderState.OPEN,
+        )
+        strategy.connectors["bithumb"].in_flight_orders = {blocker.client_order_id: blocker}
+
+        safe_price = executor._safe_maker_price_with_stp(Decimal("100"))
+        self.assertEqual(Decimal("99"), safe_price)
+        self.assertEqual("OID-SELL-BLOCKER", executor._stp_last_blocker_order_id)
+
+    def test_safe_maker_price_with_stp_ignores_pending_cancel_when_disabled(self):
+        strategy = self.create_shadow_mock_strategy(include_limit_maker=True)
+        config = self.base_config_shadow
+        config.bithumb_stp_prevention_enabled = True
+        config.bithumb_stp_consider_pending_cancel_as_conflict = False
+        executor = XEMMExecutor(strategy, config, self.update_interval)
+
+        blocker = InFlightOrder(
+            client_order_id="OID-SELL-PENDING-CANCEL",
+            exchange_order_id="EX-OID-SELL-PENDING-CANCEL",
+            trading_pair="XRP-KRW",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.SELL,
+            amount=Decimal("1"),
+            price=Decimal("100"),
+            creation_timestamp=1234,
+            initial_state=OrderState.PENDING_CANCEL,
+        )
+        strategy.connectors["bithumb"].in_flight_orders = {blocker.client_order_id: blocker}
+
+        safe_price = executor._safe_maker_price_with_stp(Decimal("100"))
+        self.assertEqual(Decimal("100"), safe_price)
+
+    async def test_create_maker_order_skips_when_no_safe_stp_price(self):
+        strategy = self.create_shadow_mock_strategy(include_limit_maker=True)
+        config = self.base_config_shadow
+        config.bithumb_stp_prevention_enabled = True
+        config.bithumb_stp_base_offset_ticks = 1
+        config.bithumb_stp_max_offset_ticks = 3
+        executor = XEMMExecutor(strategy, config, self.update_interval)
+        executor._maker_target_price = Decimal("100")
+
+        blockers = {}
+        for idx, price in enumerate([Decimal("100"), Decimal("99"), Decimal("98"), Decimal("97")], start=1):
+            blocker = InFlightOrder(
+                client_order_id=f"OID-SELL-BLOCKER-{idx}",
+                exchange_order_id=f"EX-BLOCKER-{idx}",
+                trading_pair="XRP-KRW",
+                order_type=OrderType.LIMIT,
+                trade_type=TradeType.SELL,
+                amount=Decimal("1"),
+                price=price,
+                creation_timestamp=1234,
+                initial_state=OrderState.OPEN,
+            )
+            blockers[blocker.client_order_id] = blocker
+        strategy.connectors["bithumb"].in_flight_orders = blockers
+
+        await executor.create_maker_order()
+
+        self.assertIsNone(executor.maker_order)
+        self.assertGreater(executor._stp_cooldown_until_ts, strategy.current_timestamp)
+
+    def test_process_order_failed_event_stp_rejection_updates_state(self):
+        strategy = self.create_shadow_mock_strategy(include_limit_maker=True)
+        config = self.base_config_shadow
+        config.bithumb_stp_prevention_enabled = True
+        config.bithumb_stp_pause_after_rejects = 3
+        executor = XEMMExecutor(strategy, config, self.update_interval)
+        executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+
+        failure_event = MarketOrderFailureEvent(
+            timestamp=1234,
+            order_id="OID-BUY-1",
+            order_type=OrderType.LIMIT,
+            error_type="BithumbSelfTradePreventionError",
+            error_message="cross_trading",
+        )
+        executor.process_order_failed_event(1, MagicMock(), failure_event)
+
+        self.assertIsNone(executor.maker_order)
+        self.assertEqual(1, executor._stp_reject_streak)
+        self.assertEqual(2, executor._stp_dynamic_offset_ticks)
+        self.assertGreater(executor._stp_cooldown_until_ts, strategy.current_timestamp)
+
+    def test_process_order_failed_event_stp_rejection_triggers_pause(self):
+        strategy = self.create_shadow_mock_strategy(include_limit_maker=True)
+        config = self.base_config_shadow
+        config.bithumb_stp_prevention_enabled = True
+        config.bithumb_stp_pause_after_rejects = 2
+        config.bithumb_stp_pause_duration_sec = 20.0
+        executor = XEMMExecutor(strategy, config, self.update_interval)
+
+        executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        event_1 = MarketOrderFailureEvent(
+            timestamp=1234,
+            order_id="OID-BUY-1",
+            order_type=OrderType.LIMIT,
+            error_message="cross_trading",
+        )
+        executor.process_order_failed_event(1, MagicMock(), event_1)
+
+        executor.maker_order = TrackedOrder(order_id="OID-BUY-2")
+        event_2 = MarketOrderFailureEvent(
+            timestamp=1235,
+            order_id="OID-BUY-2",
+            order_type=OrderType.LIMIT,
+            error_message="cross_trading",
+        )
+        executor.process_order_failed_event(1, MagicMock(), event_2)
+
+        self.assertGreater(executor._stp_pause_until_ts, strategy.current_timestamp)
+
+    async def test_control_maker_order_skips_create_during_stp_pause(self):
+        strategy = self.create_shadow_mock_strategy(include_limit_maker=True)
+        config = self.base_config_shadow
+        executor = XEMMExecutor(strategy, config, self.update_interval)
+        executor._stp_pause_until_ts = strategy.current_timestamp + 10
+        executor.create_maker_order = AsyncMock()
+
+        await executor.control_maker_order()
+
+        executor.create_maker_order.assert_not_called()
 
     def test_net_pnl_long(self):
         self.executor._status = RunnableStatus.TERMINATED
@@ -156,6 +459,46 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         await self.executor.validate_sufficient_balance()
         self.assertEqual(self.executor.close_type, CloseType.INSUFFICIENT_BALANCE)
         self.assertEqual(self.executor.status, RunnableStatus.TERMINATED)
+
+    @patch.object(XEMMExecutor, 'adjust_order_candidates')
+    async def test_validate_sufficient_balance_allows_one_sided_mode(self, mock_adjust_order_candidates):
+        config = XEMMExecutorConfig(
+            timestamp=1234,
+            buying_market=ConnectorPair(connector_name='binance', trading_pair='ETH-USDT'),
+            selling_market=ConnectorPair(connector_name='kucoin', trading_pair='ETH-USDT'),
+            maker_side=TradeType.BUY,
+            order_amount=Decimal('1'),
+            min_profitability=Decimal('0.01'),
+            target_profitability=Decimal('0.015'),
+            max_profitability=Decimal('0.02'),
+            allow_one_sided_inventory_mode=True,
+        )
+        executor = XEMMExecutor(self.strategy, config, self.update_interval)
+        maker_candidate = OrderCandidate(
+            trading_pair="ETH-USDT",
+            is_maker=True,
+            order_type=OrderType.LIMIT,
+            order_side=TradeType.BUY,
+            amount=Decimal("1"),
+            price=Decimal("100"),
+        )
+        taker_candidate = OrderCandidate(
+            trading_pair="ETH-USDT",
+            is_maker=False,
+            order_type=OrderType.MARKET,
+            order_side=TradeType.SELL,
+            amount=Decimal("0"),
+            price=Decimal("100"),
+        )
+        mock_adjust_order_candidates.side_effect = [
+            [maker_candidate],
+            [taker_candidate],
+        ]
+
+        await executor.validate_sufficient_balance()
+
+        self.assertNotEqual(executor.close_type, CloseType.INSUFFICIENT_BALANCE)
+        self.assertNotEqual(executor.status, RunnableStatus.TERMINATED)
 
     @patch.object(XEMMExecutor, "get_resulting_price_for_amount")
     @patch.object(XEMMExecutor, "get_tx_cost_in_asset")
@@ -383,6 +726,46 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.assertEqual(self.executor.maker_order.order.client_order_id, "OID-BUY-1")
         self.executor.process_order_created_event(1, MagicMock(), sell_order_created_event)
         self.assertEqual(self.executor.taker_order.order.client_order_id, "OID-SELL-1")
+
+    @patch.object(XEMMExecutor, "get_in_flight_order")
+    def test_process_order_created_event_resets_stp_state_for_maker(self, in_flight_order_mock):
+        strategy = self.create_shadow_mock_strategy(include_limit_maker=True)
+        config = self.base_config_shadow
+        config.bithumb_stp_prevention_enabled = True
+        config.bithumb_stp_base_offset_ticks = 1
+        executor = XEMMExecutor(strategy, config, self.update_interval)
+        executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        executor._stp_reject_streak = 2
+        executor._stp_dynamic_offset_ticks = 3
+        executor._stp_cooldown_until_ts = strategy.current_timestamp + 10
+        executor._stp_pause_until_ts = strategy.current_timestamp + 20
+        executor._stp_last_error_message = "cross_trading"
+
+        in_flight_order_mock.return_value = InFlightOrder(
+            client_order_id="OID-BUY-1",
+            creation_timestamp=1234,
+            trading_pair="XRP-KRW",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("10"),
+            price=Decimal("100"),
+        )
+        created_event = BuyOrderCreatedEvent(
+            timestamp=1234,
+            type=OrderType.LIMIT,
+            creation_timestamp=1233,
+            order_id="OID-BUY-1",
+            trading_pair="XRP-KRW",
+            amount=Decimal("10"),
+            price=Decimal("100"),
+        )
+        executor.process_order_created_event(1, MagicMock(), created_event)
+
+        self.assertEqual(0, executor._stp_reject_streak)
+        self.assertEqual(1, executor._stp_dynamic_offset_ticks)
+        self.assertEqual(0.0, executor._stp_cooldown_until_ts)
+        self.assertEqual(0.0, executor._stp_pause_until_ts)
+        self.assertEqual("", executor._stp_last_error_message)
 
     def test_process_order_completed_event(self):
         self.executor._status = RunnableStatus.RUNNING

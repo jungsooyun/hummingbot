@@ -13,6 +13,7 @@ from hummingbot.core.web_assistant.connections.data_types import RESTRequest, WS
 _REST_URL = "https://openapi.koreainvestment.com:9443"
 _REST_SANDBOX_URL = "https://openapivts.koreainvestment.com:29443"
 _TOKEN_PATH = "oauth2/tokenP"
+_WS_APPROVAL_PATH = "oauth2/Approval"
 
 
 class KisAuth(AuthBase):
@@ -22,6 +23,10 @@ class KisAuth(AuthBase):
     with ``appkey`` and ``appsecret`` returns a Bearer access token that is
     valid for ~24 hours.  This class caches the token and refreshes it
     automatically 60 seconds before expiry.
+
+    For WebSocket connections, KIS uses a separate ``approval_key`` obtained
+    via POST ``/oauth2/Approval``.  This key is used in WS subscription
+    messages, not as a header like the REST token.
 
     The ``rest_authenticate`` method injects the following headers into every
     authenticated request:
@@ -36,15 +41,20 @@ class KisAuth(AuthBase):
     """
 
     def __init__(self, app_key: str, app_secret: str, sandbox: bool = False,
-                 initial_token: Optional[str] = None):
+                 initial_token: Optional[str] = None,
+                 initial_approval_key: Optional[str] = None):
         self._app_key = app_key
         self._app_secret = app_secret
         self._sandbox = sandbox
 
-        # Token cache
+        # REST token cache
         self._access_token: Optional[str] = initial_token
         # If an initial token is provided, set a far-future expiry
         self._token_expires_at: float = (time.time() + 86400) if initial_token else 0.0
+
+        # WS approval key cache
+        self._approval_key: Optional[str] = initial_approval_key
+        self._approval_key_expires_at: float = (time.time() + 86400) if initial_approval_key else 0.0
 
     # ------------------------------------------------------------------
     # Public properties
@@ -88,7 +98,11 @@ class KisAuth(AuthBase):
         return request
 
     async def ws_authenticate(self, request: WSRequest) -> WSRequest:
-        """KIS does not require WebSocket authentication -- pass through."""
+        """KIS WebSocket auth is handled via approval_key in subscription messages.
+
+        The WSRequest itself doesn't need header modification — the approval_key
+        is embedded in each subscription JSON payload by the data sources.
+        """
         return request
 
     # ------------------------------------------------------------------
@@ -138,3 +152,40 @@ class KisAuth(AuthBase):
         self._access_token = token
         self._token_expires_at = expires_at
         return token
+
+    # ------------------------------------------------------------------
+    # WebSocket approval key
+    # ------------------------------------------------------------------
+
+    async def get_ws_approval_key(self) -> str:
+        """Return a valid WebSocket approval key, fetching if necessary.
+
+        KIS WebSocket uses a separate approval_key (different from the REST
+        access token).  It is obtained via POST ``/oauth2/Approval`` with
+        ``appkey`` and ``secretkey``.  The key is cached for ~24 hours.
+        """
+        now = time.time()
+        if self._approval_key and now < self._approval_key_expires_at - 60:
+            return self._approval_key
+
+        base_url = _REST_SANDBOX_URL if self._sandbox else _REST_URL
+        url = f"{base_url}/{_WS_APPROVAL_PATH}"
+
+        body = {
+            "grant_type": "client_credentials",
+            "appkey": self._app_key,
+            "secretkey": self._app_secret,
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=body) as response:
+                payload = await response.json()
+
+        approval_key = payload.get("approval_key")
+        if not approval_key:
+            raise RuntimeError(f"Failed to get KIS WS approval key: {payload}")
+
+        self._approval_key = approval_key
+        # KIS approval key is valid for 1 day
+        self._approval_key_expires_at = now + 86400
+        return approval_key
