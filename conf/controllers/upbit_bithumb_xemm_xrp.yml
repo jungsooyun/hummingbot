@@ -26,3 +26,12 @@ taker_slippage_buffer_bps: "10"
 taker_order_max_age_seconds: 4
 taker_max_retries: 3
 taker_fallback_to_market: false
+
+upbit_shadow_maker_enabled: false
+upbit_shadow_global_notional_cap_quote: "0"
+upbit_shadow_price_refresh_pct: "0.0005"
+upbit_shadow_order_max_age_seconds: 20
+upbit_shadow_extra_buffer_bps: "0"
+upbit_shadow_prefill_cross_timeout_sec: 1.0
+upbit_shadow_prefill_unwind_timeout_sec: 1.0
+upbit_shadow_prefill_max_retries: 1

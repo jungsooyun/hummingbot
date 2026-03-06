@@ -217,6 +217,10 @@ class TradeFeeBase(ABC):
                     conversion_rate = price if price > S_DECIMAL_0 else Decimal("1")
                 fee_amount += amount_from_percentage / conversion_rate
         for flat_fee in self.flat_fees:
+            if flat_fee.amount == S_DECIMAL_0:
+                # Skip zero-value flat fees to avoid unnecessary conversion lookups
+                # (e.g., KRW->XRP rate resolution when fee amount is actually 0).
+                continue
             if self._are_tokens_interchangeable(flat_fee.token, token):
                 # No need to convert the value
                 fee_amount += flat_fee.amount

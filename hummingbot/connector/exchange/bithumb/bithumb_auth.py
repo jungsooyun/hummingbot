@@ -44,6 +44,14 @@ class BithumbAuth(AuthBase):
         request.headers = headers
         return request
 
+    def generate_ws_token(self) -> str:
+        payload = {
+            "access_key": self._access_key,
+            "nonce": str(uuid.uuid4()),
+            "timestamp": int(time.time() * 1000),
+        }
+        return jwt.encode(payload, self._secret_key, algorithm="HS256")
+
     async def ws_authenticate(self, request: WSRequest) -> WSRequest:
         return request
 

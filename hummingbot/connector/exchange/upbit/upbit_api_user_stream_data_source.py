@@ -1,22 +1,101 @@
 import asyncio
-import time
+import json
+import uuid
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from hummingbot.connector.exchange.upbit import upbit_constants as CONSTANTS
+from hummingbot.connector.exchange.upbit.upbit_auth import UpbitAuth
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest
+from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+from hummingbot.core.web_assistant.ws_assistant import WSAssistant
+from hummingbot.logger import HummingbotLogger
+
+if TYPE_CHECKING:
+    from hummingbot.connector.exchange.upbit.upbit_exchange import UpbitExchange
 
 
 class UpbitAPIUserStreamDataSource(UserStreamTrackerDataSource):
-    def __init__(self):
+
+    _logger: Optional[HummingbotLogger] = None
+
+    def __init__(
+        self,
+        auth: UpbitAuth,
+        trading_pairs: List[str],
+        connector: "UpbitExchange",
+        api_factory: WebAssistantsFactory,
+    ):
         super().__init__()
-        self._last_recv_time = 0.0
+        self._auth: UpbitAuth = auth
+        self._trading_pairs = trading_pairs
+        self._connector = connector
+        self._api_factory = api_factory
 
-    @property
-    def last_recv_time(self) -> float:
-        return self._last_recv_time
+    async def _connected_websocket_assistant(self) -> WSAssistant:
+        ws: WSAssistant = await self._get_ws_assistant()
+        token = self._auth.generate_ws_token()
+        await ws.connect(
+            ws_url=CONSTANTS.WSS_PRIVATE_URL,
+            ws_headers={"Authorization": f"Bearer {token}"},
+            ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL,
+        )
+        return ws
 
-    async def listen_for_user_stream(self, output: asyncio.Queue):
-        # NOTE:
-        # Upbit private websocket stream is not implemented yet in this connector.
-        # Keep last_recv_time updated so connector readiness can rely on REST polling fallback.
-        while True:
-            self._last_recv_time = time.time()
-            await asyncio.sleep(30)
+    async def _subscribe_channels(self, websocket_assistant: WSAssistant):
+        try:
+            codes = []
+            for trading_pair in self._trading_pairs:
+                symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair)
+                codes.append(symbol)
+
+            payload = [
+                {"ticket": str(uuid.uuid4())},
+                {"type": CONSTANTS.PRIVATE_ORDER_CHANNEL_NAME, "codes": codes},
+                {"type": CONSTANTS.PRIVATE_ASSET_CHANNEL_NAME},
+                {"format": "DEFAULT"},
+            ]
+            subscribe_request = WSJSONRequest(payload=payload, throttler_limit_id=CONSTANTS.WS_SUBSCRIBE)
+
+            async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_SUBSCRIBE):
+                await websocket_assistant.send(subscribe_request)
+
+            self.logger().info("Subscribed to private order and asset channels...")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().exception("Unexpected error occurred subscribing to private user stream channels...")
+            raise
+
+    async def _process_websocket_messages(self, websocket_assistant: WSAssistant, queue: asyncio.Queue):
+        async for ws_response in websocket_assistant.iter_messages():
+            data: Any = ws_response.data
+            try:
+                if isinstance(data, bytes):
+                    data = data.decode("utf-8")
+                if isinstance(data, str):
+                    json_data = json.loads(data)
+                elif isinstance(data, dict):
+                    json_data = data
+                else:
+                    continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().warning(f"Invalid event message received through the user stream connection ({data})")
+                continue
+
+            if "error" in json_data:
+                raise ValueError(f"Error message received in the user stream: {json_data}")
+
+            await self._process_event_message(event_message=json_data, queue=queue)
+
+    async def _process_event_message(self, event_message: Dict[str, Any], queue: asyncio.Queue):
+        event_type = event_message.get("type", "")
+        if event_type in (CONSTANTS.PRIVATE_ORDER_CHANNEL_NAME, CONSTANTS.PRIVATE_ASSET_CHANNEL_NAME):
+            queue.put_nowait(event_message)
+
+    async def _get_ws_assistant(self) -> WSAssistant:
+        if self._ws_assistant is None:
+            self._ws_assistant = await self._api_factory.get_ws_assistant()
+        return self._ws_assistant

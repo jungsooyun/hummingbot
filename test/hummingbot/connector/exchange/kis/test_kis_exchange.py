@@ -22,8 +22,10 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
     KIS-specific characteristics:
     - No symbols list API (trading pairs configured externally)
     - TR_ID header-based request routing
-    - OAuth2 Bearer token authentication
-    - No WebSocket support (REST polling only)
+    - OAuth2 Bearer token authentication (REST) + approval_key (WebSocket)
+    - WebSocket support for orderbook/trades (KisAPIOrderBookDataSource)
+      and execution notifications (KisAPIUserStreamDataSource)
+    - Balances remain REST-polled (no WS balance updates)
     - Response format: {"rt_cd": "0", "msg1": "...", "output": {...}}
     - Trading pair format: stock code (e.g. "COINALPHA") not a pair symbol
     """
@@ -242,7 +244,8 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
 
     @property
     def balance_event_websocket_update(self):
-        # KIS does not provide balance updates through WebSocket
+        # KIS does not provide balance updates through WebSocket;
+        # balances are REST-polled via _update_balances().
         raise NotImplementedError("KIS does not support WebSocket balance updates")
 
     @property
@@ -277,7 +280,8 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
 
     @property
     def is_order_fill_http_update_executed_during_websocket_order_event_processing(self) -> bool:
-        # KIS has no WebSocket
+        # KIS WS execution notifications include fill data inline;
+        # no separate HTTP fill fetch is needed during WS event processing.
         return False
 
     @property
@@ -515,27 +519,164 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         return url
 
     # ------------------------------------------------------------------
-    # WebSocket event methods (KIS has NO WebSocket)
+    # WebSocket event methods (KIS execution notifications via H0STCNI0)
     # ------------------------------------------------------------------
 
     def order_event_for_new_order_websocket_update(self, order: InFlightOrder):
-        # KIS does not support WebSocket order events
-        return None
+        """KIS execution notification for a new (accepted) order.
+
+        CNTG_YN="1" means order acceptance; RCTF_CLS="00" means new order.
+        """
+        return {
+            "type": "execution_notification",
+            "tr_id": "H0STCNI0",
+            "data": {
+                "CUST_ID": "test",
+                "ACNT_NO": "12345678-01",
+                "ODER_NO": order.exchange_order_id or "EOID1",
+                "OODER_NO": "",
+                "SELN_BYOV_CLS": "02" if order.trade_type == TradeType.SELL else "01",
+                "RCTF_CLS": "00",
+                "ODER_KIND": "00",
+                "ODER_COND": "0",
+                "STCK_SHRN_ISCD": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
+                "CNTG_QTY": "0",
+                "CNTG_UNPR": "0",
+                "STCK_CNTG_HOUR": "093000",
+                "RFUS_YN": "N",
+                "CNTG_YN": "1",
+                "ACPT_YN": "Y",
+                "BRNC_NO": "",
+                "ODER_QTY": str(int(order.amount)),
+                "ACNT_NAME": "test",
+                "ORD_COND_PRC": "0",
+                "ORD_EXG_GB": "00",
+                "POPUP_YN": "N",
+                "FILLER": "",
+                "CRDT_CLS": "00",
+                "CRDT_LOAN_DATE": "",
+                "CNTG_ISNM40": "TEST",
+                "ODER_PRC": str(int(order.price)),
+            },
+        }
 
     def order_event_for_canceled_order_websocket_update(self, order: InFlightOrder):
-        # KIS does not support WebSocket order events
-        return None
+        """KIS execution notification for a canceled order.
+
+        CNTG_YN="1" means order event; RCTF_CLS="02" means cancel.
+        """
+        return {
+            "type": "execution_notification",
+            "tr_id": "H0STCNI0",
+            "data": {
+                "CUST_ID": "test",
+                "ACNT_NO": "12345678-01",
+                "ODER_NO": order.exchange_order_id or "EOID1",
+                "OODER_NO": "",
+                "SELN_BYOV_CLS": "02" if order.trade_type == TradeType.SELL else "01",
+                "RCTF_CLS": "02",
+                "ODER_KIND": "00",
+                "ODER_COND": "0",
+                "STCK_SHRN_ISCD": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
+                "CNTG_QTY": "0",
+                "CNTG_UNPR": "0",
+                "STCK_CNTG_HOUR": "093100",
+                "RFUS_YN": "N",
+                "CNTG_YN": "1",
+                "ACPT_YN": "Y",
+                "BRNC_NO": "",
+                "ODER_QTY": str(int(order.amount)),
+                "ACNT_NAME": "test",
+                "ORD_COND_PRC": "0",
+                "ORD_EXG_GB": "00",
+                "POPUP_YN": "N",
+                "FILLER": "",
+                "CRDT_CLS": "00",
+                "CRDT_LOAN_DATE": "",
+                "CNTG_ISNM40": "TEST",
+                "ODER_PRC": str(int(order.price)),
+            },
+        }
 
     def order_event_for_full_fill_websocket_update(self, order: InFlightOrder):
-        # KIS does not support WebSocket order events
-        return None
+        """KIS execution notification for a fully filled order.
+
+        CNTG_YN="2" means fill notification; CNTG_QTY and CNTG_UNPR carry fill data.
+        """
+        return {
+            "type": "execution_notification",
+            "tr_id": "H0STCNI0",
+            "data": {
+                "CUST_ID": "test",
+                "ACNT_NO": "12345678-01",
+                "ODER_NO": order.exchange_order_id or "EOID1",
+                "OODER_NO": "",
+                "SELN_BYOV_CLS": "02" if order.trade_type == TradeType.SELL else "01",
+                "RCTF_CLS": "00",
+                "ODER_KIND": "00",
+                "ODER_COND": "0",
+                "STCK_SHRN_ISCD": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
+                "CNTG_QTY": str(int(order.amount)),
+                "CNTG_UNPR": str(int(order.price)),
+                "STCK_CNTG_HOUR": "093200",
+                "RFUS_YN": "N",
+                "CNTG_YN": "2",
+                "ACPT_YN": "Y",
+                "BRNC_NO": "",
+                "ODER_QTY": str(int(order.amount)),
+                "ACNT_NAME": "test",
+                "ORD_COND_PRC": "0",
+                "ORD_EXG_GB": "00",
+                "POPUP_YN": "N",
+                "FILLER": "",
+                "CRDT_CLS": "00",
+                "CRDT_LOAN_DATE": "",
+                "CNTG_ISNM40": "TEST",
+                "ODER_PRC": str(int(order.price)),
+            },
+        }
 
     def trade_event_for_full_fill_websocket_update(self, order: InFlightOrder):
-        # KIS does not support WebSocket trade events
-        return None
+        """KIS execution notification carrying trade/fill data.
+
+        Same structure as the full fill order event (CNTG_YN="2").
+        """
+        return {
+            "type": "execution_notification",
+            "tr_id": "H0STCNI0",
+            "data": {
+                "CUST_ID": "test",
+                "ACNT_NO": "12345678-01",
+                "ODER_NO": order.exchange_order_id or "EOID1",
+                "OODER_NO": "",
+                "SELN_BYOV_CLS": "02" if order.trade_type == TradeType.SELL else "01",
+                "RCTF_CLS": "00",
+                "ODER_KIND": "00",
+                "ODER_COND": "0",
+                "STCK_SHRN_ISCD": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
+                "CNTG_QTY": str(int(order.amount)),
+                "CNTG_UNPR": str(int(order.price)),
+                "STCK_CNTG_HOUR": "093200",
+                "RFUS_YN": "N",
+                "CNTG_YN": "2",
+                "ACPT_YN": "Y",
+                "BRNC_NO": "",
+                "ODER_QTY": str(int(order.amount)),
+                "ACNT_NAME": "test",
+                "ORD_COND_PRC": "0",
+                "ORD_EXG_GB": "00",
+                "POPUP_YN": "N",
+                "FILLER": "",
+                "CRDT_CLS": "00",
+                "CRDT_LOAN_DATE": "",
+                "CNTG_ISNM40": "TEST",
+                "ODER_PRC": str(int(order.price)),
+            },
+        }
 
     # ------------------------------------------------------------------
-    # Tests disabled for KIS (no WS, no symbols API, etc.)
+    # Tests disabled for KIS (order-not-found not implemented, synthetic
+    # trading rules, WS tests need mock infrastructure)
     # ------------------------------------------------------------------
 
     @aioresponses()
@@ -556,37 +697,38 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         pass
 
     async def test_user_stream_update_for_new_order(self):
-        # Disabled: KIS has no WebSocket user stream
+        # TODO: Re-enable when WS mock infrastructure is ready
         pass
 
     async def test_user_stream_update_for_canceled_order(self):
-        # Disabled: KIS has no WebSocket user stream
+        # TODO: Re-enable when WS mock infrastructure is ready
         pass
 
     @aioresponses()
     async def test_user_stream_update_for_order_full_fill(self, mock_api):
-        # Disabled: KIS has no WebSocket user stream
+        # TODO: Re-enable when WS mock infrastructure is ready
         pass
 
     async def test_user_stream_balance_update(self):
-        # Disabled: KIS has no WebSocket balance updates
+        # Disabled: KIS does not provide balance updates through WebSocket
+        # (balances are REST-polled)
         pass
 
     async def test_user_stream_raises_cancel_exception(self):
-        # Disabled: KIS has no WebSocket user stream
+        # TODO: Re-enable when WS mock infrastructure is ready
         pass
 
     async def test_user_stream_logs_errors(self):
-        # Disabled: KIS has no WebSocket user stream
+        # TODO: Re-enable when WS mock infrastructure is ready
         pass
 
     async def test_lost_order_removed_after_cancel_status_user_event_received(self):
-        # Disabled: KIS has no WebSocket user stream
+        # TODO: Re-enable when WS mock infrastructure is ready
         pass
 
     @aioresponses()
     async def test_lost_order_user_stream_full_fill_events_are_processed(self, mock_api):
-        # Disabled: KIS has no WebSocket user stream
+        # TODO: Re-enable when WS mock infrastructure is ready
         pass
 
     # ------------------------------------------------------------------

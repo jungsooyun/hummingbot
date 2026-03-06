@@ -30,13 +30,14 @@ dependencies:
   - cryptography>=41.0.2
   - eth-account>=0.13.0
 #  - injective-py==1.12.*
-  - lighter-sdk>=2.0.0  # Required by lighter connector for order signing
+#  - lighter-sdk  # Not on conda/PyPI as >=2.0.0; connector uses REST-only auth
   - libta-lib>=0.6.4
   - msgpack-python
   - numba>=0.61.2
   - numpy>=2.2.6
   - objgraph
   - pandas>=2.3.2
+#  - pycryptodome>=3.20    # Moved to pip section (safer for cross-platform)
   - pandas-ta>=0.4.71b
   - prompt_toolkit>=3.0.39
   - protobuf>=4.23.3
@@ -65,3 +66,4 @@ dependencies:
   - zlib>=1.2.13
   - pip:
     - injective-py==1.12.*
+    - pycryptodome>=3.20    # Required by KIS connector for WS AES decryption

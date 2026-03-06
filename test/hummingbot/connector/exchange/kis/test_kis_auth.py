@@ -451,6 +451,123 @@ class TestKisAuth(unittest.TestCase):
         result = loop.run_until_complete(self.auth.ws_authenticate(mock_ws_request))
         self.assertIs(result, mock_ws_request)
 
+    # ------------------------------------------------------------------
+    # WebSocket approval key
+    # ------------------------------------------------------------------
+
+    def test_initial_approval_key_returned_immediately(self):
+        """When initial_approval_key is provided, get_ws_approval_key()
+        should return it without making any HTTP calls."""
+        auth = KisAuth(
+            app_key=self.app_key,
+            app_secret=self.app_secret,
+            initial_approval_key="pre-loaded-approval-key",
+        )
+
+        session_cls, captured = _make_mock_session(
+            lambda url, json=None, **kw: _make_mock_response({"approval_key": "should-not-be-used"})
+        )
+
+        with patch("aiohttp.ClientSession", session_cls):
+            loop = asyncio.get_event_loop()
+            key = loop.run_until_complete(auth.get_ws_approval_key())
+
+        self.assertEqual(key, "pre-loaded-approval-key")
+        self.assertEqual(len(captured["calls"]), 0, "Should not make any HTTP calls")
+
+    def test_get_ws_approval_key_fetches_from_api(self):
+        """When no cached approval key exists, get_ws_approval_key() should
+        POST to /oauth2/Approval with appkey and secretkey."""
+        approval_response = {"approval_key": "fetched-approval-key"}
+
+        session_cls, captured = _make_mock_session(
+            lambda url, json=None, **kw: _make_mock_response(approval_response)
+        )
+
+        with patch("aiohttp.ClientSession", session_cls):
+            loop = asyncio.get_event_loop()
+            key = loop.run_until_complete(self.auth.get_ws_approval_key())
+
+        self.assertEqual(key, "fetched-approval-key")
+        self.assertEqual(len(captured["calls"]), 1)
+        call = captured["calls"][0]
+        # Verify the URL contains /oauth2/Approval
+        self.assertIn("/oauth2/Approval", call["url"])
+        # Verify the POST body
+        self.assertEqual(call["json"]["grant_type"], "client_credentials")
+        self.assertEqual(call["json"]["appkey"], self.app_key)
+        self.assertEqual(call["json"]["secretkey"], self.app_secret)
+
+    def test_get_ws_approval_key_caches_result(self):
+        """Second call to get_ws_approval_key() should return the cached key
+        without making a new HTTP call."""
+        approval_response = {"approval_key": "cached-approval-key"}
+
+        session_cls, captured = _make_mock_session(
+            lambda url, json=None, **kw: _make_mock_response(approval_response)
+        )
+
+        with patch("aiohttp.ClientSession", session_cls):
+            loop = asyncio.get_event_loop()
+            key1 = loop.run_until_complete(self.auth.get_ws_approval_key())
+            key2 = loop.run_until_complete(self.auth.get_ws_approval_key())
+
+        self.assertEqual(key1, "cached-approval-key")
+        self.assertEqual(key2, "cached-approval-key")
+        self.assertEqual(len(captured["calls"]), 1, "Should only make one HTTP call")
+
+    def test_get_ws_approval_key_refreshes_when_expired(self):
+        """After the approval key expires, get_ws_approval_key() should make
+        a new HTTP call to fetch a fresh key."""
+        call_count = {"n": 0}
+
+        def post_handler(url, json=None, **kw):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return _make_mock_response({"approval_key": "old-approval-key"})
+            return _make_mock_response({"approval_key": "new-approval-key"})
+
+        session_cls, captured = _make_mock_session(post_handler)
+
+        with patch("aiohttp.ClientSession", session_cls):
+            loop = asyncio.get_event_loop()
+            key1 = loop.run_until_complete(self.auth.get_ws_approval_key())
+
+            # Simulate expiry by setting the expiry time to the past
+            self.auth._approval_key_expires_at = time.time() - 1
+
+            key2 = loop.run_until_complete(self.auth.get_ws_approval_key())
+
+        self.assertEqual(key1, "old-approval-key")
+        self.assertEqual(key2, "new-approval-key")
+        self.assertEqual(
+            len(captured["calls"]), 2,
+            "Expired approval key should trigger a new HTTP call",
+        )
+
+    def test_get_ws_approval_key_sandbox_url(self):
+        """Sandbox mode should use the sandbox REST URL for the approval
+        key endpoint."""
+        auth = KisAuth(
+            app_key=self.app_key,
+            app_secret=self.app_secret,
+            sandbox=True,
+        )
+        approval_response = {"approval_key": "sandbox-approval-key"}
+
+        session_cls, captured = _make_mock_session(
+            lambda url, json=None, **kw: _make_mock_response(approval_response)
+        )
+
+        with patch("aiohttp.ClientSession", session_cls):
+            loop = asyncio.get_event_loop()
+            key = loop.run_until_complete(auth.get_ws_approval_key())
+
+        self.assertEqual(key, "sandbox-approval-key")
+        self.assertEqual(len(captured["calls"]), 1)
+        self.assertIn("openapivts.koreainvestment.com:29443", captured["calls"][0]["url"])
+        self.assertIn("/oauth2/Approval", captured["calls"][0]["url"])
+
 
 if __name__ == "__main__":
     unittest.main()

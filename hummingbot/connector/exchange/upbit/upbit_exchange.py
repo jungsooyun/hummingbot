@@ -41,6 +41,7 @@ class UpbitExchange(ExchangePyBase):
         self._secret_key = upbit_secret_key
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs or []
+        self._ws_trade_fallback_timestamps: Dict[str, float] = {}
 
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         self.real_time_balance_update = False
@@ -94,7 +95,7 @@ class UpbitExchange(ExchangePyBase):
         return self._trading_required
 
     def supported_order_types(self) -> List[OrderType]:
-        return [OrderType.LIMIT, OrderType.MARKET]
+        return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
 
     def get_order_price_quantum(self, trading_pair: str, price: Decimal) -> Decimal:
         _, quote = trading_pair.split("-")
@@ -176,7 +177,12 @@ class UpbitExchange(ExchangePyBase):
         )
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
-        return UpbitAPIUserStreamDataSource()
+        return UpbitAPIUserStreamDataSource(
+            auth=self._auth,
+            trading_pairs=self._trading_pairs,
+            connector=self,
+            api_factory=self._web_assistants_factory,
+        )
 
     async def _make_trading_rules_request(self) -> Any:
         return await self._api_get(
@@ -216,7 +222,7 @@ class UpbitExchange(ExchangePyBase):
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
         side = "bid" if trade_type == TradeType.BUY else "ask"
 
-        if order_type == OrderType.LIMIT:
+        if order_type in (OrderType.LIMIT, OrderType.LIMIT_MAKER):
             order_data: Dict[str, Any] = {
                 "market": symbol,
                 "side": side,
@@ -224,6 +230,8 @@ class UpbitExchange(ExchangePyBase):
                 "volume": f"{amount:f}",
                 "price": f"{price:f}",
             }
+            if order_type == OrderType.LIMIT_MAKER:
+                order_data["time_in_force"] = "post_only"
         else:
             if side == "bid":
                 order_data = {
@@ -355,24 +363,195 @@ class UpbitExchange(ExchangePyBase):
         )
 
         state = str(order_data.get("state", "wait"))
-        new_state = CONSTANTS.ORDER_STATE.get(state, OrderState.OPEN)
-
-        if state in {"wait", "watch"}:
-            executed = Decimal(str(order_data.get("executed_volume", "0")))
+        executed = Decimal(str(order_data.get("executed_volume", "0")))
+        if "remaining_volume" in order_data:
+            remaining = Decimal(str(order_data.get("remaining_volume", "0")))
+        else:
             total = Decimal(str(order_data.get("volume", tracked_order.amount)))
-            if executed > Decimal("0") and executed < total:
-                new_state = OrderState.PARTIALLY_FILLED
+            remaining = total - executed
+        new_state = self._resolve_order_state(state=state, executed_volume=executed, remaining_volume=remaining)
+        exchange_order_id = str(order_data.get("uuid", tracked_order.exchange_order_id))
+
+        if new_state in (OrderState.FILLED, OrderState.CANCELED):
+            self._clear_ws_order_tracking(exchange_order_id)
 
         return OrderUpdate(
             client_order_id=tracked_order.client_order_id,
-            exchange_order_id=str(order_data.get("uuid", tracked_order.exchange_order_id)),
+            exchange_order_id=exchange_order_id,
             trading_pair=tracked_order.trading_pair,
             update_timestamp=self.current_timestamp,
             new_state=new_state,
         )
 
     async def _user_stream_event_listener(self):
-        await asyncio.Event().wait()
+        async for event_message in self._iter_user_event_queue():
+            try:
+                event_type = event_message.get("type", "")
+                if event_type == CONSTANTS.PRIVATE_ORDER_CHANNEL_NAME:
+                    await self._process_order_event(event_message)
+                elif event_type == CONSTANTS.PRIVATE_ASSET_CHANNEL_NAME:
+                    self._process_balance_event(event_message)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().exception("Unexpected error in user stream listener loop.")
+                await self._sleep(5.0)
+
+    async def _process_order_event(self, event_data: Dict[str, Any]):
+        exchange_order_id = str(event_data.get("uuid", ""))
+        if not exchange_order_id:
+            return
+
+        fillable_order = self._order_tracker.all_fillable_orders_by_exchange_order_id.get(exchange_order_id)
+        updatable_order = self._order_tracker.all_updatable_orders_by_exchange_order_id.get(exchange_order_id)
+
+        if fillable_order is None and updatable_order is None:
+            return
+
+        state = str(event_data.get("order_state", "wait"))
+        reference_order = updatable_order or fillable_order
+        executed = Decimal(str(event_data.get("executed_volume", "0")))
+        if "remaining_volume" in event_data:
+            remaining = Decimal(str(event_data.get("remaining_volume", "0")))
+        else:
+            total = Decimal(str(event_data.get("volume", reference_order.amount)))
+            remaining = total - executed
+
+        if state == "trade" and fillable_order is not None:
+            trade_uuid = event_data.get("trade_uuid")
+            trade_update = self._parse_trade_from_ws_event(event_data, fillable_order)
+            if trade_update is not None:
+                self._order_tracker.process_trade_update(trade_update)
+            elif trade_uuid is None or str(trade_uuid) not in fillable_order.order_fills:
+                await self._reconcile_trades_for_order(
+                    order=fillable_order,
+                    exchange_order_id=exchange_order_id,
+                    reason="invalid_ws_trade_event",
+                )
+
+        if state == "done" and fillable_order is not None and executed > Decimal("0"):
+            if fillable_order.executed_amount_base < executed:
+                await self._reconcile_trades_for_order(
+                    order=fillable_order,
+                    exchange_order_id=exchange_order_id,
+                    reason="done_mismatch",
+                    force=True,
+                )
+
+        if updatable_order is not None:
+            new_state = self._resolve_order_state(state=state, executed_volume=executed, remaining_volume=remaining)
+            order_update = OrderUpdate(
+                client_order_id=updatable_order.client_order_id,
+                exchange_order_id=exchange_order_id,
+                trading_pair=updatable_order.trading_pair,
+                update_timestamp=self.current_timestamp,
+                new_state=new_state,
+            )
+            self._order_tracker.process_order_update(order_update)
+
+        if state in {"done", "cancel"}:
+            self._clear_ws_order_tracking(exchange_order_id)
+
+    def _parse_trade_from_ws_event(
+        self, event_data: Dict[str, Any], order: InFlightOrder
+    ) -> Optional[TradeUpdate]:
+        trade_uuid = event_data.get("trade_uuid")
+        if not trade_uuid:
+            return None
+        trade_id = str(trade_uuid)
+        if trade_id in order.order_fills:
+            return None
+
+        fill_price = Decimal(str(event_data.get("price", "0")))
+        fill_base_amount = Decimal(str(event_data.get("volume", "0")))
+        if fill_price <= Decimal("0") or fill_base_amount <= Decimal("0"):
+            return None
+
+        fill_quote_amount = fill_price * fill_base_amount
+        fee_amount = Decimal(str(event_data.get("trade_fee", "0")))
+        fee_token = order.quote_asset
+
+        fee = TradeFeeBase.new_spot_fee(
+            fee_schema=self.trade_fee_schema(),
+            trade_type=order.trade_type,
+            percent_token=fee_token,
+            flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)],
+        )
+
+        ts = event_data.get("trade_timestamp")
+        fill_ts = float(ts) / 1000.0 if ts else self.current_timestamp
+
+        return TradeUpdate(
+            trade_id=trade_id,
+            client_order_id=order.client_order_id,
+            exchange_order_id=order.exchange_order_id,
+            trading_pair=order.trading_pair,
+            fee=fee,
+            fill_base_amount=fill_base_amount,
+            fill_quote_amount=fill_quote_amount,
+            fill_price=fill_price,
+            fill_timestamp=fill_ts,
+            is_taker=not bool(event_data.get("is_maker", False)),
+        )
+
+    def _resolve_order_state(
+        self,
+        state: str,
+        executed_volume: Decimal,
+        remaining_volume: Decimal,
+    ) -> OrderState:
+        if state == "done":
+            return OrderState.FILLED
+        elif state == "cancel":
+            return OrderState.CANCELED
+        elif state == "trade":
+            return OrderState.FILLED if remaining_volume <= Decimal("0") else OrderState.PARTIALLY_FILLED
+        else:
+            new_state = CONSTANTS.ORDER_STATE.get(state, OrderState.OPEN)
+            if executed_volume > Decimal("0") and remaining_volume > Decimal("0"):
+                return OrderState.PARTIALLY_FILLED
+            return new_state
+
+    def _should_run_ws_trade_rest_fallback(self, exchange_order_id: str, force: bool = False) -> bool:
+        if force:
+            self._ws_trade_fallback_timestamps[exchange_order_id] = self.current_timestamp
+            return True
+
+        last_ts = self._ws_trade_fallback_timestamps.get(exchange_order_id)
+        if last_ts is None or self.current_timestamp - last_ts >= 5.0:
+            self._ws_trade_fallback_timestamps[exchange_order_id] = self.current_timestamp
+            return True
+        return False
+
+    async def _reconcile_trades_for_order(
+        self,
+        order: InFlightOrder,
+        exchange_order_id: str,
+        reason: str,
+        force: bool = False,
+    ) -> None:
+        if not self._should_run_ws_trade_rest_fallback(exchange_order_id=exchange_order_id, force=force):
+            self.logger().debug(
+                f"Skipping WS trade reconciliation for {exchange_order_id}: debounce active ({reason})"
+            )
+            return
+
+        self.logger().warning(f"WS trade reconciliation triggered for {exchange_order_id}: {reason}")
+        trade_updates = await self._all_trade_updates_for_order(order)
+        for trade_update in trade_updates:
+            self._order_tracker.process_trade_update(trade_update)
+
+    def _clear_ws_order_tracking(self, exchange_order_id: str) -> None:
+        self._ws_trade_fallback_timestamps.pop(exchange_order_id, None)
+
+    def _process_balance_event(self, event_data: Dict[str, Any]):
+        asset = event_data.get("currency", "")
+        if not asset:
+            return
+        available = Decimal(str(event_data.get("balance", "0")))
+        locked = Decimal(str(event_data.get("locked", "0")))
+        self._account_available_balances[asset] = available
+        self._account_balances[asset] = available + locked
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Any):
         mapping = bidict()

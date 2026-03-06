@@ -7,6 +7,16 @@ from hummingbot.core.web_assistant.auth import AuthBase
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
+def ws_url(domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
+    """
+    Returns the KIS WebSocket URL for the given domain.
+
+    :param domain: pass ``"sandbox"`` to target the KIS sandbox environment
+    :return: the full WebSocket URL
+    """
+    return CONSTANTS.WS_SANDBOX_URL if domain == "sandbox" else CONSTANTS.WS_URL
+
+
 def public_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
     """
     Creates a full URL for provided public REST endpoint.

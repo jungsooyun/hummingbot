@@ -42,6 +42,13 @@ class StrategyV2ConfigBase(BaseClientModel):
     """
     Base class for version 2 strategy configurations.
     """
+    executors_update_interval: float = Field(
+        default=1.0,
+        json_schema_extra={
+            "prompt": "Enter executors update interval in seconds (e.g., 0.3):",
+            "prompt_on_new": True,
+        },
+    )
     markets: MarketDict = Field(
         default=...,
         json_schema_extra={
@@ -202,8 +209,10 @@ class StrategyV2Base(ScriptStrategyBase):
         self._is_stop_triggered = False
 
         # Collect initial positions from all controller configs
+        executors_update_interval = getattr(config, "executors_update_interval", 1.0)
         self.executor_orchestrator = ExecutorOrchestrator(
             strategy=self,
+            executors_update_interval=executors_update_interval,
             initial_positions_by_controller=self._collect_initial_positions()
         )
         self.mqtt_enabled = False

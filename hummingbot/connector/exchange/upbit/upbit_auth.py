@@ -43,6 +43,13 @@ class UpbitAuth(AuthBase):
         request.headers = headers
         return request
 
+    def generate_ws_token(self) -> str:
+        payload = {
+            "access_key": self._access_key,
+            "nonce": str(uuid.uuid4()),
+        }
+        return jwt.encode(payload, self._secret_key, algorithm="HS512")
+
     async def ws_authenticate(self, request: WSRequest) -> WSRequest:
         return request
 
