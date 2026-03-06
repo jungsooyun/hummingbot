@@ -334,9 +334,11 @@ class UpbitBithumbXemmControllerConfig(ControllerConfigBase):
     transfer_amount_quantum_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
     transfer_source_balance_reserve_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
     transfer_poll_interval_sec: float = Field(default=5.0, json_schema_extra={"is_updatable": True})
+    transfer_delay_before_submit_sec: float = Field(default=0.0, json_schema_extra={"is_updatable": True})
     transfer_request_cooldown_sec: float = Field(default=60.0, json_schema_extra={"is_updatable": True})
     transfer_request_timeout_sec: float = Field(default=1800.0, json_schema_extra={"is_updatable": True})
     transfer_recovery_max_wait_sec: float = Field(default=300.0, json_schema_extra={"is_updatable": True})
+    transfer_hard_trigger_skew_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
     transfer_state_file_path: str = Field(
         default="/home/hummingbot/data/transfer_rebalance_state_{controller_id}.json",
         json_schema_extra={"is_updatable": True},
@@ -428,6 +430,15 @@ class UpbitBithumbXemmControllerConfig(ControllerConfigBase):
                 raise ValueError("transfer_trigger_skew_base must be > transfer_recover_skew_base")
             if not (self.transfer_route_key_maker_to_taker or self.transfer_route_key_taker_to_maker):
                 raise ValueError("At least one transfer_route_key must be configured when transfer_rebalance_enabled is true")
+        if self.transfer_delay_before_submit_sec < 0:
+            raise ValueError("transfer_delay_before_submit_sec must be >= 0")
+        if self.transfer_hard_trigger_skew_base < Decimal("0"):
+            raise ValueError("transfer_hard_trigger_skew_base must be >= 0")
+        if (
+            self.transfer_hard_trigger_skew_base > Decimal("0")
+            and self.transfer_hard_trigger_skew_base <= self.transfer_trigger_skew_base
+        ):
+            raise ValueError("transfer_hard_trigger_skew_base must be > transfer_trigger_skew_base")
         return self
 
     def update_markets(self, markets: MarketDict) -> MarketDict:
@@ -469,6 +480,8 @@ class UpbitBithumbXemmController(ControllerBase):
         self._transfer_event_id: Optional[str] = None
         self._transfer_amount_base: Optional[Decimal] = None
         self._transfer_started_ts: Optional[float] = None
+        self._transfer_delay_started_ts: Optional[float] = None
+        self._transfer_delay_deadline_ts: Optional[float] = None
         self._transfer_retry_at: Optional[float] = None
         self._transfer_recovery_started_ts: Optional[float] = None
         self._transfer_last_poll_ts: float = 0.0
@@ -1058,6 +1071,90 @@ class UpbitBithumbXemmController(ControllerBase):
         self._risk_pause_reason = ""
         return True, True
 
+    def _clear_transfer_delay_state(self):
+        self._transfer_delay_started_ts = None
+        self._transfer_delay_deadline_ts = None
+
+    def _hard_trigger_reached(self, inventory_delta: Decimal) -> bool:
+        return (
+            self.config.transfer_hard_trigger_skew_base > Decimal("0")
+            and abs(inventory_delta) >= self.config.transfer_hard_trigger_skew_base
+        )
+
+    def _enter_transfer_delay(self, *, inventory_delta: Decimal, now: float):
+        direction, route_key, paused_side = self._direction_route_and_side(inventory_delta)
+        if not route_key:
+            return
+        self._rebalance_state = RebalanceState.DELAYING
+        self._paused_side = paused_side
+        self._transfer_direction = direction
+        self._active_transfer_request_id = None
+        self._transfer_cycle_id = None
+        self._transfer_event_id = None
+        self._transfer_amount_base = None
+        self._transfer_started_ts = None
+        self._transfer_retry_at = None
+        self._transfer_recovery_started_ts = None
+        self._transfer_last_qtg_state = None
+        self._transfer_last_error = None
+        self._clear_transfer_delay_state()
+        self._transfer_delay_started_ts = now
+        self._transfer_delay_deadline_ts = now + self.config.transfer_delay_before_submit_sec
+        self._save_transfer_state()
+        self.logger().info(
+            f"Transfer rebalance delay armed: direction={direction}, paused_side={paused_side.name}, "
+            f"inventory_delta={inventory_delta}, deadline_in={self.config.transfer_delay_before_submit_sec}s, "
+            f"hard_trigger={self.config.transfer_hard_trigger_skew_base}"
+        )
+
+    def _complete_transfer_delay(self, *, reason: str):
+        self._rebalance_state = RebalanceState.IDLE
+        self._paused_side = None
+        self._transfer_direction = None
+        self._active_transfer_request_id = None
+        self._transfer_cycle_id = None
+        self._transfer_event_id = None
+        self._transfer_amount_base = None
+        self._transfer_started_ts = None
+        self._transfer_retry_at = None
+        self._transfer_recovery_started_ts = None
+        self._transfer_last_qtg_state = None
+        self._transfer_last_error = None
+        self._clear_transfer_delay_state()
+        self._transfer_stop_sent_executor_ids.clear()
+        self._clear_transfer_state()
+        self.logger().info(f"Transfer rebalance delay cleared: {reason}")
+
+    def _begin_transfer_submission(self, *, inventory_delta: Decimal, now: float, reason: str) -> bool:
+        direction, route_key, paused_side = self._direction_route_and_side(inventory_delta)
+        if not route_key:
+            return False
+        amount = self._compute_transfer_amount(inventory_delta, direction)
+        if amount <= Decimal("0"):
+            return False
+        if not self._acquire_transfer_lock(direction):
+            return False
+
+        self._rebalance_state = RebalanceState.SIGNAL_SUBMITTING
+        self._paused_side = paused_side
+        self._transfer_direction = direction
+        self._transfer_cycle_id = uuid.uuid4().hex[:12]
+        self._transfer_event_id = f"{self._controller_id()}:{direction}:{self._transfer_cycle_id}"
+        self._transfer_amount_base = amount
+        self._transfer_started_ts = now
+        self._transfer_retry_at = None
+        self._transfer_recovery_started_ts = None
+        self._transfer_last_qtg_state = None
+        self._transfer_last_error = None
+        self._clear_transfer_delay_state()
+        self._save_transfer_state()
+        self.logger().info(
+            f"Transfer rebalance submission started: reason={reason}, direction={direction}, "
+            f"paused_side={paused_side.name}, inventory_delta={inventory_delta}, amount={amount}"
+        )
+        self._transfer_task = asyncio.create_task(self._signal_and_approve(route_key=route_key, amount=amount))
+        return True
+
     async def _transfer_rebalance_tick(self):
         if not self.config.transfer_rebalance_enabled:
             return
@@ -1082,6 +1179,8 @@ class UpbitBithumbXemmController(ControllerBase):
             if self._transfer_retry_at is not None and now >= self._transfer_retry_at:
                 self._rebalance_state = RebalanceState.IDLE
                 self._paused_side = None
+                self._transfer_direction = None
+                self._clear_transfer_delay_state()
                 self._release_transfer_lock(force=False)
                 self._save_transfer_state()
             return
@@ -1116,30 +1215,62 @@ class UpbitBithumbXemmController(ControllerBase):
         if self._rebalance_state in {RebalanceState.SIGNAL_SUBMITTING, RebalanceState.APPROVAL_SUBMITTING}:
             return
 
+        if self._rebalance_state == RebalanceState.DELAYING:
+            if abs(inventory_delta) < self.config.transfer_trigger_skew_base:
+                self._complete_transfer_delay(reason="inventory_delta back below soft trigger")
+                return
+
+            expected_direction = self._transfer_direction
+            current_direction, route_key, _ = self._direction_route_and_side(inventory_delta)
+            if expected_direction is not None and current_direction != expected_direction:
+                self.logger().info("Transfer rebalance delay restarted due to inventory direction flip")
+                if self._hard_trigger_reached(inventory_delta):
+                    if self._begin_transfer_submission(
+                        inventory_delta=inventory_delta,
+                        now=now,
+                        reason="delay_direction_flip_hard_trigger",
+                    ):
+                        return
+                if route_key:
+                    self._enter_transfer_delay(inventory_delta=inventory_delta, now=now)
+                else:
+                    self._complete_transfer_delay(reason="inventory direction flipped but route key missing")
+                return
+
+            if self._hard_trigger_reached(inventory_delta):
+                self.logger().info("Transfer rebalance delay escalated: hard trigger reached")
+                self._begin_transfer_submission(
+                    inventory_delta=inventory_delta,
+                    now=now,
+                    reason="delay_hard_trigger",
+                )
+                return
+
+            if self._transfer_delay_deadline_ts is not None and now >= self._transfer_delay_deadline_ts:
+                self.logger().info("Transfer rebalance delay expired: proceeding with transfer submission")
+                self._begin_transfer_submission(
+                    inventory_delta=inventory_delta,
+                    now=now,
+                    reason="delay_expired",
+                )
+                return
+
+            return
+
         # IDLE path
         if abs(inventory_delta) < self.config.transfer_trigger_skew_base:
             return
-        direction, route_key, paused_side = self._direction_route_and_side(inventory_delta)
+        direction, route_key, _ = self._direction_route_and_side(inventory_delta)
         if not route_key:
             return
-        amount = self._compute_transfer_amount(inventory_delta, direction)
-        if amount <= Decimal("0"):
+        if self.config.transfer_delay_before_submit_sec > 0 and not self._hard_trigger_reached(inventory_delta):
+            self._enter_transfer_delay(inventory_delta=inventory_delta, now=now)
             return
-        if not self._acquire_transfer_lock(direction):
-            return
-
-        self._rebalance_state = RebalanceState.SIGNAL_SUBMITTING
-        self._paused_side = paused_side
-        self._transfer_direction = direction
-        self._transfer_cycle_id = uuid.uuid4().hex[:12]
-        self._transfer_event_id = f"{self._controller_id()}:{direction}:{self._transfer_cycle_id}"
-        self._transfer_amount_base = amount
-        self._transfer_started_ts = now
-        self._transfer_retry_at = None
-        self._transfer_last_qtg_state = None
-        self._transfer_last_error = None
-        self._save_transfer_state()
-        self._transfer_task = asyncio.create_task(self._signal_and_approve(route_key=route_key, amount=amount))
+        self._begin_transfer_submission(
+            inventory_delta=inventory_delta,
+            now=now,
+            reason="soft_trigger_direct" if self.config.transfer_delay_before_submit_sec <= 0 else "hard_trigger_direct",
+        )
 
     async def _signal_and_approve(self, *, route_key: str, amount: Decimal):
         if self._transfer_client is None:
@@ -1264,12 +1395,14 @@ class UpbitBithumbXemmController(ControllerBase):
         self._transfer_last_error = reason
         self._active_transfer_request_id = None
         self._transfer_recovery_started_ts = None
+        self._clear_transfer_delay_state()
         self._release_transfer_lock(force=False)
         self._save_transfer_state()
 
     def _enter_error(self, reason: str):
         self._rebalance_state = RebalanceState.ERROR
         self._transfer_last_error = reason
+        self._clear_transfer_delay_state()
         self._release_transfer_lock(force=False)
         self._save_transfer_state()
         self.logger().warning(f"Transfer rebalance entered ERROR state: {reason}")
@@ -1287,6 +1420,7 @@ class UpbitBithumbXemmController(ControllerBase):
         self._transfer_recovery_started_ts = None
         self._transfer_last_qtg_state = None
         self._transfer_last_error = None
+        self._clear_transfer_delay_state()
         self._transfer_stop_sent_executor_ids.clear()
         self._release_transfer_lock(force=False)
         self._clear_transfer_state()
@@ -1429,6 +1563,8 @@ class UpbitBithumbXemmController(ControllerBase):
             last_error=self._transfer_last_error,
             last_qtg_state=self._transfer_last_qtg_state,
             lock_key=self._transfer_lock_key,
+            delay_started_ts=self._transfer_delay_started_ts,
+            delay_deadline_ts=self._transfer_delay_deadline_ts,
         )
         try:
             self._transfer_state_store.save(snapshot)
@@ -1476,6 +1612,8 @@ class UpbitBithumbXemmController(ControllerBase):
         self._transfer_last_error = snapshot.last_error
         self._transfer_last_qtg_state = snapshot.last_qtg_state
         self._transfer_lock_key = snapshot.lock_key
+        self._transfer_delay_started_ts = snapshot.delay_started_ts
+        self._transfer_delay_deadline_ts = snapshot.delay_deadline_ts
         if snapshot.paused_side in TradeType.__members__:
             self._paused_side = TradeType[snapshot.paused_side]
         else:
@@ -1485,6 +1623,7 @@ class UpbitBithumbXemmController(ControllerBase):
             # intermediate state cannot be safely resumed, so retry through cooldown.
             self._rebalance_state = RebalanceState.COOLDOWN
             self._transfer_retry_at = 0.0
+            self._clear_transfer_delay_state()
             self._save_transfer_state()
             return
 
@@ -1516,6 +1655,7 @@ class UpbitBithumbXemmController(ControllerBase):
                 self._rebalance_state = RebalanceState.COOLDOWN
                 self._transfer_retry_at = 0.0
                 self._transfer_last_error = "Failed to reacquire transfer global lock during state restore (cooldown retry)"
+                self._clear_transfer_delay_state()
                 self._save_transfer_state()
 
     def _consume_task_result(self, task: asyncio.Task, context: str):
@@ -1541,6 +1681,11 @@ class UpbitBithumbXemmController(ControllerBase):
             recovery_grace_remaining = Decimal(
                 max(0.0, self._market_data_recovery_grace_until_ts - self.market_data_provider.time())
             )
+        transfer_delay_remaining = Decimal("0")
+        if self._transfer_delay_deadline_ts is not None:
+            transfer_delay_remaining = Decimal(
+                max(0.0, self._transfer_delay_deadline_ts - self.market_data_provider.time())
+            )
         return [
             f"  Pair: maker={self.config.maker_connector} {self.config.maker_trading_pair} | taker={self.config.taker_connector} {self.config.taker_trading_pair}",
             f"  Taker order type: {self.config.taker_order_type.name}, slippage_buffer_bps={self.config.taker_slippage_buffer_bps}",
@@ -1558,6 +1703,9 @@ class UpbitBithumbXemmController(ControllerBase):
             f"  Risk cutoff: effective_session_pnl={self._risk_effective_session_pnl_quote}, "
             f"unhedged_notional={self._risk_unhedged_notional_quote}, pause_remaining={max(0.0, self._risk_pause_until_ts - self.market_data_provider.time()):.2f}s, reason={self._risk_pause_reason}",
             f"  Transfer rebalance: enabled={self.config.transfer_rebalance_enabled}, state={self._rebalance_state.value}, direction={self._transfer_direction}, paused_side={self._paused_side.name if self._paused_side else None}",
+            f"  Transfer delay: active={self._rebalance_state == RebalanceState.DELAYING}, started={self._transfer_delay_started_ts}, "
+            f"deadline={self._transfer_delay_deadline_ts}, remaining={transfer_delay_remaining}s, "
+            f"hard_trigger={self.config.transfer_hard_trigger_skew_base}",
             f"  Transfer request: id={self._active_transfer_request_id}, qtg_state={self._transfer_last_qtg_state}, amount={self._transfer_amount_base}, retry_at={self._transfer_retry_at}, error={self._transfer_last_error}",
         ]
 
@@ -1571,6 +1719,9 @@ class UpbitBithumbXemmController(ControllerBase):
         recovery_grace_remaining = 0.0
         if self._market_data_recovery_grace_until_ts is not None:
             recovery_grace_remaining = max(0.0, self._market_data_recovery_grace_until_ts - self.market_data_provider.time())
+        transfer_delay_remaining = 0.0
+        if self._transfer_delay_deadline_ts is not None:
+            transfer_delay_remaining = max(0.0, self._transfer_delay_deadline_ts - self.market_data_provider.time())
         return {
             "loop_metrics": self.get_loop_metrics(),
             "inventory_delta": str(inventory_delta),
@@ -1624,6 +1775,11 @@ class UpbitBithumbXemmController(ControllerBase):
             "transfer_amount_base": str(self._transfer_amount_base) if self._transfer_amount_base else None,
             "transfer_last_error": self._transfer_last_error,
             "transfer_retry_at": self._transfer_retry_at,
+            "transfer_delay_active": self._rebalance_state == RebalanceState.DELAYING,
+            "transfer_delay_started_ts": self._transfer_delay_started_ts,
+            "transfer_delay_deadline_ts": self._transfer_delay_deadline_ts,
+            "transfer_delay_remaining_sec": transfer_delay_remaining,
+            "transfer_hard_trigger_skew_base": str(self.config.transfer_hard_trigger_skew_base),
             "transfer_event_id": self._transfer_event_id,
             "transfer_cycle_id": self._transfer_cycle_id,
             "transfer_lock_key": self._transfer_lock_key,

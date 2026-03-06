@@ -10,6 +10,7 @@ from typing import Optional
 
 class RebalanceState(Enum):
     IDLE = "IDLE"
+    DELAYING = "DELAYING"
     SIGNAL_SUBMITTING = "SIGNAL_SUBMITTING"
     APPROVAL_SUBMITTING = "APPROVAL_SUBMITTING"
     IN_FLIGHT = "IN_FLIGHT"
@@ -34,6 +35,8 @@ class RebalanceSnapshot:
     last_error: Optional[str]
     last_qtg_state: Optional[str]
     lock_key: Optional[str]
+    delay_started_ts: Optional[float] = None
+    delay_deadline_ts: Optional[float] = None
 
 
 class TransferRebalanceStateStore:

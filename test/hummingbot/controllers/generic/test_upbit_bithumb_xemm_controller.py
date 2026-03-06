@@ -3,8 +3,11 @@ import json
 import os
 import tempfile
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, PropertyMock
+
+import yaml
 
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 
@@ -129,6 +132,16 @@ class TestUpbitBithumbXemmController(IsolatedAsyncioWrapperTestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
         super().tearDown()
+
+    @staticmethod
+    def _top_level_root() -> Path:
+        return Path(__file__).resolve().parents[5]
+
+    def _make_xrp_v3_config(self) -> UpbitBithumbXemmControllerConfig:
+        config_path = self._top_level_root() / "deploy/hummingbot-conf/controllers/upbit_bithumb_xemm_xrp_live_v3.yml"
+        with open(config_path, "r", encoding="utf-8") as stream:
+            raw = yaml.safe_load(stream)
+        return UpbitBithumbXemmControllerConfig(**raw)
 
     def test_validate_levels_targets_amount_from_string(self):
         parsed = self.config.buy_levels_targets_amount
@@ -312,6 +325,38 @@ class TestUpbitBithumbXemmController(IsolatedAsyncioWrapperTestCase):
                 transfer_recover_skew_base=Decimal("10"),
             )
 
+    def test_transfer_delay_validation_non_negative(self):
+        with self.assertRaises(ValueError):
+            UpbitBithumbXemmControllerConfig(
+                id="invalid-transfer-delay",
+                maker_connector="bithumb",
+                maker_trading_pair="XRP-KRW",
+                taker_connector="upbit",
+                taker_trading_pair="XRP-KRW",
+                transfer_rebalance_enabled=True,
+                transfer_route_key_maker_to_taker="bithumb-upbit-xrp",
+                transfer_route_key_taker_to_maker="upbit-bithumb-xrp",
+                transfer_trigger_skew_base=Decimal("10"),
+                transfer_recover_skew_base=Decimal("5"),
+                transfer_delay_before_submit_sec=-1,
+            )
+
+    def test_transfer_hard_trigger_must_exceed_soft_trigger(self):
+        with self.assertRaises(ValueError):
+            UpbitBithumbXemmControllerConfig(
+                id="invalid-transfer-hard-trigger",
+                maker_connector="bithumb",
+                maker_trading_pair="XRP-KRW",
+                taker_connector="upbit",
+                taker_trading_pair="XRP-KRW",
+                transfer_rebalance_enabled=True,
+                transfer_route_key_maker_to_taker="bithumb-upbit-xrp",
+                transfer_route_key_taker_to_maker="upbit-bithumb-xrp",
+                transfer_trigger_skew_base=Decimal("10"),
+                transfer_recover_skew_base=Decimal("5"),
+                transfer_hard_trigger_skew_base=Decimal("10"),
+            )
+
     async def test_transfer_trigger_maker_excess_sends_signal_and_pauses_buy(self):
         self.controller.config.transfer_trigger_skew_base = Decimal("1")
         self.controller.config.transfer_recover_skew_base = Decimal("0.5")
@@ -470,6 +515,125 @@ class TestUpbitBithumbXemmController(IsolatedAsyncioWrapperTestCase):
         await self.controller.update_processed_data()
 
         self.assertEqual(RebalanceState.IDLE, self.controller._rebalance_state)
+
+    async def test_transfer_trigger_enters_delaying_not_signal_submitting(self):
+        self.controller.config.transfer_trigger_skew_base = Decimal("260")
+        self.controller.config.transfer_recover_skew_base = Decimal("100")
+        self.controller.config.transfer_delay_before_submit_sec = 180.0
+        self.controller.config.transfer_hard_trigger_skew_base = Decimal("400")
+        self.controller.config.transfer_route_key_maker_to_taker = "bithumb-upbit-xrp"
+        self.controller.config.transfer_route_key_taker_to_maker = "upbit-bithumb-xrp"
+        self.controller.config.transfer_global_lock_enabled = False
+        self.controller.config.transfer_state_file_path = f"{self.temp_dir.name}/state_{{controller_id}}.json"
+        self.controller.config.transfer_rebalance_enabled = True
+        self.mock_market_data_provider.connectors["bithumb"].get_available_balance.return_value = Decimal("401")
+        self.mock_market_data_provider.connectors["upbit"].get_available_balance.return_value = Decimal("100")
+        fake_client = _FakeTransferClient()
+        self.controller._transfer_client = fake_client
+        self.controller._transfer_client_ready = True
+
+        await self.controller.update_processed_data()
+
+        self.assertEqual(RebalanceState.DELAYING, self.controller._rebalance_state)
+        self.assertEqual(TradeType.BUY, self.controller._paused_side)
+        self.assertEqual("maker_to_taker", self.controller._transfer_direction)
+        self.assertEqual(0, len(fake_client.sent_signals))
+        self.assertIsNotNone(self.controller._transfer_delay_started_ts)
+        self.assertIsNotNone(self.controller._transfer_delay_deadline_ts)
+
+    async def test_delaying_expires_then_submits_transfer(self):
+        self.controller.config.transfer_trigger_skew_base = Decimal("260")
+        self.controller.config.transfer_recover_skew_base = Decimal("100")
+        self.controller.config.transfer_target_buffer_base = Decimal("100")
+        self.controller.config.transfer_min_amount_base = Decimal("250")
+        self.controller.config.transfer_max_amount_base = Decimal("350")
+        self.controller.config.transfer_amount_quantum_base = Decimal("0.1")
+        self.controller.config.transfer_source_balance_reserve_base = Decimal("20")
+        self.controller.config.transfer_delay_before_submit_sec = 180.0
+        self.controller.config.transfer_hard_trigger_skew_base = Decimal("400")
+        self.controller.config.transfer_route_key_maker_to_taker = "bithumb-upbit-xrp"
+        self.controller.config.transfer_global_lock_enabled = False
+        self.controller.config.transfer_state_file_path = f"{self.temp_dir.name}/state_{{controller_id}}.json"
+        self.controller.config.transfer_rebalance_enabled = True
+        self.mock_market_data_provider.connectors["bithumb"].get_available_balance.return_value = Decimal("401")
+        self.mock_market_data_provider.connectors["upbit"].get_available_balance.return_value = Decimal("100")
+        fake_client = _FakeTransferClient(signal_state="PENDING_APPROVAL", approval_state="READY_FOR_EXECUTION")
+        self.controller._transfer_client = fake_client
+        self.controller._transfer_client_ready = True
+
+        self.mock_market_data_provider.time.return_value = 100.0
+        await self.controller.update_processed_data()
+        self.assertEqual(RebalanceState.DELAYING, self.controller._rebalance_state)
+
+        self.mock_market_data_provider.time.return_value = 281.0
+        await self.controller.update_processed_data()
+        await asyncio.sleep(0)
+        await self.controller.update_processed_data()
+
+        self.assertEqual(1, len(fake_client.sent_signals))
+        self.assertEqual(RebalanceState.IN_FLIGHT, self.controller._rebalance_state)
+
+    async def test_delaying_clears_when_skew_recovers_below_soft_trigger(self):
+        self.controller.config.transfer_trigger_skew_base = Decimal("260")
+        self.controller.config.transfer_recover_skew_base = Decimal("100")
+        self.controller.config.transfer_delay_before_submit_sec = 180.0
+        self.controller.config.transfer_hard_trigger_skew_base = Decimal("400")
+        self.controller.config.transfer_route_key_maker_to_taker = "bithumb-upbit-xrp"
+        self.controller.config.transfer_global_lock_enabled = False
+        self.controller.config.transfer_state_file_path = f"{self.temp_dir.name}/state_{{controller_id}}.json"
+        self.controller.config.transfer_rebalance_enabled = True
+        fake_client = _FakeTransferClient()
+        self.controller._transfer_client = fake_client
+        self.controller._transfer_client_ready = True
+
+        self.mock_market_data_provider.time.return_value = 100.0
+        self.mock_market_data_provider.connectors["bithumb"].get_available_balance.return_value = Decimal("401")
+        self.mock_market_data_provider.connectors["upbit"].get_available_balance.return_value = Decimal("100")
+        await self.controller.update_processed_data()
+        self.assertEqual(RebalanceState.DELAYING, self.controller._rebalance_state)
+
+        self.mock_market_data_provider.time.return_value = 120.0
+        self.mock_market_data_provider.connectors["bithumb"].get_available_balance.return_value = Decimal("220")
+        self.mock_market_data_provider.connectors["upbit"].get_available_balance.return_value = Decimal("100")
+        await self.controller.update_processed_data()
+
+        self.assertEqual(RebalanceState.IDLE, self.controller._rebalance_state)
+        self.assertIsNone(self.controller._paused_side)
+        self.assertEqual(0, len(fake_client.sent_signals))
+
+    async def test_delaying_escalates_immediately_on_hard_trigger(self):
+        self.controller.config.transfer_trigger_skew_base = Decimal("260")
+        self.controller.config.transfer_recover_skew_base = Decimal("100")
+        self.controller.config.transfer_target_buffer_base = Decimal("100")
+        self.controller.config.transfer_min_amount_base = Decimal("250")
+        self.controller.config.transfer_max_amount_base = Decimal("350")
+        self.controller.config.transfer_amount_quantum_base = Decimal("0.1")
+        self.controller.config.transfer_source_balance_reserve_base = Decimal("20")
+        self.controller.config.transfer_delay_before_submit_sec = 180.0
+        self.controller.config.transfer_hard_trigger_skew_base = Decimal("400")
+        self.controller.config.transfer_route_key_maker_to_taker = "bithumb-upbit-xrp"
+        self.controller.config.transfer_global_lock_enabled = False
+        self.controller.config.transfer_state_file_path = f"{self.temp_dir.name}/state_{{controller_id}}.json"
+        self.controller.config.transfer_rebalance_enabled = True
+        fake_client = _FakeTransferClient(signal_state="PENDING_APPROVAL", approval_state="READY_FOR_EXECUTION")
+        self.controller._transfer_client = fake_client
+        self.controller._transfer_client_ready = True
+
+        self.mock_market_data_provider.time.return_value = 100.0
+        self.mock_market_data_provider.connectors["bithumb"].get_available_balance.return_value = Decimal("401")
+        self.mock_market_data_provider.connectors["upbit"].get_available_balance.return_value = Decimal("100")
+        await self.controller.update_processed_data()
+        self.assertEqual(RebalanceState.DELAYING, self.controller._rebalance_state)
+
+        self.mock_market_data_provider.time.return_value = 101.0
+        self.mock_market_data_provider.connectors["bithumb"].get_available_balance.return_value = Decimal("520")
+        self.mock_market_data_provider.connectors["upbit"].get_available_balance.return_value = Decimal("100")
+        await self.controller.update_processed_data()
+        await asyncio.sleep(0)
+        await self.controller.update_processed_data()
+
+        self.assertEqual(1, len(fake_client.sent_signals))
+        self.assertEqual(RebalanceState.IN_FLIGHT, self.controller._rebalance_state)
 
     # ── D2. Transfer Amount Computation ──────────────────────────────────
 
@@ -753,6 +917,34 @@ class TestUpbitBithumbXemmController(IsolatedAsyncioWrapperTestCase):
         state_file_path = self.controller._transfer_state_store.path
         self.assertTrue(os.path.exists(state_file_path))
 
+    async def test_state_file_written_for_delaying(self):
+        self.controller.config.transfer_trigger_skew_base = Decimal("260")
+        self.controller.config.transfer_recover_skew_base = Decimal("100")
+        self.controller.config.transfer_delay_before_submit_sec = 180.0
+        self.controller.config.transfer_hard_trigger_skew_base = Decimal("400")
+        self.controller.config.transfer_route_key_maker_to_taker = "bithumb-upbit-xrp"
+        self.controller.config.transfer_global_lock_enabled = False
+        self.controller.config.transfer_state_file_path = f"{self.temp_dir.name}/state_{{controller_id}}.json"
+        self.controller.config.transfer_rebalance_enabled = True
+        self.controller._transfer_state_store = TransferRebalanceStateStore(
+            path_template=self.controller.config.transfer_state_file_path,
+            controller_id="test-controller",
+        )
+        self.controller._transfer_client = _FakeTransferClient()
+        self.controller._transfer_client_ready = True
+        self.mock_market_data_provider.time.return_value = 100.0
+        self.mock_market_data_provider.connectors["bithumb"].get_available_balance.return_value = Decimal("401")
+        self.mock_market_data_provider.connectors["upbit"].get_available_balance.return_value = Decimal("100")
+
+        await self.controller.update_processed_data()
+
+        with open(self.controller._transfer_state_store.path, "r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+
+        self.assertEqual("DELAYING", payload["state"])
+        self.assertEqual(100.0, payload["delay_started_ts"])
+        self.assertEqual(280.0, payload["delay_deadline_ts"])
+
     def test_state_restore_in_flight_resumes_polling(self):
         state_file_path = f"{self.temp_dir.name}/state_test-restore.json"
         snapshot = RebalanceSnapshot(
@@ -998,6 +1190,105 @@ class TestUpbitBithumbXemmController(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(0.0, controller._transfer_retry_at)
         self.assertIn("Failed to reacquire transfer global lock", controller._transfer_last_error)
 
+    def test_restore_delaying_resumes_without_signal(self):
+        state_file_path = f"{self.temp_dir.name}/state_delay_restore_{{controller_id}}.json"
+        store = TransferRebalanceStateStore(path_template=state_file_path, controller_id="test-delay-restore")
+        store.save(
+            RebalanceSnapshot(
+                version=1,
+                state="DELAYING",
+                request_id=None,
+                direction="maker_to_taker",
+                paused_side="BUY",
+                amount=None,
+                cycle_id=None,
+                event_id=None,
+                transfer_start_ts=None,
+                retry_at=None,
+                recovery_started_ts=None,
+                last_error=None,
+                last_qtg_state=None,
+                lock_key=None,
+                delay_started_ts=100.0,
+                delay_deadline_ts=280.0,
+            )
+        )
+
+        config = UpbitBithumbXemmControllerConfig(
+            id="test-delay-restore",
+            maker_connector="bithumb",
+            maker_trading_pair="XRP-KRW",
+            taker_connector="upbit",
+            taker_trading_pair="XRP-KRW",
+            transfer_rebalance_enabled=True,
+            transfer_trigger_skew_base=Decimal("260"),
+            transfer_recover_skew_base=Decimal("100"),
+            transfer_delay_before_submit_sec=180.0,
+            transfer_hard_trigger_skew_base=Decimal("400"),
+            transfer_route_key_maker_to_taker="bithumb-upbit-xrp",
+            transfer_route_key_taker_to_maker="upbit-bithumb-xrp",
+            transfer_global_lock_enabled=False,
+            transfer_state_file_path=state_file_path,
+        )
+        controller = UpbitBithumbXemmController(
+            config=config,
+            market_data_provider=self.mock_market_data_provider,
+            actions_queue=self.mock_actions_queue,
+        )
+
+        self.assertEqual(RebalanceState.DELAYING, controller._rebalance_state)
+        self.assertEqual(TradeType.BUY, controller._paused_side)
+        self.assertEqual(100.0, controller._transfer_delay_started_ts)
+        self.assertEqual(280.0, controller._transfer_delay_deadline_ts)
+
+    def test_old_snapshot_without_delay_fields_still_loads(self):
+        state_file_path = Path(self.temp_dir.name) / "state_old_schema_test.json"
+        state_file_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "state": "IN_FLIGHT",
+                    "request_id": "req-legacy",
+                    "direction": "maker_to_taker",
+                    "paused_side": "BUY",
+                    "amount": "5",
+                    "cycle_id": "cycle-1",
+                    "event_id": "ev-1",
+                    "transfer_start_ts": 50.0,
+                    "retry_at": None,
+                    "recovery_started_ts": None,
+                    "last_error": None,
+                    "last_qtg_state": "WITHDRAWAL_SUBMITTED",
+                    "lock_key": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        config = UpbitBithumbXemmControllerConfig(
+            id="state_old_schema_test",
+            maker_connector="bithumb",
+            maker_trading_pair="BTC-KRW",
+            taker_connector="upbit",
+            taker_trading_pair="BTC-KRW",
+            transfer_rebalance_enabled=True,
+            transfer_trigger_skew_base=Decimal("10"),
+            transfer_recover_skew_base=Decimal("5"),
+            transfer_route_key_maker_to_taker="bithumb-upbit-btc",
+            transfer_route_key_taker_to_maker="upbit-bithumb-btc",
+            transfer_global_lock_enabled=False,
+            transfer_state_file_path=str(state_file_path),
+        )
+        controller = UpbitBithumbXemmController(
+            config=config,
+            market_data_provider=self.mock_market_data_provider,
+            actions_queue=self.mock_actions_queue,
+        )
+
+        self.assertEqual(RebalanceState.IN_FLIGHT, controller._rebalance_state)
+        self.assertIsNone(controller._transfer_delay_started_ts)
+        self.assertIsNone(controller._transfer_delay_deadline_ts)
+
     def test_heartbeat_not_extended_in_error_or_cooldown(self):
         lock_dir = tempfile.mkdtemp(dir=self.temp_dir.name)
         lock_key = "BTC:bithumb:upbit"
@@ -1130,3 +1421,64 @@ class TestUpbitBithumbXemmController(IsolatedAsyncioWrapperTestCase):
         create_actions = [action for action in actions if isinstance(action, CreateExecutorAction)]
         self.assertGreater(len(create_actions), 0)
         self.assertTrue(all(action.executor_config.maker_price_source == "best" for action in create_actions))
+
+    def test_xrp_v3_config_loads_successfully(self):
+        config = self._make_xrp_v3_config()
+
+        self.assertEqual("upbit_bithumb_xemm_xrp_live_v3", config.id)
+        self.assertEqual("best", config.maker_price_source)
+        self.assertEqual(Decimal("0.0008"), config.maker_price_refresh_pct)
+        self.assertEqual(180.0, config.transfer_delay_before_submit_sec)
+        self.assertEqual(Decimal("400"), config.transfer_hard_trigger_skew_base)
+        self.assertEqual("http://quant-transfer-guard:8100", config.transfer_guard_base_url)
+
+    def test_xrp_v3_fixed_two_ticks_passes_at_two_tick_edge(self):
+        config = self._make_xrp_v3_config()
+        controller = UpbitBithumbXemmController(
+            config=config,
+            market_data_provider=self.mock_market_data_provider,
+            actions_queue=self.mock_actions_queue,
+        )
+
+        def price_side_effect(connector_name, trading_pair, requested_price_type):
+            if requested_price_type == PriceType.BestAsk:
+                return Decimal("1202") if connector_name == "bithumb" else Decimal("1200")
+            if requested_price_type == PriceType.BestBid:
+                return Decimal("1200") if connector_name == "bithumb" else Decimal("1202")
+            if requested_price_type == PriceType.MidPrice:
+                return Decimal("1201")
+            return Decimal("1201")
+
+        self.mock_market_data_provider.get_price_by_type.side_effect = price_side_effect
+        controller.executors_info = []
+
+        actions = controller.determine_executor_actions()
+        create_actions = [action for action in actions if isinstance(action, CreateExecutorAction)]
+
+        self.assertEqual(2, len(create_actions))
+        self.assertEqual({TradeType.BUY, TradeType.SELL}, {action.executor_config.maker_side for action in create_actions})
+
+    def test_xrp_v3_blocks_one_tick_edge(self):
+        config = self._make_xrp_v3_config()
+        controller = UpbitBithumbXemmController(
+            config=config,
+            market_data_provider=self.mock_market_data_provider,
+            actions_queue=self.mock_actions_queue,
+        )
+
+        def price_side_effect(connector_name, trading_pair, requested_price_type):
+            if requested_price_type == PriceType.BestAsk:
+                return Decimal("1201") if connector_name == "bithumb" else Decimal("1200")
+            if requested_price_type == PriceType.BestBid:
+                return Decimal("1200") if connector_name == "bithumb" else Decimal("1201")
+            if requested_price_type == PriceType.MidPrice:
+                return Decimal("1200.5")
+            return Decimal("1200.5")
+
+        self.mock_market_data_provider.get_price_by_type.side_effect = price_side_effect
+        controller.executors_info = []
+
+        actions = controller.determine_executor_actions()
+        create_actions = [action for action in actions if isinstance(action, CreateExecutorAction)]
+
+        self.assertEqual(0, len(create_actions))
