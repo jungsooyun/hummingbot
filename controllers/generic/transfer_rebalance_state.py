@@ -35,6 +35,7 @@ class RebalanceSnapshot:
     last_error: Optional[str]
     last_qtg_state: Optional[str]
     lock_key: Optional[str]
+    required_base_threshold: Optional[str] = None
     delay_started_ts: Optional[float] = None
     delay_deadline_ts: Optional[float] = None
 

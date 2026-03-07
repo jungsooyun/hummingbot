@@ -11,6 +11,7 @@ from hummingbot.connector.exchange.upbit.upbit_api_user_stream_data_source impor
 from hummingbot.connector.exchange.upbit.upbit_auth import UpbitAuth
 from hummingbot.connector.exchange.upbit.upbit_exchange import UpbitExchange
 from hummingbot.connector.test_support.network_mocking_assistant import NetworkMockingAssistant
+from hummingbot.core.utils.xemm_diagnostics import HB_DIAG_WS_RECV_MONO_TS_MS, HB_DIAG_WS_RECV_TS_MS
 
 
 class UpbitAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
@@ -192,7 +193,10 @@ class UpbitAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(1, msg_queue.qsize())
         queued_msg = msg_queue.get_nowait()
-        self.assertEqual(order_event, queued_msg)
+        self.assertEqual(order_event["type"], queued_msg["type"])
+        self.assertEqual(order_event["uuid"], queued_msg["uuid"])
+        self.assertIn(HB_DIAG_WS_RECV_TS_MS, queued_msg)
+        self.assertIn(HB_DIAG_WS_RECV_MONO_TS_MS, queued_msg)
 
     @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
     async def test_processes_asset_event(self, mock_ws):
@@ -216,7 +220,10 @@ class UpbitAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(1, msg_queue.qsize())
         queued_msg = msg_queue.get_nowait()
-        self.assertEqual(asset_event, queued_msg)
+        self.assertEqual(asset_event["type"], queued_msg["type"])
+        self.assertEqual(asset_event["currency"], queued_msg["currency"])
+        self.assertIn(HB_DIAG_WS_RECV_TS_MS, queued_msg)
+        self.assertIn(HB_DIAG_WS_RECV_MONO_TS_MS, queued_msg)
 
     @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
     async def test_processes_multiple_events(self, mock_ws):
@@ -250,8 +257,14 @@ class UpbitAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(2, msg_queue.qsize())
         first_msg = msg_queue.get_nowait()
         second_msg = msg_queue.get_nowait()
-        self.assertEqual(order_event, first_msg)
-        self.assertEqual(asset_event, second_msg)
+        self.assertEqual(order_event["type"], first_msg["type"])
+        self.assertEqual(order_event["uuid"], first_msg["uuid"])
+        self.assertIn(HB_DIAG_WS_RECV_TS_MS, first_msg)
+        self.assertIn(HB_DIAG_WS_RECV_MONO_TS_MS, first_msg)
+        self.assertEqual(asset_event["type"], second_msg["type"])
+        self.assertEqual(asset_event["currency"], second_msg["currency"])
+        self.assertIn(HB_DIAG_WS_RECV_TS_MS, second_msg)
+        self.assertIn(HB_DIAG_WS_RECV_MONO_TS_MS, second_msg)
 
     @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
     @patch("hummingbot.core.data_type.user_stream_tracker_data_source.UserStreamTrackerDataSource._sleep")

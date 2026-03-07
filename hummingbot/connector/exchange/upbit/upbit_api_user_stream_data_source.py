@@ -6,6 +6,12 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from hummingbot.connector.exchange.upbit import upbit_constants as CONSTANTS
 from hummingbot.connector.exchange.upbit.upbit_auth import UpbitAuth
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.utils.xemm_diagnostics import (
+    HB_DIAG_WS_RECV_MONO_TS_MS,
+    HB_DIAG_WS_RECV_TS_MS,
+    monotonic_ms,
+    wall_clock_ms,
+)
 from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
@@ -93,6 +99,8 @@ class UpbitAPIUserStreamDataSource(UserStreamTrackerDataSource):
     async def _process_event_message(self, event_message: Dict[str, Any], queue: asyncio.Queue):
         event_type = event_message.get("type", "")
         if event_type in (CONSTANTS.PRIVATE_ORDER_CHANNEL_NAME, CONSTANTS.PRIVATE_ASSET_CHANNEL_NAME):
+            event_message[HB_DIAG_WS_RECV_TS_MS] = wall_clock_ms()
+            event_message[HB_DIAG_WS_RECV_MONO_TS_MS] = monotonic_ms()
             queue.put_nowait(event_message)
 
     async def _get_ws_assistant(self) -> WSAssistant:

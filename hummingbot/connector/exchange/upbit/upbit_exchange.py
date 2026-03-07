@@ -17,6 +17,13 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState,
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.utils.xemm_diagnostics import (
+    HB_DIAG_WS_RECV_MONO_TS_MS,
+    HB_DIAG_WS_RECV_TS_MS,
+    log_xemm_diag,
+    monotonic_ms,
+    wall_clock_ms,
+)
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
@@ -45,6 +52,114 @@ class UpbitExchange(ExchangePyBase):
 
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         self.real_time_balance_update = False
+
+    def _xemm_latency_diagnostics_enabled(self) -> bool:
+        return int(getattr(self, "_xemm_latency_diag_refcount", 0)) > 0
+
+    def _xemm_latency_diagnostics_context(
+        self,
+        tracked_order: Optional[InFlightOrder],
+        exchange_order_id: Optional[str],
+    ) -> Dict[str, Any]:
+        contexts = getattr(self, "_xemm_latency_diag_order_contexts", None)
+        if not isinstance(contexts, dict):
+            return {}
+        candidate_ids: List[str] = []
+        if tracked_order is not None:
+            if tracked_order.client_order_id:
+                candidate_ids.append(tracked_order.client_order_id)
+            if tracked_order.exchange_order_id:
+                candidate_ids.append(str(tracked_order.exchange_order_id))
+        if exchange_order_id:
+            candidate_ids.append(str(exchange_order_id))
+        for candidate_id in candidate_ids:
+            context = contexts.get(candidate_id)
+            if isinstance(context, dict):
+                return dict(context)
+        return {}
+
+    def _log_private_order_event_diagnostic(
+        self,
+        event_data: Dict[str, Any],
+        exchange_order_id: str,
+        tracked_order: Optional[InFlightOrder],
+        event_kind: str,
+        used_reconciliation: bool = False,
+        reconciliation_reason: Optional[str] = None,
+    ) -> None:
+        if not self._xemm_latency_diagnostics_enabled():
+            return
+        trace_context = self._xemm_latency_diagnostics_context(
+            tracked_order=tracked_order,
+            exchange_order_id=exchange_order_id,
+        )
+        if not trace_context:
+            return
+
+        ws_recv_ts_ms = event_data.get(HB_DIAG_WS_RECV_TS_MS)
+        process_ts_ms = wall_clock_ms()
+        process_mono_ts_ms = monotonic_ms()
+        exchange_trade_ts_ms = event_data.get("trade_timestamp")
+        exchange_to_recv_ms = None
+        if exchange_trade_ts_ms is not None and ws_recv_ts_ms is not None:
+            exchange_to_recv_ms = max(0, int(ws_recv_ts_ms) - int(exchange_trade_ts_ms))
+        recv_to_process_ms = None
+        ws_recv_mono_ts_ms = event_data.get(HB_DIAG_WS_RECV_MONO_TS_MS)
+        if ws_recv_mono_ts_ms is not None:
+            recv_to_process_ms = max(0, process_mono_ts_ms - int(ws_recv_mono_ts_ms))
+
+        user_stream_queue_size = None
+        if self._user_stream_tracker is not None:
+            user_stream_queue_size = self._user_stream_tracker.user_stream.qsize()
+
+        log_xemm_diag(
+            self.logger(),
+            "xemm_private_event",
+            **trace_context,
+            connector=self.name,
+            trading_pair=tracked_order.trading_pair if tracked_order is not None else event_data.get("code"),
+            client_order_id=tracked_order.client_order_id if tracked_order is not None else None,
+            exchange_order_id=exchange_order_id,
+            exchange_trade_id=event_data.get("trade_uuid"),
+            event_kind=event_kind,
+            raw_state=event_data.get("order_state"),
+            executed_volume=event_data.get("executed_volume"),
+            remaining_volume=event_data.get("remaining_volume"),
+            exchange_trade_ts_ms=exchange_trade_ts_ms,
+            ws_recv_ts_ms=ws_recv_ts_ms,
+            process_ts_ms=process_ts_ms,
+            recv_to_process_ms=recv_to_process_ms,
+            exchange_to_recv_ms=exchange_to_recv_ms,
+            user_stream_queue_size=user_stream_queue_size,
+            used_reconciliation=used_reconciliation,
+            reconciliation_reason=reconciliation_reason,
+        )
+
+    @staticmethod
+    def _normalize_order_state_value(state: Any) -> str:
+        if state is None:
+            return ""
+        normalized = str(state).strip().lower()
+        if normalized in {"", "none", "null"}:
+            return ""
+        return normalized
+
+    @staticmethod
+    def _is_terminal_fill_snapshot(executed_volume: Decimal, remaining_volume: Decimal) -> bool:
+        return executed_volume > Decimal("0") and remaining_volume <= Decimal("0")
+
+    def _ws_event_has_trade_signal(
+        self,
+        state: str,
+        event_data: Dict[str, Any],
+        executed_volume: Decimal,
+        remaining_volume: Decimal,
+    ) -> bool:
+        return (
+            state == "trade"
+            or event_data.get("trade_uuid") is not None
+            or self._is_terminal_fill_snapshot(executed_volume=executed_volume, remaining_volume=remaining_volume)
+        )
 
     @property
     def authenticator(self):
@@ -408,7 +523,7 @@ class UpbitExchange(ExchangePyBase):
         if fillable_order is None and updatable_order is None:
             return
 
-        state = str(event_data.get("order_state", "wait"))
+        state = self._normalize_order_state_value(event_data.get("order_state", "wait"))
         reference_order = updatable_order or fillable_order
         executed = Decimal(str(event_data.get("executed_volume", "0")))
         if "remaining_volume" in event_data:
@@ -416,30 +531,63 @@ class UpbitExchange(ExchangePyBase):
         else:
             total = Decimal(str(event_data.get("volume", reference_order.amount)))
             remaining = total - executed
+        new_state = self._resolve_order_state(state=state, executed_volume=executed, remaining_volume=remaining)
+        has_trade_signal = self._ws_event_has_trade_signal(
+            state=state,
+            event_data=event_data,
+            executed_volume=executed,
+            remaining_volume=remaining,
+        )
+        event_kind = (
+            "cancel"
+            if state == "cancel"
+            else "trade"
+            if (state == "trade" or event_data.get("trade_uuid") is not None)
+            else "done"
+            if new_state == OrderState.FILLED or state == "done"
+            else "order"
+        )
+        self._log_private_order_event_diagnostic(
+            event_data=event_data,
+            exchange_order_id=exchange_order_id,
+            tracked_order=reference_order,
+            event_kind=event_kind,
+        )
 
-        if state == "trade" and fillable_order is not None:
+        reconciled_from_ws_event = False
+        if has_trade_signal and fillable_order is not None:
             trade_uuid = event_data.get("trade_uuid")
             trade_update = self._parse_trade_from_ws_event(event_data, fillable_order)
             if trade_update is not None:
                 self._order_tracker.process_trade_update(trade_update)
-            elif trade_uuid is None or str(trade_uuid) not in fillable_order.order_fills:
+            elif (
+                (trade_uuid is not None and str(trade_uuid) not in fillable_order.order_fills)
+                or (
+                    trade_uuid is None
+                    and self._is_terminal_fill_snapshot(executed_volume=executed, remaining_volume=remaining)
+                    and fillable_order.executed_amount_base < executed
+                )
+            ):
                 await self._reconcile_trades_for_order(
                     order=fillable_order,
                     exchange_order_id=exchange_order_id,
-                    reason="invalid_ws_trade_event",
+                    reason="invalid_ws_trade_event" if trade_uuid is not None else "terminal_fill_missing_trade_uuid",
+                    force=self._is_terminal_fill_snapshot(executed_volume=executed, remaining_volume=remaining),
+                    event_data=event_data,
                 )
+                reconciled_from_ws_event = True
 
-        if state == "done" and fillable_order is not None and executed > Decimal("0"):
+        if state == "done" and fillable_order is not None and executed > Decimal("0") and not reconciled_from_ws_event:
             if fillable_order.executed_amount_base < executed:
                 await self._reconcile_trades_for_order(
                     order=fillable_order,
                     exchange_order_id=exchange_order_id,
                     reason="done_mismatch",
                     force=True,
+                    event_data=event_data,
                 )
 
         if updatable_order is not None:
-            new_state = self._resolve_order_state(state=state, executed_volume=executed, remaining_volume=remaining)
             order_update = OrderUpdate(
                 client_order_id=updatable_order.client_order_id,
                 exchange_order_id=exchange_order_id,
@@ -449,7 +597,7 @@ class UpbitExchange(ExchangePyBase):
             )
             self._order_tracker.process_order_update(order_update)
 
-        if state in {"done", "cancel"}:
+        if new_state in {OrderState.FILLED, OrderState.CANCELED}:
             self._clear_ws_order_tracking(exchange_order_id)
 
     def _parse_trade_from_ws_event(
@@ -500,17 +648,17 @@ class UpbitExchange(ExchangePyBase):
         executed_volume: Decimal,
         remaining_volume: Decimal,
     ) -> OrderState:
-        if state == "done":
-            return OrderState.FILLED
-        elif state == "cancel":
+        normalized_state = self._normalize_order_state_value(state)
+        if normalized_state == "cancel":
             return OrderState.CANCELED
-        elif state == "trade":
-            return OrderState.FILLED if remaining_volume <= Decimal("0") else OrderState.PARTIALLY_FILLED
-        else:
-            new_state = CONSTANTS.ORDER_STATE.get(state, OrderState.OPEN)
-            if executed_volume > Decimal("0") and remaining_volume > Decimal("0"):
-                return OrderState.PARTIALLY_FILLED
-            return new_state
+        if normalized_state == "done":
+            return OrderState.FILLED
+        if self._is_terminal_fill_snapshot(executed_volume=executed_volume, remaining_volume=remaining_volume):
+            return OrderState.FILLED
+        if normalized_state == "trade" or (executed_volume > Decimal("0") and remaining_volume > Decimal("0")):
+            return OrderState.PARTIALLY_FILLED
+        fallback_state = normalized_state or "wait"
+        return CONSTANTS.ORDER_STATE.get(fallback_state, OrderState.OPEN)
 
     def _should_run_ws_trade_rest_fallback(self, exchange_order_id: str, force: bool = False) -> bool:
         if force:
@@ -529,6 +677,7 @@ class UpbitExchange(ExchangePyBase):
         exchange_order_id: str,
         reason: str,
         force: bool = False,
+        event_data: Optional[Dict[str, Any]] = None,
     ) -> None:
         if not self._should_run_ws_trade_rest_fallback(exchange_order_id=exchange_order_id, force=force):
             self.logger().debug(
@@ -537,6 +686,15 @@ class UpbitExchange(ExchangePyBase):
             return
 
         self.logger().warning(f"WS trade reconciliation triggered for {exchange_order_id}: {reason}")
+        if event_data is not None:
+            self._log_private_order_event_diagnostic(
+                event_data=event_data,
+                exchange_order_id=exchange_order_id,
+                tracked_order=order,
+                event_kind="reconcile",
+                used_reconciliation=True,
+                reconciliation_reason=reason,
+            )
         trade_updates = await self._all_trade_updates_for_order(order)
         for trade_update in trade_updates:
             self._order_tracker.process_trade_update(trade_update)

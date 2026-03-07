@@ -1,6 +1,6 @@
 import asyncio
 from decimal import Decimal
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from bidict import bidict
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
@@ -10,6 +10,11 @@ from hummingbot.connector.exchange.bithumb.bithumb_exceptions import BithumbSelf
 from hummingbot.connector.exchange.bithumb.bithumb_exchange import BithumbExchange
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
+from hummingbot.core.utils.xemm_diagnostics import (
+    HB_DIAG_WS_RECV_MONO_TS_MS,
+    HB_DIAG_WS_RECV_TS_MS,
+    extract_xemm_diag_payload,
+)
 
 
 class BithumbExchangeTests(IsolatedAsyncioWrapperTestCase):
@@ -250,6 +255,62 @@ class BithumbExchangeTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(order_data["uuid"], "order-5")
         self.assertEqual(mock_get.call_count, 2)
 
+    async def test_user_stream_diagnostics_include_trace_context(self):
+        order = InFlightOrder(
+            client_order_id="OID-DIAG-2",
+            exchange_order_id="order-ws-diag-2",
+            trading_pair="BTC-KRW",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            price=Decimal("55000000"),
+            amount=Decimal("1.0"),
+            creation_timestamp=self.exchange.current_timestamp,
+        )
+        self.exchange._order_tracker._in_flight_orders["OID-DIAG-2"] = order
+        order.current_state = OrderState.OPEN
+        self.exchange._xemm_latency_diag_refcount = 1
+        self.exchange._xemm_latency_diag_order_contexts = {
+            "OID-DIAG-2": {
+                "trace_id": "trace-bithumb-1",
+                "executor_id": "exec-bithumb-1",
+                "controller_id": "controller-bithumb-1",
+                "side": "BUY",
+                "order_role": "taker",
+            }
+        }
+        self.exchange._user_stream_tracker = MagicMock()
+        self.exchange._user_stream_tracker.user_stream.qsize.return_value = 4
+
+        event_data = {
+            "type": "myOrder",
+            "uuid": "order-ws-diag-2",
+            "state": "wait",
+            "executed_volume": "0.4",
+            "remaining_volume": "0.6",
+            "trade_timestamp": 1700000000100,
+            "code": "KRW-BTC",
+            HB_DIAG_WS_RECV_TS_MS: 1700000000128,
+            HB_DIAG_WS_RECV_MONO_TS_MS: 64,
+        }
+
+        with self.assertLogs(self.exchange.logger(), level="INFO") as captured_logs:
+            await self.exchange._process_order_event(event_data)
+
+        payloads = [
+            extract_xemm_diag_payload(message)
+            for message in captured_logs.output
+            if "XEMM_DIAG" in message
+        ]
+        payloads = [payload for payload in payloads if payload is not None]
+        private_payload = next(payload for payload in payloads if payload["diag_type"] == "xemm_private_event")
+
+        self.assertEqual("trace-bithumb-1", private_payload["trace_id"])
+        self.assertEqual("exec-bithumb-1", private_payload["executor_id"])
+        self.assertEqual("taker", private_payload["order_role"])
+        self.assertEqual("order", private_payload["event_kind"])
+        self.assertEqual(28, private_payload["exchange_to_recv_ms"])
+        self.assertEqual(4, private_payload["user_stream_queue_size"])
+
     async def test_initialize_symbol_map_from_exchange_info(self):
         self.exchange._initialize_trading_pair_symbols_from_exchange_info(
             [
@@ -472,7 +533,7 @@ class BithumbExchangeTests(IsolatedAsyncioWrapperTestCase):
             order_type=OrderType.LIMIT,
             trade_type=TradeType.BUY,
             price=Decimal("55000000"),
-            amount=Decimal("0.1"),
+            amount=Decimal("0.2"),
             creation_timestamp=self.exchange.current_timestamp,
         )
         self.exchange._order_tracker._in_flight_orders["OID-WS-CLN"] = order
@@ -489,7 +550,7 @@ class BithumbExchangeTests(IsolatedAsyncioWrapperTestCase):
             "paid_fee": "2750",
             "trade_timestamp": 1709700000000,
             "executed_volume": "0.1",
-            "remaining_volume": "0",
+            "remaining_volume": "0.1",
             "code": "KRW-BTC",
         }
         await self.exchange._process_order_event(trade_event)
@@ -500,7 +561,7 @@ class BithumbExchangeTests(IsolatedAsyncioWrapperTestCase):
             "type": "myOrder",
             "uuid": "order-wst-cln",
             "state": "done",
-            "executed_volume": "0.1",
+            "executed_volume": "0.2",
             "remaining_volume": "0",
             "code": "KRW-BTC",
         }
@@ -508,6 +569,80 @@ class BithumbExchangeTests(IsolatedAsyncioWrapperTestCase):
             await self.exchange._process_order_event(done_event)
 
         self.assertNotIn("order-wst-cln", self.exchange._ws_order_paid_fees)
+
+    async def test_ws_done_event_with_trade_uuid_processes_final_fill_before_order_update(self):
+        order = InFlightOrder(
+            client_order_id="OID-WS-DONE-FILL",
+            exchange_order_id="order-wst-done-fill",
+            trading_pair="BTC-KRW",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            price=Decimal("55000000"),
+            amount=Decimal("0.1"),
+            creation_timestamp=self.exchange.current_timestamp,
+        )
+        self.exchange._order_tracker._in_flight_orders["OID-WS-DONE-FILL"] = order
+        order.current_state = OrderState.OPEN
+
+        partial_trade_event = {
+            "type": "myOrder",
+            "uuid": "order-wst-done-fill",
+            "state": "trade",
+            "trade_uuid": "fill-done-partial",
+            "price": "55000000",
+            "volume": "0.09",
+            "paid_fee": "2475",
+            "trade_timestamp": 1709700000000,
+            "executed_volume": "0.09",
+            "remaining_volume": "0.01",
+            "code": "KRW-BTC",
+        }
+        await self.exchange._process_order_event(partial_trade_event)
+
+        call_order = []
+        original_process_trade_update = self.exchange._order_tracker.process_trade_update
+        original_process_order_update = self.exchange._order_tracker.process_order_update
+
+        def track_trade_update(trade_update):
+            call_order.append(("trade", trade_update.trade_id))
+            return original_process_trade_update(trade_update)
+
+        def track_order_update(order_update):
+            call_order.append(("order", order_update.new_state))
+            return original_process_order_update(order_update)
+
+        done_event = {
+            "type": "myOrder",
+            "uuid": "order-wst-done-fill",
+            "state": "done",
+            "trade_uuid": "fill-done-final",
+            "price": "55000000",
+            "volume": "0.01",
+            "paid_fee": "2750",
+            "trade_timestamp": 1709700001000,
+            "executed_volume": "0.1",
+            "remaining_volume": "0",
+            "code": "KRW-BTC",
+        }
+
+        with patch.object(self.exchange, "_request_order_detail", AsyncMock()) as mock_api, patch.object(
+            self.exchange._order_tracker,
+            "process_trade_update",
+            side_effect=track_trade_update,
+        ), patch.object(
+            self.exchange._order_tracker,
+            "process_order_update",
+            side_effect=track_order_update,
+        ):
+            await self.exchange._process_order_event(done_event)
+            await asyncio.sleep(0)
+
+        mock_api.assert_not_called()
+        self.assertGreaterEqual(len(call_order), 2)
+        self.assertEqual(call_order[0], ("trade", "fill-done-final"))
+        self.assertEqual(call_order[1], ("order", OrderState.FILLED))
+        self.assertEqual(order.current_state, OrderState.FILLED)
+        self.assertIn("fill-done-final", order.order_fills)
 
     async def test_ws_done_event_with_missing_trades_falls_back_to_rest(self):
         """state='done' + executed_volume mismatch → REST fallback."""

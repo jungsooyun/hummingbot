@@ -17,6 +17,7 @@ from hummingbot.core.event.events import (
     OrderFilledEvent,
     SellOrderCompletedEvent,
 )
+from hummingbot.core.utils.xemm_diagnostics import extract_xemm_diag_payload
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.executors.xemm_executor.data_types import XEMMExecutorConfig
@@ -218,6 +219,44 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
 
         self.assertIsNotNone(executor._shadow_prefill_unwind_order)
         strategy.buy.assert_called()
+
+    async def test_maybe_place_taker_after_fill_allows_close_out_loss_cap_bypass(self):
+        executor = XEMMExecutor(self.strategy, self.base_config_long_limit_taker, self.update_interval)
+        executor.config.allow_loss_hedge = False
+        executor.config.min_profitability_guard = Decimal("0.001")
+        executor.config.close_out_loss_cap_bps = Decimal("15")
+        executor._unhedged_base = Decimal("100")
+        executor._unhedged_quote = Decimal("10000")
+        executor._taker_result_price = Decimal("99.95")
+        executor._tx_cost_pct = Decimal("0")
+
+        with patch.object(executor, "update_prices_and_tx_costs", AsyncMock()), \
+                patch.object(executor, "_has_order_budget", return_value=True), \
+                patch.object(executor, "place_taker_order") as place_taker_order:
+            await executor._maybe_place_taker_after_fill()
+
+        place_taker_order.assert_called_once_with(order_amount=Decimal("100"))
+        self.assertEqual("loss_cap_bypass", executor._last_hedge_guard_mode)
+        self.assertEqual("", executor._hedge_block_reason)
+
+    async def test_maybe_place_taker_after_fill_blocks_below_close_out_loss_cap(self):
+        executor = XEMMExecutor(self.strategy, self.base_config_long_limit_taker, self.update_interval)
+        executor.config.allow_loss_hedge = False
+        executor.config.min_profitability_guard = Decimal("0.001")
+        executor.config.close_out_loss_cap_bps = Decimal("15")
+        executor._unhedged_base = Decimal("100")
+        executor._unhedged_quote = Decimal("10000")
+        executor._taker_result_price = Decimal("99.80")
+        executor._tx_cost_pct = Decimal("0")
+
+        with patch.object(executor, "update_prices_and_tx_costs", AsyncMock()), \
+                patch.object(executor, "_has_order_budget", return_value=True), \
+                patch.object(executor, "place_taker_order") as place_taker_order:
+            await executor._maybe_place_taker_after_fill()
+
+        place_taker_order.assert_not_called()
+        self.assertEqual("blocked", executor._last_hedge_guard_mode)
+        self.assertIn("close_out_loss_cap_bps=15", executor._hedge_block_reason)
 
     @patch.object(XEMMExecutor, "get_resulting_price_for_amount")
     @patch.object(XEMMExecutor, "get_tx_cost_in_asset")
@@ -724,6 +763,10 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.assertEqual(self.executor.taker_order.order, None)
         self.executor.process_order_created_event(1, MagicMock(), buy_order_created_event)
         self.assertEqual(self.executor.maker_order.order.client_order_id, "OID-BUY-1")
+        self.assertEqual(
+            self.strategy.current_timestamp + self.executor._maker_post_create_grace_sec,
+            self.executor._maker_post_create_grace_until_ts,
+        )
         self.executor.process_order_created_event(1, MagicMock(), sell_order_created_event)
         self.assertEqual(self.executor.taker_order.order.client_order_id, "OID-SELL-1")
 
@@ -766,6 +809,65 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.assertEqual(0.0, executor._stp_cooldown_until_ts)
         self.assertEqual(0.0, executor._stp_pause_until_ts)
         self.assertEqual("", executor._stp_last_error_message)
+
+    async def test_control_update_maker_order_skips_before_create_ack(self):
+        self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        self.executor.update_current_trade_profitability = AsyncMock()
+        self.strategy.cancel.reset_mock()
+
+        with patch.object(self.executor, "_should_refresh_maker_order", return_value=(False, "")) as refresh_mock:
+            await self.executor.control_update_maker_order()
+
+        self.executor.update_current_trade_profitability.assert_not_awaited()
+        refresh_mock.assert_not_called()
+        self.strategy.cancel.assert_not_called()
+
+    async def test_control_update_maker_order_skips_during_post_create_grace(self):
+        self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        self.executor.maker_order.order = InFlightOrder(
+            creation_timestamp=1234,
+            trading_pair="ETH-USDT",
+            client_order_id="OID-BUY-1",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("100"),
+            price=Decimal("100"),
+            initial_state=OrderState.OPEN,
+        )
+        self.executor._maker_post_create_grace_until_ts = self.strategy.current_timestamp + 1
+        self.executor.update_current_trade_profitability = AsyncMock()
+        self.strategy.cancel.reset_mock()
+
+        with patch.object(self.executor, "_should_refresh_maker_order", return_value=(False, "")) as refresh_mock:
+            await self.executor.control_update_maker_order()
+
+        self.executor.update_current_trade_profitability.assert_not_awaited()
+        refresh_mock.assert_not_called()
+        self.strategy.cancel.assert_not_called()
+
+    async def test_control_update_maker_order_allows_profitability_cancel_after_grace(self):
+        self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        self.executor.maker_order.order = InFlightOrder(
+            creation_timestamp=1234,
+            trading_pair="ETH-USDT",
+            client_order_id="OID-BUY-1",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("100"),
+            price=Decimal("100"),
+            initial_state=OrderState.OPEN,
+        )
+        self.executor._maker_post_create_grace_until_ts = self.strategy.current_timestamp - 1
+        self.executor._current_trade_profitability = Decimal("0")
+        self.executor._tx_cost_pct = Decimal("0.02")
+        self.executor.update_current_trade_profitability = AsyncMock()
+        self.strategy.cancel.reset_mock()
+
+        with patch.object(self.executor, "_should_refresh_maker_order", return_value=(False, "")):
+            await self.executor.control_update_maker_order()
+
+        self.executor.update_current_trade_profitability.assert_awaited_once()
+        self.strategy.cancel.assert_called_once_with("binance", "ETH-USDT", "OID-BUY-1")
 
     def test_process_order_completed_event(self):
         self.executor._status = RunnableStatus.RUNNING
@@ -859,6 +961,136 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.assertEqual(custom_info["taker_order_type"], OrderType.MARKET.name)
         self.assertEqual(custom_info["taker_slippage_buffer_bps"], Decimal("0"))
         self.assertEqual(custom_info["taker_fallback_to_market"], False)
+
+    def test_get_custom_info_includes_latency_diagnostics_fields(self):
+        config = XEMMExecutorConfig(
+            timestamp=1234,
+            latency_diagnostics_enabled=True,
+            buying_market=ConnectorPair(connector_name='binance', trading_pair='ETH-USDT'),
+            selling_market=ConnectorPair(connector_name='kucoin', trading_pair='ETH-USDT'),
+            maker_side=TradeType.BUY,
+            order_amount=Decimal('100'),
+            min_profitability=Decimal('0.01'),
+            target_profitability=Decimal('0.015'),
+            max_profitability=Decimal('0.02'),
+        )
+        executor = XEMMExecutor(self.strategy, config, self.update_interval)
+        custom_info = executor.get_custom_info()
+        self.assertTrue(custom_info["latency_diagnostics_enabled"])
+        self.assertEqual(custom_info["trace_id"], config.id)
+
+    def test_place_taker_order_emits_submit_request_diagnostic_when_enabled(self):
+        config = XEMMExecutorConfig(
+            timestamp=1234,
+            latency_diagnostics_enabled=True,
+            buying_market=ConnectorPair(connector_name='binance', trading_pair='ETH-USDT'),
+            selling_market=ConnectorPair(connector_name='kucoin', trading_pair='ETH-USDT'),
+            maker_side=TradeType.BUY,
+            order_amount=Decimal('100'),
+            min_profitability=Decimal('0.01'),
+            target_profitability=Decimal('0.015'),
+            max_profitability=Decimal('0.02'),
+        )
+        executor = XEMMExecutor(self.strategy, config, self.update_interval)
+        self.set_loggers(loggers=[executor.logger()])
+
+        executor.place_taker_order()
+
+        diagnostic_payloads = [
+            extract_xemm_diag_payload(record.getMessage())
+            for record in self.log_records
+            if "XEMM_DIAG" in record.getMessage()
+        ]
+        diagnostic_payloads = [payload for payload in diagnostic_payloads if payload is not None]
+        self.assertTrue(any(payload["diag_type"] == "xemm_taker_transition" for payload in diagnostic_payloads))
+        self.assertTrue(
+            any(
+                payload["diag_type"] == "xemm_taker_transition" and payload.get("stage") == "submit_request"
+                for payload in diagnostic_payloads
+            )
+        )
+        self.assertTrue(
+            any(
+                payload["diag_type"] == "xemm_book_sample" and payload.get("stage") == "taker_submit_request"
+                for payload in diagnostic_payloads
+            )
+        )
+
+    def test_latency_diagnostics_connector_contexts_are_released_on_stop(self):
+        config = XEMMExecutorConfig(
+            timestamp=1234,
+            latency_diagnostics_enabled=True,
+            buying_market=ConnectorPair(connector_name='binance', trading_pair='ETH-USDT'),
+            selling_market=ConnectorPair(connector_name='kucoin', trading_pair='ETH-USDT'),
+            maker_side=TradeType.BUY,
+            order_amount=Decimal('100'),
+            min_profitability=Decimal('0.01'),
+            target_profitability=Decimal('0.015'),
+            max_profitability=Decimal('0.02'),
+        )
+        executor = XEMMExecutor(self.strategy, config, self.update_interval)
+        binance_connector = executor.connectors["binance"]
+        kucoin_connector = executor.connectors["kucoin"]
+
+        self.assertEqual(1, binance_connector.__dict__["_xemm_latency_diag_refcount"])
+        self.assertEqual(1, kucoin_connector.__dict__["_xemm_latency_diag_refcount"])
+
+        executor.place_taker_order()
+
+        self.assertIn(
+            executor.taker_order.order_id,
+            kucoin_connector.__dict__["_xemm_latency_diag_order_contexts"],
+        )
+
+        executor.on_stop()
+
+        self.assertNotIn("_xemm_latency_diag_refcount", binance_connector.__dict__)
+        self.assertNotIn("_xemm_latency_diag_refcount", kucoin_connector.__dict__)
+        self.assertNotIn("_xemm_latency_diag_order_contexts", kucoin_connector.__dict__)
+
+    def test_process_order_completed_event_maker_completed_diagnostic_reflects_unhedged_exposure(self):
+        config = XEMMExecutorConfig(
+            timestamp=1234,
+            latency_diagnostics_enabled=True,
+            buying_market=ConnectorPair(connector_name='binance', trading_pair='ETH-USDT'),
+            selling_market=ConnectorPair(connector_name='kucoin', trading_pair='ETH-USDT'),
+            maker_side=TradeType.BUY,
+            order_amount=Decimal('100'),
+            min_profitability=Decimal('0.01'),
+            target_profitability=Decimal('0.015'),
+            max_profitability=Decimal('0.02'),
+        )
+        executor = XEMMExecutor(self.strategy, config, self.update_interval)
+        executor._status = RunnableStatus.RUNNING
+        executor.maker_order = TrackedOrder(order_id="OID-BUY-9")
+        self.set_loggers(loggers=[executor.logger()])
+
+        buy_order_completed_event = BuyOrderCompletedEvent(
+            base_asset="ETH",
+            quote_asset="USDT",
+            base_asset_amount=Decimal("2"),
+            quote_asset_amount=Decimal("200"),
+            order_type=OrderType.LIMIT,
+            timestamp=1234,
+            order_id="OID-BUY-9",
+        )
+
+        executor.process_order_completed_event(1, MagicMock(), buy_order_completed_event)
+
+        diagnostic_payloads = [
+            extract_xemm_diag_payload(record.getMessage())
+            for record in self.log_records
+            if "XEMM_DIAG" in record.getMessage()
+        ]
+        diagnostic_payloads = [payload for payload in diagnostic_payloads if payload is not None]
+        completed_payload = next(
+            payload
+            for payload in diagnostic_payloads
+            if payload["diag_type"] == "xemm_maker_transition" and payload.get("stage") == "completed"
+        )
+
+        self.assertEqual("2", completed_payload["accounting_snapshot"]["unhedged_base"])
+        self.assertEqual("200", completed_payload["accounting_snapshot"]["unhedged_quote"])
 
     def test_to_format_status(self):
         self.assertIn("Maker Side: TradeType.BUY", self.executor.to_format_status())

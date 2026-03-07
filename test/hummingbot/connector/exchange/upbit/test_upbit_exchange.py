@@ -9,6 +9,11 @@ from hummingbot.connector.exchange.upbit import upbit_constants as CONSTANTS
 from hummingbot.connector.exchange.upbit.upbit_exchange import UpbitExchange
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
+from hummingbot.core.utils.xemm_diagnostics import (
+    HB_DIAG_WS_RECV_MONO_TS_MS,
+    HB_DIAG_WS_RECV_TS_MS,
+    extract_xemm_diag_payload,
+)
 
 
 class UpbitExchangeTests(IsolatedAsyncioWrapperTestCase):
@@ -250,6 +255,62 @@ class UpbitExchangeTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(order.current_state, OrderState.PARTIALLY_FILLED)
 
+    async def test_user_stream_diagnostics_include_trace_context(self):
+        order = InFlightOrder(
+            client_order_id="OID-DIAG-1",
+            exchange_order_id="order-ws-diag-1",
+            trading_pair="BTC-KRW",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            price=Decimal("100000"),
+            amount=Decimal("1.0"),
+            creation_timestamp=self.exchange.current_timestamp,
+        )
+        self.exchange._order_tracker._in_flight_orders["OID-DIAG-1"] = order
+        order.current_state = OrderState.OPEN
+        self.exchange._xemm_latency_diag_refcount = 1
+        self.exchange._xemm_latency_diag_order_contexts = {
+            "OID-DIAG-1": {
+                "trace_id": "trace-upbit-1",
+                "executor_id": "exec-upbit-1",
+                "controller_id": "controller-upbit-1",
+                "side": "BUY",
+                "order_role": "maker",
+            }
+        }
+        self.exchange._user_stream_tracker = MagicMock()
+        self.exchange._user_stream_tracker.user_stream.qsize.return_value = 3
+
+        event_data = {
+            "type": "myOrder",
+            "uuid": "order-ws-diag-1",
+            "order_state": "wait",
+            "executed_volume": "0.3",
+            "remaining_volume": "0.7",
+            "trade_timestamp": 1700000000000,
+            "code": "KRW-BTC",
+            HB_DIAG_WS_RECV_TS_MS: 1700000000015,
+            HB_DIAG_WS_RECV_MONO_TS_MS: 42,
+        }
+
+        with self.assertLogs(self.exchange.logger(), level="INFO") as captured_logs:
+            await self.exchange._process_order_event(event_data)
+
+        payloads = [
+            extract_xemm_diag_payload(message)
+            for message in captured_logs.output
+            if "XEMM_DIAG" in message
+        ]
+        payloads = [payload for payload in payloads if payload is not None]
+        private_payload = next(payload for payload in payloads if payload["diag_type"] == "xemm_private_event")
+
+        self.assertEqual("trace-upbit-1", private_payload["trace_id"])
+        self.assertEqual("exec-upbit-1", private_payload["executor_id"])
+        self.assertEqual("maker", private_payload["order_role"])
+        self.assertEqual("order", private_payload["event_kind"])
+        self.assertEqual(15, private_payload["exchange_to_recv_ms"])
+        self.assertEqual(3, private_payload["user_stream_queue_size"])
+
     async def test_user_stream_processes_order_canceled(self):
         order = InFlightOrder(
             client_order_id="OID-3",
@@ -405,6 +466,43 @@ class UpbitExchangeTests(IsolatedAsyncioWrapperTestCase):
         await asyncio.sleep(0)
 
         self.assertEqual(order.current_state, OrderState.FILLED)
+
+    async def test_ws_terminal_fill_with_null_state_and_trade_uuid_sets_filled(self):
+        order = InFlightOrder(
+            client_order_id="OID-WS-T3B",
+            exchange_order_id="order-wst-3b",
+            trading_pair="BTC-KRW",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.SELL,
+            price=Decimal("100000"),
+            amount=Decimal("0.1"),
+            creation_timestamp=self.exchange.current_timestamp,
+        )
+        self.exchange._order_tracker._in_flight_orders["OID-WS-T3B"] = order
+        order.current_state = OrderState.OPEN
+
+        event_data = {
+            "type": "myOrder",
+            "uuid": "order-wst-3b",
+            "order_state": None,
+            "trade_uuid": "fill-uuid-3b",
+            "price": "100000",
+            "volume": "0.1",
+            "trade_fee": "5",
+            "is_maker": False,
+            "trade_timestamp": 1709700000000,
+            "executed_volume": "0.1",
+            "remaining_volume": "0",
+            "code": "KRW-BTC",
+        }
+
+        with patch.object(self.exchange, "_api_get", AsyncMock()) as mock_api:
+            await self.exchange._process_order_event(event_data)
+            await asyncio.sleep(0)
+
+        mock_api.assert_not_called()
+        self.assertEqual(order.current_state, OrderState.FILLED)
+        self.assertIn("fill-uuid-3b", order.order_fills)
 
     async def test_ws_done_event_with_missing_trades_falls_back_to_rest(self):
         """state='done' + executed_volume mismatch → REST fallback 1 time."""

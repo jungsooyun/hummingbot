@@ -7,6 +7,7 @@ from hummingbot.strategy_v2.executors.data_types import ConnectorPair, ExecutorC
 
 class XEMMExecutorConfig(ExecutorConfigBase):
     type: Literal["xemm_executor"] = "xemm_executor"
+    latency_diagnostics_enabled: bool = False
     buying_market: ConnectorPair
     selling_market: ConnectorPair
     maker_side: TradeType
@@ -27,6 +28,7 @@ class XEMMExecutorConfig(ExecutorConfigBase):
     # Safety / hedging guards
     min_profitability_guard: Decimal = Decimal("0")
     allow_loss_hedge: bool = False
+    close_out_loss_cap_bps: Decimal = Decimal("0")
     hedge_aggregation_window_sec: float = 1.0
     max_unhedged_notional_quote: Decimal = Decimal("0")
     rate_limit_backoff_factor: float = 1.0

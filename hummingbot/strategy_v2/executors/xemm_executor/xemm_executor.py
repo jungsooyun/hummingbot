@@ -1,7 +1,8 @@
 import asyncio
 import logging
+import time
 from decimal import Decimal
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from hummingbot.connector.connector_base import ConnectorBase, Union
 from hummingbot.connector.utils import split_hb_trading_pair
@@ -17,6 +18,7 @@ from hummingbot.core.event.events import (
     SellOrderCreatedEvent,
 )
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
+from hummingbot.core.utils.xemm_diagnostics import log_xemm_diag
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
@@ -118,6 +120,8 @@ class XEMMExecutor(ExecutorBase):
         self._maker_cancel_in_flight = False
         self._maker_cancel_requested_timestamp = 0.0
         self._maker_cancel_retry_interval = 3.0
+        self._maker_post_create_grace_sec = 1.0
+        self._maker_post_create_grace_until_ts = 0.0
         self._taker_cancel_in_flight = False
         self._taker_cancel_requested_timestamp = 0.0
         self._taker_cancel_retry_interval = 3.0
@@ -146,6 +150,7 @@ class XEMMExecutor(ExecutorBase):
         self._unhedged_quote: Decimal = Decimal("0")
         self._last_fill_timestamp: float = 0.0
         self._hedge_block_reason: str = ""
+        self._last_hedge_guard_mode: str = "normal"
         self._early_stop_hedge_initiated: bool = False
         # Bithumb self-trade prevention (STP) guard state
         self._stp_reject_streak: int = 0
@@ -158,6 +163,295 @@ class XEMMExecutor(ExecutorBase):
         super().__init__(strategy=strategy,
                          connectors=[config.buying_market.connector_name, config.selling_market.connector_name],
                          config=config, update_interval=update_interval)
+        self._diag_trace_started = False
+        self._diag_trace_ended = False
+        self._diag_registered_orders: set[Tuple[str, str]] = set()
+        self._diag_connector_handles_acquired = False
+        if self._diag_enabled():
+            self._acquire_connector_diag_handles()
+
+    def _diag_enabled(self) -> bool:
+        return bool(getattr(self.config, "latency_diagnostics_enabled", False))
+
+    def _diag_connector_context(self, order_role: str) -> Dict[str, Any]:
+        return {
+            "trace_id": self.config.id,
+            "executor_id": self.config.id,
+            "controller_id": self.config.controller_id,
+            "side": self.maker_order_side.name,
+            "order_role": order_role,
+        }
+
+    def _acquire_connector_diag_handles(self) -> None:
+        if self._diag_connector_handles_acquired or not self._diag_enabled():
+            return
+        seen_connector_ids: set[int] = set()
+        for connector in self.connectors.values():
+            connector_id = id(connector)
+            if connector_id in seen_connector_ids:
+                continue
+            seen_connector_ids.add(connector_id)
+            refcount = int(getattr(connector, "_xemm_latency_diag_refcount", 0))
+            setattr(connector, "_xemm_latency_diag_refcount", refcount + 1)
+            contexts = getattr(connector, "_xemm_latency_diag_order_contexts", None)
+            if not isinstance(contexts, dict):
+                setattr(connector, "_xemm_latency_diag_order_contexts", {})
+        self._diag_connector_handles_acquired = True
+
+    def _release_connector_diag_handles(self) -> None:
+        if not self._diag_connector_handles_acquired:
+            return
+        for connector_name, order_id in list(self._diag_registered_orders):
+            connector = self.connectors.get(connector_name)
+            if connector is None:
+                continue
+            contexts = getattr(connector, "_xemm_latency_diag_order_contexts", None)
+            if isinstance(contexts, dict):
+                contexts.pop(order_id, None)
+        self._diag_registered_orders.clear()
+
+        seen_connector_ids: set[int] = set()
+        for connector in self.connectors.values():
+            connector_id = id(connector)
+            if connector_id in seen_connector_ids:
+                continue
+            seen_connector_ids.add(connector_id)
+            refcount = max(0, int(getattr(connector, "_xemm_latency_diag_refcount", 0)) - 1)
+            if refcount > 0:
+                setattr(connector, "_xemm_latency_diag_refcount", refcount)
+            else:
+                if hasattr(connector, "_xemm_latency_diag_refcount"):
+                    delattr(connector, "_xemm_latency_diag_refcount")
+                contexts = getattr(connector, "_xemm_latency_diag_order_contexts", None)
+                if isinstance(contexts, dict) and not contexts:
+                    delattr(connector, "_xemm_latency_diag_order_contexts")
+        self._diag_connector_handles_acquired = False
+
+    def _register_connector_diag_order(self, connector_name: str, order_id: Optional[str], order_role: str) -> None:
+        if not self._diag_enabled() or not order_id:
+            return
+        connector = self.connectors.get(connector_name)
+        if connector is None:
+            return
+        contexts = getattr(connector, "_xemm_latency_diag_order_contexts", None)
+        if not isinstance(contexts, dict):
+            contexts = {}
+            setattr(connector, "_xemm_latency_diag_order_contexts", contexts)
+        contexts[order_id] = self._diag_connector_context(order_role=order_role)
+        self._diag_registered_orders.add((connector_name, order_id))
+
+    def _register_tracked_order_diag_context(
+        self,
+        connector_name: str,
+        tracked_order: Optional[TrackedOrder],
+        order_role: str,
+    ) -> None:
+        if tracked_order is None:
+            return
+        self._register_connector_diag_order(connector_name, tracked_order.order_id, order_role=order_role)
+        in_flight_order = tracked_order.order
+        exchange_order_id = getattr(in_flight_order, "exchange_order_id", None)
+        if exchange_order_id:
+            self._register_connector_diag_order(
+                connector_name,
+                str(exchange_order_id),
+                order_role=order_role,
+            )
+
+    def _diag_base_fields(self) -> Dict[str, Any]:
+        return {
+            "trace_id": self.config.id,
+            "executor_id": self.config.id,
+            "controller_id": self.config.controller_id,
+            "maker_order_id": self.maker_order.order_id if self.maker_order else None,
+            "taker_order_id": self.taker_order.order_id if self.taker_order else None,
+            "side": self.maker_order_side.name,
+            "maker_connector": self.maker_connector,
+            "maker_trading_pair": self.maker_trading_pair,
+            "taker_connector": self.taker_connector,
+            "taker_trading_pair": self.taker_trading_pair,
+            "close_type": self.close_type.name if self.close_type is not None else None,
+            "status": self.status.name if hasattr(self.status, "name") else str(self.status),
+        }
+
+    def _emit_diag(self, diag_type: str, **fields: Any) -> None:
+        if not self._diag_enabled():
+            return
+        payload = self._diag_base_fields()
+        payload.update(fields)
+        log_xemm_diag(self.logger(), diag_type, **payload)
+
+    def _ensure_trace_started(self, start_reason: str, **fields: Any) -> None:
+        if self._diag_trace_started or not self._diag_enabled():
+            return
+        self._diag_trace_started = True
+        self._emit_diag(
+            "xemm_trace_start",
+            start_reason=start_reason,
+            order_amount=self.config.order_amount,
+            min_profitability=self.config.min_profitability,
+            target_profitability=self.config.target_profitability,
+            max_profitability=self.config.max_profitability,
+            maker_price_source=self.config.maker_price_source,
+            taker_order_type=self._effective_taker_order_type().name,
+            taker_order_max_age_seconds=self.config.taker_order_max_age_seconds,
+            maker_order_max_age_seconds=self.config.maker_order_max_age_seconds,
+            **fields,
+        )
+
+    def _emit_trace_end(self, end_reason: str, **fields: Any) -> None:
+        if self._diag_trace_ended or not self._diag_enabled():
+            return
+        self._ensure_trace_started(f"auto_start_before_{end_reason}")
+        self._diag_trace_ended = True
+        self._emit_diag(
+            "xemm_trace_end",
+            end_reason=end_reason,
+            close_timestamp=self.close_timestamp,
+            unhedged_base=self._unhedged_base,
+            unhedged_quote=self._unhedged_quote,
+            hedge_block_reason=self._hedge_block_reason,
+            **fields,
+        )
+
+    def _tracked_order_snapshot(self, tracked_order: Optional[TrackedOrder]) -> Dict[str, Any]:
+        if tracked_order is None:
+            return {
+                "order_id": None,
+                "is_open": False,
+                "is_done": False,
+                "is_filled": False,
+                "creation_timestamp": None,
+                "last_update_timestamp": None,
+                "price": None,
+                "average_executed_price": None,
+                "executed_amount_base": Decimal("0"),
+                "executed_amount_quote": Decimal("0"),
+            }
+        return {
+            "order_id": tracked_order.order_id,
+            "is_open": tracked_order.is_open,
+            "is_done": tracked_order.is_done,
+            "is_filled": tracked_order.is_filled,
+            "creation_timestamp": tracked_order.creation_timestamp,
+            "last_update_timestamp": tracked_order.last_update_timestamp,
+            "price": tracked_order.price,
+            "average_executed_price": tracked_order.average_executed_price,
+            "executed_amount_base": tracked_order.executed_amount_base,
+            "executed_amount_quote": tracked_order.executed_amount_quote,
+        }
+
+    def _event_snapshot(self, event: Any) -> Dict[str, Any]:
+        return {
+            "order_id": getattr(event, "order_id", None),
+            "timestamp": getattr(event, "timestamp", None),
+            "price": getattr(event, "price", None),
+            "amount": getattr(event, "amount", None),
+            "base_asset_amount": getattr(event, "base_asset_amount", None),
+            "quote_asset_amount": getattr(event, "quote_asset_amount", None),
+        }
+
+    def _accounting_snapshot(
+        self,
+        tracked_order: Optional[TrackedOrder],
+        event_base: Optional[Decimal] = None,
+        event_quote: Optional[Decimal] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "tracked_order": self._tracked_order_snapshot(tracked_order),
+            "event_executed_base": event_base,
+            "event_executed_quote": event_quote,
+            "unhedged_base": self._unhedged_base,
+            "unhedged_quote": self._unhedged_quote,
+            "unhedged_avg_price": self._unhedged_avg_price(),
+        }
+
+    def _collect_order_book_sample(self, connector_name: str, trading_pair: str) -> Dict[str, Any]:
+        sample: Dict[str, Any] = {
+            "connector": connector_name,
+            "trading_pair": trading_pair,
+            "best_bid": self.get_price(connector_name, trading_pair, price_type=PriceType.BestBid),
+            "best_ask": self.get_price(connector_name, trading_pair, price_type=PriceType.BestAsk),
+        }
+        connector = self.connectors.get(connector_name)
+        if connector is None:
+            return sample
+
+        try:
+            order_book = connector.get_order_book(connector_name, trading_pair)
+        except Exception:
+            order_book = None
+        if order_book is not None:
+            snapshot_uid = getattr(order_book, "snapshot_uid", None)
+            sample["snapshot_uid"] = snapshot_uid
+            try:
+                snapshot_uid_int = int(snapshot_uid)
+            except (TypeError, ValueError):
+                snapshot_uid_int = None
+            if snapshot_uid_int is not None and snapshot_uid_int > 10**11:
+                sample["book_age_ms_exchange"] = max(0, int(time.time() * 1000) - snapshot_uid_int)
+
+        tracker = getattr(connector, "order_book_tracker", None)
+        if tracker is None:
+            return sample
+
+        metrics = getattr(tracker, "metrics", None)
+        pair_metrics = getattr(metrics, "per_pair_metrics", {}).get(trading_pair) if metrics is not None else None
+        if pair_metrics is not None:
+            try:
+                last_diff_timestamp = float(pair_metrics.last_diff_timestamp)
+                last_snapshot_timestamp = float(pair_metrics.last_snapshot_timestamp)
+                last_local_update = max(last_diff_timestamp, last_snapshot_timestamp)
+            except (TypeError, ValueError):
+                last_local_update = None
+            sample["last_local_update_perf_ts"] = last_local_update
+            if last_local_update is not None and last_local_update > 0:
+                sample["book_age_ms_local"] = int(max(0.0, time.perf_counter() - last_local_update) * 1000)
+
+        pair_queue = getattr(tracker, "_tracking_message_queues", {}).get(trading_pair)
+        saved_queue = getattr(tracker, "_saved_message_queues", {}).get(trading_pair)
+        snapshot_stream = getattr(tracker, "_order_book_snapshot_stream", None)
+        diff_stream = getattr(tracker, "_order_book_diff_stream", None)
+        sample["tracker_pair_queue_size"] = pair_queue.qsize() if pair_queue is not None else 0
+        sample["tracker_saved_queue_size"] = len(saved_queue) if saved_queue is not None else 0
+        sample["tracker_snapshot_stream_size"] = snapshot_stream.qsize() if snapshot_stream is not None else 0
+        sample["tracker_diff_stream_size"] = diff_stream.qsize() if diff_stream is not None else 0
+        return sample
+
+    def _log_book_sample(self, stage: str, **fields: Any) -> None:
+        self._ensure_trace_started(stage)
+        self._emit_diag(
+            "xemm_book_sample",
+            stage=stage,
+            maker_book=self._collect_order_book_sample(self.maker_connector, self.maker_trading_pair),
+            taker_book=self._collect_order_book_sample(self.taker_connector, self.taker_trading_pair),
+            taker_result_price=self._taker_result_price,
+            maker_target_price=self._maker_target_price,
+            tx_cost_pct=self._tx_cost_pct,
+            **fields,
+        )
+
+    def _log_maker_transition(self, stage: str, **fields: Any) -> None:
+        self._ensure_trace_started(stage)
+        payload_fields = dict(fields)
+        payload_fields.setdefault("order_snapshot", self._tracked_order_snapshot(self.maker_order))
+        payload_fields.setdefault("accounting_snapshot", self._accounting_snapshot(self.maker_order))
+        self._emit_diag(
+            "xemm_maker_transition",
+            stage=stage,
+            **payload_fields,
+        )
+
+    def _log_taker_transition(self, stage: str, **fields: Any) -> None:
+        self._ensure_trace_started(stage)
+        payload_fields = dict(fields)
+        payload_fields.setdefault("order_snapshot", self._tracked_order_snapshot(self.taker_order))
+        payload_fields.setdefault("accounting_snapshot", self._accounting_snapshot(self.taker_order))
+        self._emit_diag(
+            "xemm_taker_transition",
+            stage=stage,
+            **payload_fields,
+        )
 
     async def validate_sufficient_balance(self):
         mid_price = self.get_price(self.maker_connector, self.maker_trading_pair,
@@ -421,6 +715,10 @@ class XEMMExecutor(ExecutorBase):
     def _use_market_hedge_on_early_stop(self) -> bool:
         return str(self.config.stale_fill_hedge_mode).lower() == "market"
 
+    def _close_out_loss_cap_pct(self) -> Decimal:
+        cap_bps = getattr(self.config, "close_out_loss_cap_bps", Decimal("0"))
+        return Decimal(str(cap_bps)) / Decimal("10000")
+
     def _unhedged_abs_notional(self) -> Decimal:
         if self._unhedged_base == 0:
             return Decimal("0")
@@ -447,6 +745,11 @@ class XEMMExecutor(ExecutorBase):
             self.logger().warning(
                 f"Maker cancel pending for {self.maker_order.order_id} after "
                 f"{now - self._maker_cancel_requested_timestamp:.2f}s. Retrying cancel."
+            )
+            self._log_maker_transition(
+                "cancel_retry",
+                retry_interval=self._maker_cancel_retry_interval,
+                elapsed_since_cancel_request=now - self._maker_cancel_requested_timestamp,
             )
             self._strategy.cancel(self.maker_connector, self.maker_trading_pair, self.maker_order.order_id)
             self._maker_cancel_requested_timestamp = now
@@ -961,29 +1264,43 @@ class XEMMExecutor(ExecutorBase):
         return await self.connectors[connector].get_quote_price(trading_pair, is_buy, order_amount)
 
     async def create_maker_order(self):
+        self._ensure_trace_started("maker_create_attempt")
         maker_price = self._safe_maker_price_with_stp(self._maker_target_price)
+        self._log_book_sample("maker_create_decision", proposed_maker_price=maker_price)
         if maker_price is None:
             self._stp_last_error_message = (
                 "Bithumb STP guard could not find a safe maker price within configured offset ticks."
             )
             self._stp_cooldown_until_ts = self._strategy.current_timestamp + float(self.config.bithumb_stp_retry_cooldown_sec)
             self.logger().warning(self._stp_last_error_message)
+            self._log_maker_transition("stp_blocked", blocker_error=self._stp_last_error_message)
             return
 
         estimated_profitability = await self._estimate_profitability_for_maker_price(maker_price)
         if estimated_profitability is None:
             self.logger().warning("Could not estimate profitability for maker order. Skipping maker placement.")
+            self._log_maker_transition("estimate_missing", proposed_maker_price=maker_price)
             return
         if estimated_profitability < self.config.min_profitability:
             self.logger().info(
                 f"Skipping maker placement at price={maker_price}: estimated profitability "
                 f"{estimated_profitability} < min_profitability {self.config.min_profitability}."
             )
+            self._log_maker_transition(
+                "placement_skipped_below_min",
+                proposed_maker_price=maker_price,
+                estimated_profitability=estimated_profitability,
+            )
             return
         if estimated_profitability > self.config.max_profitability:
             self.logger().info(
                 f"Skipping maker placement at price={maker_price}: estimated profitability "
                 f"{estimated_profitability} > max_profitability {self.config.max_profitability}."
+            )
+            self._log_maker_transition(
+                "placement_skipped_above_max",
+                proposed_maker_price=maker_price,
+                estimated_profitability=estimated_profitability,
             )
             return
 
@@ -995,7 +1312,15 @@ class XEMMExecutor(ExecutorBase):
             amount=self.config.order_amount,
             price=maker_price)
         self.maker_order = TrackedOrder(order_id=order_id)
+        self._register_tracked_order_diag_context(self.maker_connector, self.maker_order, order_role="maker")
         self.logger().info(f"Created maker order {order_id} at price {maker_price}.")
+        self._log_maker_transition(
+            "create_request",
+            requested_order_id=order_id,
+            requested_price=maker_price,
+            requested_amount=self.config.order_amount,
+            estimated_profitability=estimated_profitability,
+        )
 
     async def _estimate_profitability_for_maker_price(self, maker_price: Decimal) -> Optional[Decimal]:
         if maker_price <= Decimal("0") or self._taker_result_price <= Decimal("0"):
@@ -1044,6 +1369,7 @@ class XEMMExecutor(ExecutorBase):
         )
         if maker_done and taker_done and shadow_closed and unwind_closed:
             self.logger().info("Both orders are done, executor terminated.")
+            self._emit_trace_end("both_orders_done")
             self.stop()
 
     async def control_early_stop_shutdown(self):
@@ -1053,7 +1379,7 @@ class XEMMExecutor(ExecutorBase):
         if maker_open:
             if not self._maker_cancel_in_flight:
                 self.logger().info(f"Early stop: cancelling maker order {self.maker_order.order_id}.")
-                self.request_maker_cancel()
+                self.request_maker_cancel(reason="early_stop")
             else:
                 await self.control_pending_maker_cancel()
 
@@ -1064,7 +1390,7 @@ class XEMMExecutor(ExecutorBase):
             else:
                 if not self._taker_cancel_in_flight:
                     self.logger().info(f"Early stop: cancelling taker order {self.taker_order.order_id}.")
-                    self.request_taker_cancel()
+                    self.request_taker_cancel(reason="early_stop")
                 else:
                     await self.control_pending_taker_cancel()
 
@@ -1102,6 +1428,7 @@ class XEMMExecutor(ExecutorBase):
 
         if ready_to_stop:
             self.logger().info("Early stop cleanup completed. Executor terminated.")
+            self._emit_trace_end("early_stop_cleanup_completed")
             self.stop()
 
     @staticmethod
@@ -1114,6 +1441,7 @@ class XEMMExecutor(ExecutorBase):
 
     async def _refresh_taker_limit_order(self):
         if self.taker_order is None or self.taker_order.order is None:
+            self._log_taker_transition("replace_after_missing_order")
             self._replace_taker_order_after_cancel()
             return
 
@@ -1122,7 +1450,9 @@ class XEMMExecutor(ExecutorBase):
 
         if not self._taker_cancel_in_flight:
             self.logger().info(f"Refreshing taker order {self.taker_order.order_id}: requesting cancel before replace.")
-            self.request_taker_cancel()
+            self._log_book_sample("taker_refresh_request", taker_order_max_age_seconds=self.config.taker_order_max_age_seconds)
+            self._log_taker_transition("refresh_request", order_age=self._strategy.current_timestamp - self.taker_order.order.creation_timestamp)
+            self.request_taker_cancel(reason="refresh_after_max_age")
             return
 
         await self.control_pending_taker_cancel()
@@ -1143,6 +1473,11 @@ class XEMMExecutor(ExecutorBase):
                 f"Taker cancel pending for {self.taker_order.order_id} after "
                 f"{now - self._taker_cancel_requested_timestamp:.2f}s. Retrying cancel."
             )
+            self._log_taker_transition(
+                "cancel_retry",
+                retry_interval=self._taker_cancel_retry_interval,
+                elapsed_since_cancel_request=now - self._taker_cancel_requested_timestamp,
+            )
             self._strategy.cancel(self.taker_connector, self.taker_trading_pair, self.taker_order.order_id)
             self._taker_cancel_requested_timestamp = now
 
@@ -1153,16 +1488,26 @@ class XEMMExecutor(ExecutorBase):
                 self.logger().warning(
                     f"Taker {self.config.taker_order_type.name} retries exceeded. Fallback to MARKET for {self.taker_connector}."
                 )
+                self._log_taker_transition("fallback_to_market", retries=self._current_retries)
                 self._force_market_taker = True
                 self._current_retries = 0
             else:
                 self.close_type = CloseType.FAILED
                 self.logger().error("Taker order retries exceeded while already using MARKET. Stopping executor.")
+                self._log_taker_transition("retries_exhausted", retries=self._current_retries)
+                self._emit_trace_end("taker_retries_exhausted")
                 self.stop()
                 return
+        self._log_taker_transition("replace_after_cancel", retries=self._current_retries)
         self.place_taker_order()
 
     async def control_update_maker_order(self):
+        if self.maker_order is None or self.maker_order.order is None:
+            return
+        if not self.maker_order.order.is_open:
+            return
+        if self._strategy.current_timestamp < self._maker_post_create_grace_until_ts:
+            return
         await self.update_current_trade_profitability()
         should_refresh, refresh_reason = self._should_refresh_maker_order()
         if should_refresh:
@@ -1171,21 +1516,25 @@ class XEMMExecutor(ExecutorBase):
                 f"old_price={self.maker_order.order.price if self.maker_order and self.maker_order.order else 'n/a'} "
                 f"target_price={self._maker_target_price}"
             )
-            self.request_maker_cancel()
+            self._log_book_sample("maker_refresh_decision", refresh_reason=refresh_reason)
+            self.request_maker_cancel(reason=refresh_reason)
             return
 
         if self._current_trade_profitability - self._tx_cost_pct < self.config.min_profitability:
             self.logger().info(f"Order {self.maker_order.order_id} profitability {self._current_trade_profitability - self._tx_cost_pct} is below minimum profitability {self.config.min_profitability}. Cancelling order.")
-            self.request_maker_cancel()
+            self._log_book_sample("maker_profitability_cancel", profitability=self._current_trade_profitability - self._tx_cost_pct)
+            self.request_maker_cancel(reason="profitability_below_min")
         elif self._current_trade_profitability - self._tx_cost_pct > self.config.max_profitability:
             self.logger().info(f"Order {self.maker_order.order_id} profitability {self._current_trade_profitability - self._tx_cost_pct} is above maximum profitability {self.config.max_profitability}. Cancelling order.")
-            self.request_maker_cancel()
+            self._log_book_sample("maker_profitability_cancel", profitability=self._current_trade_profitability - self._tx_cost_pct)
+            self.request_maker_cancel(reason="profitability_above_max")
 
-    def request_maker_cancel(self):
+    def request_maker_cancel(self, reason: str = ""):
         if self.maker_order is None:
             return
         if self._maker_cancel_in_flight:
             return
+        self._log_maker_transition("cancel_request", cancel_reason=reason)
         self._strategy.cancel(self.maker_connector, self.maker_trading_pair, self.maker_order.order_id)
         self._maker_cancel_in_flight = True
         self._maker_cancel_requested_timestamp = self._strategy.current_timestamp
@@ -1194,15 +1543,18 @@ class XEMMExecutor(ExecutorBase):
         # Guard against placing hedges below profitability unless allowed
         hedge_amount = abs(self._unhedged_base) if self._unhedged_base != 0 else self.config.order_amount
         await self.update_prices_and_tx_costs(order_amount=hedge_amount)
+        self._log_book_sample("taker_submit_decision", hedge_amount=hedge_amount)
 
         if self._unhedged_base == 0:
             self.logger().warning("Maker fill recorded but unhedged_base is zero. Skipping taker.")
+            self._log_taker_transition("skip_zero_unhedged", hedge_amount=hedge_amount)
             return
 
         avg_price = self._unhedged_avg_price()
         # profitability vs current taker price
         if avg_price == 0:
             self.logger().warning("Cannot compute average price for hedge. Skipping taker.")
+            self._log_taker_transition("skip_zero_avg_price", hedge_amount=hedge_amount)
             return
 
         # Compute profitability based on side
@@ -1215,15 +1567,45 @@ class XEMMExecutor(ExecutorBase):
             self.config.max_unhedged_notional_quote > 0 and
             self._unhedged_abs_notional() >= self.config.max_unhedged_notional_quote
         )
+        loss_cap_pct = self._close_out_loss_cap_pct()
+        self._last_hedge_guard_mode = "normal"
 
         if (not self.config.allow_loss_hedge and
                 profitability < self.config.min_profitability_guard and
                 not force_by_notional):
-            self._hedge_block_reason = (
-                f"Guard block: profitability={profitability:.6f} < min_guard={self.config.min_profitability_guard}"
-            )
-            self.logger().info(self._hedge_block_reason)
-            return
+            if loss_cap_pct > Decimal("0") and profitability >= -loss_cap_pct:
+                self._last_hedge_guard_mode = "loss_cap_bypass"
+                self._hedge_block_reason = ""
+                self.logger().info(
+                    f"Close-out loss-cap bypass: profitability={profitability:.6f} within "
+                    f"close_out_loss_cap_bps={self.config.close_out_loss_cap_bps}. Proceeding with hedge."
+                )
+                self._log_taker_transition(
+                    "loss_cap_bypass",
+                    guard_mode=self._last_hedge_guard_mode,
+                    profitability=profitability,
+                    min_profitability_guard=self.config.min_profitability_guard,
+                    close_out_loss_cap_bps=self.config.close_out_loss_cap_bps,
+                    force_by_notional=force_by_notional,
+                    hedge_amount=hedge_amount,
+                )
+            else:
+                self._last_hedge_guard_mode = "blocked"
+                self._hedge_block_reason = (
+                    f"Guard block: profitability={profitability:.6f} < min_guard={self.config.min_profitability_guard}, "
+                    f"close_out_loss_cap_bps={self.config.close_out_loss_cap_bps}"
+                )
+                self.logger().info(self._hedge_block_reason)
+                self._log_taker_transition(
+                    "guard_block",
+                    guard_mode=self._last_hedge_guard_mode,
+                    profitability=profitability,
+                    min_profitability_guard=self.config.min_profitability_guard,
+                    close_out_loss_cap_bps=self.config.close_out_loss_cap_bps,
+                    force_by_notional=force_by_notional,
+                    hedge_amount=hedge_amount,
+                )
+                return
 
         taker_order_type = self._effective_taker_order_type()
         taker_price = self._taker_result_price
@@ -1243,21 +1625,25 @@ class XEMMExecutor(ExecutorBase):
                 self._hedge_block_reason = "One-sided mode: taker hedge skipped due to insufficient balance."
                 self._log_one_sided_mode_warning(self._hedge_block_reason)
                 self.close_type = CloseType.INSUFFICIENT_BALANCE
+                self._log_taker_transition("insufficient_balance_one_sided", hedge_amount=hedge_amount)
+                self._emit_trace_end("insufficient_balance_one_sided")
                 self.stop()
                 return
             self._hedge_block_reason = "Taker hedge blocked: insufficient balance."
             self.logger().warning(self._hedge_block_reason)
+            self._log_taker_transition("blocked_insufficient_balance", hedge_amount=hedge_amount, taker_price=taker_price)
             return
 
         # Place taker hedge for unhedged amount
         self._hedge_block_reason = ""
         self.place_taker_order(order_amount=hedge_amount)
 
-    def request_taker_cancel(self):
+    def request_taker_cancel(self, reason: str = ""):
         if self.taker_order is None:
             return
         if self._taker_cancel_in_flight:
             return
+        self._log_taker_transition("cancel_request", cancel_reason=reason)
         self._strategy.cancel(self.taker_connector, self.taker_trading_pair, self.taker_order.order_id)
         self._taker_cancel_in_flight = True
         self._taker_cancel_requested_timestamp = self._strategy.current_timestamp
@@ -1315,10 +1701,15 @@ class XEMMExecutor(ExecutorBase):
         if self.maker_order and event.order_id == self.maker_order.order_id:
             self.logger().info(f"Maker order {event.order_id} created.")
             self.maker_order.order = self.get_in_flight_order(self.maker_connector, event.order_id)
+            self._maker_post_create_grace_until_ts = self._strategy.current_timestamp + self._maker_post_create_grace_sec
+            self._register_tracked_order_diag_context(self.maker_connector, self.maker_order, order_role="maker")
             self._reset_stp_state_on_success()
+            self._log_maker_transition("create_ack", event=self._event_snapshot(event))
         elif self.taker_order and event.order_id == self.taker_order.order_id:
             self.logger().info(f"Taker order {event.order_id} created.")
             self.taker_order.order = self.get_in_flight_order(self.taker_connector, event.order_id)
+            self._register_tracked_order_diag_context(self.taker_connector, self.taker_order, order_role="taker")
+            self._log_taker_transition("create_ack", event=self._event_snapshot(event))
         elif self.shadow_order and event.order_id == self.shadow_order.order_id:
             self.logger().info(f"Shadow maker order {event.order_id} created.")
             self.shadow_order.order = self.get_in_flight_order(self.taker_connector, event.order_id)
@@ -1330,6 +1721,26 @@ class XEMMExecutor(ExecutorBase):
                                    event_tag: int,
                                    market: ConnectorBase,
                                    event: OrderFilledEvent):
+        if self.maker_order and event.order_id == self.maker_order.order_id:
+            self._log_maker_transition(
+                "fill",
+                event=self._event_snapshot(event),
+                accounting_snapshot=self._accounting_snapshot(
+                    self.maker_order,
+                    event_base=getattr(event, "amount", None),
+                    event_quote=(event.amount * event.price) if event.price is not None else None,
+                ),
+            )
+        elif self.taker_order and event.order_id == self.taker_order.order_id:
+            self._log_taker_transition(
+                "fill",
+                event=self._event_snapshot(event),
+                accounting_snapshot=self._accounting_snapshot(
+                    self.taker_order,
+                    event_base=getattr(event, "amount", None),
+                    event_quote=(event.amount * event.price) if event.price is not None else None,
+                ),
+            )
         if self.shadow_order and event.order_id == self.shadow_order.order_id:
             self._record_prefill_fill(order_id=event.order_id, amount=event.amount)
             self._add_shadow_prefill_exposure(
@@ -1352,6 +1763,17 @@ class XEMMExecutor(ExecutorBase):
         if self.maker_order and event.order_id == self.maker_order.order_id:
             event_executed_base = getattr(event, "base_asset_amount", Decimal("0"))
             event_executed_quote = getattr(event, "quote_asset_amount", Decimal("0"))
+            if not self._shadow_prefill_mode:
+                self._record_maker_fill(executed_base=event_executed_base, executed_quote=event_executed_quote)
+            self._log_maker_transition(
+                "completed",
+                event=self._event_snapshot(event),
+                accounting_snapshot=self._accounting_snapshot(
+                    self.maker_order,
+                    event_base=event_executed_base,
+                    event_quote=event_executed_quote,
+                ),
+            )
             if self._shadow_prefill_mode:
                 delta = self._record_prefill_completion_delta(event.order_id, event_executed_base)
                 self._consume_shadow_prefill_remaining(delta)
@@ -1371,7 +1793,6 @@ class XEMMExecutor(ExecutorBase):
                 return
             if self.close_type == CloseType.EARLY_STOP:
                 self._maker_cancel_in_flight = False
-                self._record_maker_fill(executed_base=event_executed_base, executed_quote=event_executed_quote)
                 if self._use_market_hedge_on_early_stop():
                     hedge_amount = abs(self._unhedged_base)
                     if hedge_amount > 0 and self.taker_order is None:
@@ -1389,11 +1810,19 @@ class XEMMExecutor(ExecutorBase):
                         )
                 else:
                     self.logger().info(f"Maker order {event.order_id} completed during early stop. Skipping taker hedge.")
+                    self._emit_trace_end(
+                        "hedge_skipped_early_stop",
+                        event=self._event_snapshot(event),
+                        accounting_snapshot=self._accounting_snapshot(
+                            self.maker_order,
+                            event_base=event_executed_base,
+                            event_quote=event_executed_quote,
+                        ),
+                    )
                 return
             self.logger().info(f"Maker order {event.order_id} completed. Executing taker order.")
             self._maker_cancel_in_flight = False
             self._current_retries = 0
-            self._record_maker_fill(executed_base=event_executed_base, executed_quote=event_executed_quote)
             # Taker will be placed in shutdown control with guard
             self._status = RunnableStatus.SHUTTING_DOWN
         elif self.taker_order and event.order_id == self.taker_order.order_id:
@@ -1414,6 +1843,24 @@ class XEMMExecutor(ExecutorBase):
                     if event_executed_quote and not event_executed_quote.is_nan():
                         self._unhedged_quote += event_executed_quote * sign
             self._early_stop_hedge_initiated = False
+            self._log_taker_transition(
+                "completed",
+                event=self._event_snapshot(event),
+                accounting_snapshot=self._accounting_snapshot(
+                    self.taker_order,
+                    event_base=getattr(event, "base_asset_amount", None),
+                    event_quote=getattr(event, "quote_asset_amount", None),
+                ),
+            )
+            self._emit_trace_end(
+                "hedged_completed",
+                event=self._event_snapshot(event),
+                accounting_snapshot=self._accounting_snapshot(
+                    self.taker_order,
+                    event_base=getattr(event, "base_asset_amount", None),
+                    event_quote=getattr(event, "quote_asset_amount", None),
+                ),
+            )
         elif self.shadow_order and event.order_id == self.shadow_order.order_id:
             completed_base = getattr(event, "base_asset_amount", Decimal("0"))
             completed_quote = getattr(event, "quote_asset_amount", Decimal("0"))
@@ -1464,6 +1911,11 @@ class XEMMExecutor(ExecutorBase):
         if self.maker_order and event.order_id == self.maker_order.order_id:
             self.logger().info(f"Maker order {event.order_id} cancelled.")
             executed_base = self.maker_order.executed_amount_base if self.maker_order.executed_amount_base else Decimal("0")
+            self._log_maker_transition(
+                "cancelled",
+                event=self._event_snapshot(event),
+                accounting_snapshot=self._accounting_snapshot(self.maker_order, event_base=executed_base),
+            )
             if self._shadow_prefill_mode and executed_base > 0:
                 delta = self._record_prefill_completion_delta(event.order_id, executed_base)
                 self._consume_shadow_prefill_remaining(delta)
@@ -1476,6 +1928,11 @@ class XEMMExecutor(ExecutorBase):
                     self._shadow_prefill_stage_started_ts = self._strategy.current_timestamp
         elif self.taker_order and event.order_id == self.taker_order.order_id:
             self.logger().info(f"Taker order {event.order_id} cancelled.")
+            self._log_taker_transition(
+                "cancelled",
+                event=self._event_snapshot(event),
+                accounting_snapshot=self._accounting_snapshot(self.taker_order),
+            )
             self.taker_order = None
             self._taker_cancel_in_flight = False
             if self.close_type == CloseType.EARLY_STOP and self._early_stop_hedge_initiated:
@@ -1531,6 +1988,18 @@ class XEMMExecutor(ExecutorBase):
         effective_side = side if side is not None else self.taker_order_side
         if taker_order_type == OrderType.LIMIT:
             taker_price = self._get_taker_limit_price(amount, side=effective_side)
+        self._log_book_sample(
+            "taker_submit_request",
+            hedge_amount=amount,
+            requested_side=effective_side.name,
+            requested_order_type=taker_order_type.name,
+            proposed_taker_price=taker_price,
+            guard_mode=self._last_hedge_guard_mode,
+            close_out_loss_cap_bps=getattr(self.config, "close_out_loss_cap_bps", Decimal("0")),
+            early_stop_market_hedge=bool(
+                self.close_type == CloseType.EARLY_STOP and self._use_market_hedge_on_early_stop()
+            ),
+        )
         taker_order_id = self.place_order(
             connector_name=self.taker_connector,
             trading_pair=self.taker_trading_pair,
@@ -1539,9 +2008,21 @@ class XEMMExecutor(ExecutorBase):
             amount=amount,
             price=taker_price)
         self.taker_order = TrackedOrder(order_id=taker_order_id)
+        self._register_tracked_order_diag_context(self.taker_connector, self.taker_order, order_role="taker")
+        self._log_taker_transition(
+            "submit_request",
+            requested_order_id=taker_order_id,
+            requested_amount=amount,
+            requested_price=taker_price,
+            requested_side=effective_side.name,
+            requested_order_type=taker_order_type.name,
+            guard_mode=self._last_hedge_guard_mode,
+            close_out_loss_cap_bps=getattr(self.config, "close_out_loss_cap_bps", Decimal("0")),
+        )
 
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
         if self.maker_order and self.maker_order.order_id == event.order_id:
+            self._log_maker_transition("failed", error_message=event.error_message, event=self._event_snapshot(event))
             self.failed_orders.append(self.maker_order)
             self.maker_order = None
             self._maker_cancel_in_flight = False
@@ -1566,6 +2047,7 @@ class XEMMExecutor(ExecutorBase):
                 return
             self._current_retries += 1
         elif self.taker_order and self.taker_order.order_id == event.order_id:
+            self._log_taker_transition("failed", error_message=event.error_message, event=self._event_snapshot(event))
             self.failed_orders.append(self.taker_order)
             self._taker_cancel_in_flight = False
             if self.close_type == CloseType.EARLY_STOP:
@@ -1593,6 +2075,7 @@ class XEMMExecutor(ExecutorBase):
                 else:
                     self.close_type = CloseType.FAILED
                     self.logger().error("Taker order retries exceeded while using MARKET. Stopping executor.")
+                    self._emit_trace_end("taker_failed_market_retries_exhausted")
                     self.stop()
                     return
             self.place_taker_order()
@@ -1618,6 +2101,8 @@ class XEMMExecutor(ExecutorBase):
         # Since we can't make this method async, we'll skip the profitability calculation
         # The profitability will still be shown in the status message which is async
         return {
+            "latency_diagnostics_enabled": self._diag_enabled(),
+            "trace_id": self.config.id,
             "side": self.config.maker_side,
             "maker_connector": self.maker_connector,
             "maker_trading_pair": self.maker_trading_pair,
@@ -1641,6 +2126,8 @@ class XEMMExecutor(ExecutorBase):
             "taker_max_retries": self._max_retries,
             "taker_retries": self._current_retries,
             "taker_fallback_to_market": self.config.taker_fallback_to_market,
+            "close_out_loss_cap_bps": getattr(self.config, "close_out_loss_cap_bps", Decimal("0")),
+            "hedge_guard_mode": self._last_hedge_guard_mode,
             "allow_one_sided_inventory_mode": self.config.allow_one_sided_inventory_mode,
             "stale_fill_hedge_mode": self.config.stale_fill_hedge_mode,
             "maker_cancel_in_flight": self._maker_cancel_in_flight,
@@ -1672,9 +2159,14 @@ class XEMMExecutor(ExecutorBase):
             "loop_metrics": self.get_loop_metrics(),
         }
 
+    def on_stop(self):
+        self._emit_trace_end("executor_stopped")
+        self._release_connector_diag_handles()
+
     def early_stop(self, keep_position: bool = False):
         if keep_position:
             self.close_type = CloseType.POSITION_HOLD
+            self._emit_trace_end("position_hold")
             self.stop()
             return
 
@@ -1683,11 +2175,11 @@ class XEMMExecutor(ExecutorBase):
 
         if self._tracked_order_is_open(self.maker_order):
             self.logger().info(f"Cancelling maker order {self.maker_order.order_id}.")
-            self.request_maker_cancel()
+            self.request_maker_cancel(reason="early_stop")
             should_wait_cancels = True
         if self._tracked_order_is_open(self.taker_order):
             self.logger().info(f"Cancelling taker order {self.taker_order.order_id}.")
-            self.request_taker_cancel()
+            self.request_taker_cancel(reason="early_stop")
             should_wait_cancels = True
         if self._tracked_order_is_open(self.shadow_order):
             self.logger().info(f"Cancelling shadow order {self.shadow_order.order_id}.")

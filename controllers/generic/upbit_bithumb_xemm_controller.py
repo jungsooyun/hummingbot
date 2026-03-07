@@ -141,6 +141,14 @@ class UpbitBithumbXemmControllerConfig(ControllerConfigBase):
         default=Decimal("0.01"),
         json_schema_extra={"prompt": "Max maker-taker base imbalance: ", "prompt_on_new": True, "is_updatable": True},
     )
+    inventory_skew_side_gating_enabled: bool = Field(
+        default=True,
+        json_schema_extra={
+            "prompt": "Block new entries when maker-taker base skew exceeds max_inventory_skew_base (True/False): ",
+            "prompt_on_new": True,
+            "is_updatable": True,
+        },
+    )
     maker_price_refresh_pct: Decimal = Field(
         default=Decimal("0.0002"),
         json_schema_extra={
@@ -153,6 +161,14 @@ class UpbitBithumbXemmControllerConfig(ControllerConfigBase):
         default=30.0,
         json_schema_extra={"prompt": "Max maker order age before refresh (seconds): ", "prompt_on_new": True, "is_updatable": True},
     )
+    latency_diagnostics_enabled: bool = Field(
+        default=False,
+        json_schema_extra={
+            "prompt": "Enable XEMM latency diagnostics logs (True/False): ",
+            "prompt_on_new": True,
+            "is_updatable": True,
+        },
+    )
     min_profitability_guard: Decimal = Field(
         default=Decimal("0"),
         json_schema_extra={"prompt": "Minimum profitability required to place hedge: ", "prompt_on_new": True, "is_updatable": True},
@@ -160,6 +176,14 @@ class UpbitBithumbXemmControllerConfig(ControllerConfigBase):
     allow_loss_hedge: bool = Field(
         default=False,
         json_schema_extra={"prompt": "Allow hedging even if profitability below guard (True/False): ", "prompt_on_new": True, "is_updatable": True},
+    )
+    close_out_loss_cap_bps: Decimal = Field(
+        default=Decimal("0"),
+        json_schema_extra={
+            "prompt": "Allow close-out hedges within this loss cap (bps, 0 to disable): ",
+            "prompt_on_new": True,
+            "is_updatable": True,
+        },
     )
     hedge_aggregation_window_sec: float = Field(
         default=1.0,
@@ -326,8 +350,6 @@ class UpbitBithumbXemmControllerConfig(ControllerConfigBase):
     transfer_guard_read_secret_env: str = Field(default="QTG_READ_HMAC_SECRET", json_schema_extra={"is_updatable": True})
     transfer_route_key_maker_to_taker: str = Field(default="", json_schema_extra={"is_updatable": True})
     transfer_route_key_taker_to_maker: str = Field(default="", json_schema_extra={"is_updatable": True})
-    transfer_trigger_skew_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
-    transfer_recover_skew_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
     transfer_target_buffer_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
     transfer_min_amount_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
     transfer_max_amount_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
@@ -338,7 +360,6 @@ class UpbitBithumbXemmControllerConfig(ControllerConfigBase):
     transfer_request_cooldown_sec: float = Field(default=60.0, json_schema_extra={"is_updatable": True})
     transfer_request_timeout_sec: float = Field(default=1800.0, json_schema_extra={"is_updatable": True})
     transfer_recovery_max_wait_sec: float = Field(default=300.0, json_schema_extra={"is_updatable": True})
-    transfer_hard_trigger_skew_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
     transfer_state_file_path: str = Field(
         default="/home/hummingbot/data/transfer_rebalance_state_{controller_id}.json",
         json_schema_extra={"is_updatable": True},
@@ -400,6 +421,8 @@ class UpbitBithumbXemmControllerConfig(ControllerConfigBase):
             raise ValueError("Maker and taker quote assets must match for this controller.")
         if self.max_executors_per_side < 1:
             raise ValueError("max_executors_per_side must be >= 1")
+        if self.close_out_loss_cap_bps < Decimal("0"):
+            raise ValueError("close_out_loss_cap_bps must be >= 0")
         if self.upbit_shadow_maker_enabled and not (self.maker_connector == "bithumb" and self.taker_connector == "upbit"):
             raise ValueError("upbit_shadow_maker_enabled is supported only for maker=bithumb and taker=upbit.")
         if self.bithumb_stp_base_offset_ticks < 1:
@@ -424,21 +447,10 @@ class UpbitBithumbXemmControllerConfig(ControllerConfigBase):
             if self.max_executors_per_side > 1:
                 raise ValueError("opportunity_gate_enabled requires max_executors_per_side <= 1.")
         if self.transfer_rebalance_enabled:
-            if self.transfer_trigger_skew_base <= Decimal("0"):
-                raise ValueError("transfer_trigger_skew_base must be > 0 when transfer_rebalance_enabled is true")
-            if self.transfer_trigger_skew_base <= self.transfer_recover_skew_base:
-                raise ValueError("transfer_trigger_skew_base must be > transfer_recover_skew_base")
             if not (self.transfer_route_key_maker_to_taker or self.transfer_route_key_taker_to_maker):
                 raise ValueError("At least one transfer_route_key must be configured when transfer_rebalance_enabled is true")
         if self.transfer_delay_before_submit_sec < 0:
             raise ValueError("transfer_delay_before_submit_sec must be >= 0")
-        if self.transfer_hard_trigger_skew_base < Decimal("0"):
-            raise ValueError("transfer_hard_trigger_skew_base must be >= 0")
-        if (
-            self.transfer_hard_trigger_skew_base > Decimal("0")
-            and self.transfer_hard_trigger_skew_base <= self.transfer_trigger_skew_base
-        ):
-            raise ValueError("transfer_hard_trigger_skew_base must be > transfer_trigger_skew_base")
         return self
 
     def update_markets(self, markets: MarketDict) -> MarketDict:
@@ -463,6 +475,10 @@ class UpbitBithumbXemmController(ControllerBase):
         self._opportunity_edge_net_bps: Dict[TradeType, Optional[Decimal]] = {TradeType.BUY: None, TradeType.SELL: None}
         self._opportunity_required_ticks: int = int(self.config.opportunity_min_ticks)
         self._opportunity_last_debug_log_ts: float = 0.0
+        self._opportunity_last_debug_log_ts_by_side: Dict[TradeType, float] = {
+            TradeType.BUY: 0.0,
+            TradeType.SELL: 0.0,
+        }
         self._rv_maker = _MidPriceBuffer(maxlen=500)
         self._rv_taker = _MidPriceBuffer(maxlen=500)
         self._opportunity_rv_bps_maker: Optional[Decimal] = None
@@ -484,6 +500,7 @@ class UpbitBithumbXemmController(ControllerBase):
         self._transfer_delay_deadline_ts: Optional[float] = None
         self._transfer_retry_at: Optional[float] = None
         self._transfer_recovery_started_ts: Optional[float] = None
+        self._transfer_required_base_threshold: Optional[Decimal] = None
         self._transfer_last_poll_ts: float = 0.0
         self._transfer_last_qtg_state: Optional[str] = None
         self._transfer_last_error: Optional[str] = None
@@ -576,10 +593,26 @@ class UpbitBithumbXemmController(ControllerBase):
             sell_gate_pass, _ = self._opportunity_gate_check(TradeType.SELL)
             if not buy_gate_pass:
                 allow_buy = False
+                self._log_opportunity_gate_decision(
+                    side=TradeType.BUY,
+                    passed=False,
+                    reason=self._opportunity_last_gate_reason[TradeType.BUY],
+                    now=now,
+                    active_executor_count=active_buy_count,
+                    action="stop_active_and_suppress_new_entries" if self.config.opportunity_gate_stop_on_fail else "suppress_new_entries",
+                )
                 if self.config.opportunity_gate_stop_on_fail:
                     actions.extend(self._opportunity_stop_actions(active_executors=active_executors, side=TradeType.BUY))
             if not sell_gate_pass:
                 allow_sell = False
+                self._log_opportunity_gate_decision(
+                    side=TradeType.SELL,
+                    passed=False,
+                    reason=self._opportunity_last_gate_reason[TradeType.SELL],
+                    now=now,
+                    active_executor_count=active_sell_count,
+                    action="stop_active_and_suppress_new_entries" if self.config.opportunity_gate_stop_on_fail else "suppress_new_entries",
+                )
                 if self.config.opportunity_gate_stop_on_fail:
                     actions.extend(self._opportunity_stop_actions(active_executors=active_executors, side=TradeType.SELL))
             if buy_gate_pass:
@@ -696,6 +729,7 @@ class UpbitBithumbXemmController(ControllerBase):
             action = CreateExecutorAction(
                 executor_config=XEMMExecutorConfig(
                     timestamp=now,
+                    latency_diagnostics_enabled=self.config.latency_diagnostics_enabled,
                     buying_market=buying_market,
                     selling_market=selling_market,
                     maker_side=side,
@@ -716,6 +750,7 @@ class UpbitBithumbXemmController(ControllerBase):
                     hedge_aggregation_window_sec=self.config.hedge_aggregation_window_sec,
                     max_unhedged_notional_quote=self.config.max_unhedged_notional_quote,
                     rate_limit_backoff_factor=self.config.rate_limit_backoff_factor,
+                    close_out_loss_cap_bps=self.config.close_out_loss_cap_bps,
                     stale_fill_hedge_mode=self.config.stale_fill_hedge_mode,
                     allow_one_sided_inventory_mode=self.config.allow_one_sided_inventory_mode,
                     shadow_maker_enabled=shadow_enabled_for_executor,
@@ -751,6 +786,34 @@ class UpbitBithumbXemmController(ControllerBase):
         if side == TradeType.BUY:
             return maker, taker
         return taker, maker
+
+    def _should_log_opportunity_gate(self, side: TradeType, now: float) -> bool:
+        interval = float(self.config.opportunity_debug_log_interval_sec)
+        last_ts = self._opportunity_last_debug_log_ts_by_side.get(side, 0.0)
+        if now - last_ts < interval:
+            return False
+        self._opportunity_last_debug_log_ts_by_side[side] = now
+        self._opportunity_last_debug_log_ts = now
+        return True
+
+    def _log_opportunity_gate_decision(
+        self,
+        side: TradeType,
+        passed: bool,
+        reason: str,
+        now: float,
+        active_executor_count: Optional[int] = None,
+        action: Optional[str] = None,
+    ) -> None:
+        if not self._should_log_opportunity_gate(side=side, now=now):
+            return
+        self.logger().info(
+            f"Opportunity gate {'PASS' if passed else 'FAIL'} ({side.name}): "
+            f"reason={reason}, required_ticks={self._opportunity_required_ticks}, "
+            f"edge_ticks={self._opportunity_edge_ticks[side]}, est_net_bps={self._opportunity_edge_net_bps[side]}, "
+            f"active_executor_count={active_executor_count if active_executor_count is not None else 0}, "
+            f"action={action or 'none'}"
+        )
 
     def _controller_id(self) -> str:
         return self.config.id or self.config.controller_name or "main"
@@ -830,25 +893,8 @@ class UpbitBithumbXemmController(ControllerBase):
         return actions
 
     def _transfer_pause_stop_actions(self, active_executors: List) -> List[ExecutorAction]:
-        if self._paused_side is None:
-            self._transfer_stop_sent_executor_ids.clear()
-            return []
-        actions: List[ExecutorAction] = []
-        controller_id = self._controller_id()
-        for executor in active_executors:
-            if executor.side != self._paused_side:
-                continue
-            if executor.id in self._transfer_stop_sent_executor_ids:
-                continue
-            actions.append(
-                StopExecutorAction(
-                    executor_id=executor.id,
-                    controller_id=controller_id,
-                    keep_position=False,
-                )
-            )
-            self._transfer_stop_sent_executor_ids.add(executor.id)
-        return actions
+        self._transfer_stop_sent_executor_ids.clear()
+        return []
 
     def _transfer_allowed_sides(self) -> Tuple[bool, bool]:
         if self._paused_side == TradeType.BUY:
@@ -865,7 +911,92 @@ class UpbitBithumbXemmController(ControllerBase):
         taker_base = taker_base if taker_base is not None else Decimal("0")
         return maker_base - taker_base - self.config.inventory_target_base
 
+    def _available_base_balance(self, connector_name: str) -> Decimal:
+        base_asset, _ = split_hb_trading_pair(self.config.maker_trading_pair)
+        balance = self.market_data_provider.connectors[connector_name].get_available_balance(base_asset)
+        return balance if balance is not None else Decimal("0")
+
+    def _transfer_reference_mid_price(self) -> Optional[Decimal]:
+        maker_mid = self.market_data_provider.get_price_by_type(
+            self.config.maker_connector, self.config.maker_trading_pair, PriceType.MidPrice
+        )
+        if maker_mid is not None and maker_mid > Decimal("0"):
+            return maker_mid
+        taker_mid = self.market_data_provider.get_price_by_type(
+            self.config.taker_connector, self.config.taker_trading_pair, PriceType.MidPrice
+        )
+        if taker_mid is not None and taker_mid > Decimal("0"):
+            return taker_mid
+        return None
+
+    def _planned_order_amounts_for_side(self, side: TradeType, mid_price: Decimal) -> List[Decimal]:
+        levels = self.config.buy_levels_targets_amount if side == TradeType.BUY else self.config.sell_levels_targets_amount
+        total_weight = sum(weight for _, weight in levels)
+        if total_weight <= Decimal("0") or mid_price <= Decimal("0"):
+            return []
+        side_budget_quote = self.config.total_amount_quote / Decimal("2")
+        order_amounts: List[Decimal] = []
+        for _, weight in levels:
+            quote_amount = side_budget_quote * (weight / total_weight)
+            base_amount = self.market_data_provider.quantize_order_amount(
+                self.config.maker_connector,
+                self.config.maker_trading_pair,
+                quote_amount / mid_price,
+            )
+            if base_amount is not None and base_amount > Decimal("0"):
+                order_amounts.append(base_amount)
+        return order_amounts
+
+    def _required_base_for_next_cycle(self, side: TradeType) -> Decimal:
+        mid_price = self._transfer_reference_mid_price()
+        if mid_price is None:
+            return Decimal("0")
+        order_amounts = self._planned_order_amounts_for_side(side=side, mid_price=mid_price)
+        return max(order_amounts) if order_amounts else Decimal("0")
+
+    def _inventory_shortage_trigger(self) -> Optional[Dict[str, object]]:
+        buy_required_base = self._required_base_for_next_cycle(TradeType.BUY)
+        sell_required_base = self._required_base_for_next_cycle(TradeType.SELL)
+        taker_available_base = self._available_base_balance(self.config.taker_connector)
+        maker_available_base = self._available_base_balance(self.config.maker_connector)
+
+        candidates: List[Dict[str, object]] = []
+        if self.config.transfer_route_key_maker_to_taker and buy_required_base > Decimal("0"):
+            buy_shortfall = max(Decimal("0"), buy_required_base - taker_available_base)
+            if buy_shortfall > Decimal("0"):
+                candidates.append({
+                    "direction": "maker_to_taker",
+                    "route_key": self.config.transfer_route_key_maker_to_taker,
+                    "paused_side": TradeType.BUY,
+                    "required_base": buy_required_base,
+                    "target_available_base": taker_available_base,
+                    "shortfall_base": buy_shortfall,
+                })
+
+        if self.config.transfer_route_key_taker_to_maker and sell_required_base > Decimal("0"):
+            sell_shortfall = max(Decimal("0"), sell_required_base - maker_available_base)
+            if sell_shortfall > Decimal("0"):
+                candidates.append({
+                    "direction": "taker_to_maker",
+                    "route_key": self.config.transfer_route_key_taker_to_maker,
+                    "paused_side": TradeType.SELL,
+                    "required_base": sell_required_base,
+                    "target_available_base": maker_available_base,
+                    "shortfall_base": sell_shortfall,
+                })
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda candidate: (candidate["shortfall_base"], candidate["required_base"]), reverse=True)
+        return candidates[0]
+
+    def _current_transfer_trigger(self) -> Optional[Dict[str, object]]:
+        return self._inventory_shortage_trigger()
+
     def _allowed_sides(self, inventory_delta: Decimal) -> Tuple[bool, bool]:
+        if not self.config.inventory_skew_side_gating_enabled:
+            return True, True
         max_skew = self.config.max_inventory_skew_base
         if inventory_delta > max_skew:
             return False, True
@@ -992,12 +1123,13 @@ class UpbitBithumbXemmController(ControllerBase):
             return False, "net_below_min_profitability"
 
         now = self.market_data_provider.time()
-        if now - self._opportunity_last_debug_log_ts >= self.config.opportunity_debug_log_interval_sec:
-            self._opportunity_last_debug_log_ts = now
-            self.logger().info(
-                f"Opportunity gate PASS ({side.name}): required_ticks={required_ticks}, edge_ticks={edge_ticks}, "
-                f"est_net_bps={self._opportunity_edge_net_bps[side]}"
-            )
+        self._log_opportunity_gate_decision(
+            side=side,
+            passed=True,
+            reason="pass",
+            now=now,
+            action="allow_new_entries",
+        )
         self._opportunity_last_gate_reason[side] = "pass"
         return True, "pass"
 
@@ -1075,19 +1207,19 @@ class UpbitBithumbXemmController(ControllerBase):
         self._transfer_delay_started_ts = None
         self._transfer_delay_deadline_ts = None
 
-    def _hard_trigger_reached(self, inventory_delta: Decimal) -> bool:
-        return (
-            self.config.transfer_hard_trigger_skew_base > Decimal("0")
-            and abs(inventory_delta) >= self.config.transfer_hard_trigger_skew_base
-        )
+    def _clear_transfer_pause_state(self):
+        self._paused_side = None
+        self._transfer_direction = None
+        self._transfer_required_base_threshold = None
+        self._transfer_stop_sent_executor_ids.clear()
 
-    def _enter_transfer_delay(self, *, inventory_delta: Decimal, now: float):
-        direction, route_key, paused_side = self._direction_route_and_side(inventory_delta)
+    def _enter_transfer_delay(self, *, trigger: Dict[str, object], now: float):
+        route_key = trigger.get("route_key")
         if not route_key:
             return
         self._rebalance_state = RebalanceState.DELAYING
-        self._paused_side = paused_side
-        self._transfer_direction = direction
+        self._paused_side = trigger["paused_side"]
+        self._transfer_direction = trigger["direction"]
         self._active_transfer_request_id = None
         self._transfer_cycle_id = None
         self._transfer_event_id = None
@@ -1095,6 +1227,9 @@ class UpbitBithumbXemmController(ControllerBase):
         self._transfer_started_ts = None
         self._transfer_retry_at = None
         self._transfer_recovery_started_ts = None
+        self._transfer_required_base_threshold = (
+            Decimal(str(trigger["required_base"])) if trigger.get("required_base") is not None else None
+        )
         self._transfer_last_qtg_state = None
         self._transfer_last_error = None
         self._clear_transfer_delay_state()
@@ -1102,15 +1237,13 @@ class UpbitBithumbXemmController(ControllerBase):
         self._transfer_delay_deadline_ts = now + self.config.transfer_delay_before_submit_sec
         self._save_transfer_state()
         self.logger().info(
-            f"Transfer rebalance delay armed: direction={direction}, paused_side={paused_side.name}, "
-            f"inventory_delta={inventory_delta}, deadline_in={self.config.transfer_delay_before_submit_sec}s, "
-            f"hard_trigger={self.config.transfer_hard_trigger_skew_base}"
+            f"Transfer rebalance delay armed: direction={self._transfer_direction}, paused_side={self._paused_side.name}, "
+            f"deadline_in={self.config.transfer_delay_before_submit_sec}s"
         )
 
     def _complete_transfer_delay(self, *, reason: str):
         self._rebalance_state = RebalanceState.IDLE
-        self._paused_side = None
-        self._transfer_direction = None
+        self._clear_transfer_pause_state()
         self._active_transfer_request_id = None
         self._transfer_cycle_id = None
         self._transfer_event_id = None
@@ -1125,11 +1258,17 @@ class UpbitBithumbXemmController(ControllerBase):
         self._clear_transfer_state()
         self.logger().info(f"Transfer rebalance delay cleared: {reason}")
 
-    def _begin_transfer_submission(self, *, inventory_delta: Decimal, now: float, reason: str) -> bool:
-        direction, route_key, paused_side = self._direction_route_and_side(inventory_delta)
-        if not route_key:
-            return False
-        amount = self._compute_transfer_amount(inventory_delta, direction)
+    def _begin_transfer_submission(self, *, trigger: Dict[str, object], now: float, reason: str) -> bool:
+        direction = trigger["direction"]
+        route_key = trigger["route_key"]
+        paused_side = trigger["paused_side"]
+        amount = self._compute_transfer_amount(
+            direction,
+            target_available_base=(
+                Decimal(str(trigger["target_available_base"])) if trigger.get("target_available_base") is not None else None
+            ),
+            required_base=Decimal(str(trigger["required_base"])) if trigger.get("required_base") is not None else None,
+        )
         if amount <= Decimal("0"):
             return False
         if not self._acquire_transfer_lock(direction):
@@ -1144,13 +1283,16 @@ class UpbitBithumbXemmController(ControllerBase):
         self._transfer_started_ts = now
         self._transfer_retry_at = None
         self._transfer_recovery_started_ts = None
+        self._transfer_required_base_threshold = (
+            Decimal(str(trigger["required_base"])) if trigger.get("required_base") is not None else None
+        )
         self._transfer_last_qtg_state = None
         self._transfer_last_error = None
         self._clear_transfer_delay_state()
         self._save_transfer_state()
         self.logger().info(
             f"Transfer rebalance submission started: reason={reason}, direction={direction}, "
-            f"paused_side={paused_side.name}, inventory_delta={inventory_delta}, amount={amount}"
+            f"paused_side={paused_side.name}, amount={amount}"
         )
         self._transfer_task = asyncio.create_task(self._signal_and_approve(route_key=route_key, amount=amount))
         return True
@@ -1165,7 +1307,6 @@ class UpbitBithumbXemmController(ControllerBase):
             return
 
         now = self.market_data_provider.time()
-        inventory_delta = self._inventory_delta()
         self._heartbeat_transfer_lock()
 
         if self._transfer_task is not None and self._transfer_task.done():
@@ -1178,8 +1319,7 @@ class UpbitBithumbXemmController(ControllerBase):
         if self._rebalance_state == RebalanceState.COOLDOWN:
             if self._transfer_retry_at is not None and now >= self._transfer_retry_at:
                 self._rebalance_state = RebalanceState.IDLE
-                self._paused_side = None
-                self._transfer_direction = None
+                self._clear_transfer_pause_state()
                 self._clear_transfer_delay_state()
                 self._release_transfer_lock(force=False)
                 self._save_transfer_state()
@@ -1189,7 +1329,16 @@ class UpbitBithumbXemmController(ControllerBase):
             return
 
         if self._rebalance_state == RebalanceState.WAITING_RECOVERY:
-            if abs(inventory_delta) <= self.config.transfer_recover_skew_base:
+            required_base_threshold = self._transfer_required_base_threshold
+            if required_base_threshold is not None:
+                target_connector = (
+                    self.config.taker_connector if self._transfer_direction == "maker_to_taker" else self.config.maker_connector
+                )
+                target_available_base = self._available_base_balance(target_connector)
+                if target_available_base >= required_base_threshold:
+                    self._complete_transfer_cycle(reason="recovery_reached")
+                    return
+            else:
                 self._complete_transfer_cycle(reason="recovery_reached")
                 return
             if (
@@ -1215,62 +1364,38 @@ class UpbitBithumbXemmController(ControllerBase):
         if self._rebalance_state in {RebalanceState.SIGNAL_SUBMITTING, RebalanceState.APPROVAL_SUBMITTING}:
             return
 
+        trigger = self._current_transfer_trigger()
+
         if self._rebalance_state == RebalanceState.DELAYING:
-            if abs(inventory_delta) < self.config.transfer_trigger_skew_base:
-                self._complete_transfer_delay(reason="inventory_delta back below soft trigger")
+            if trigger is None:
+                self._complete_transfer_delay(reason="transfer trigger no longer active")
                 return
 
             expected_direction = self._transfer_direction
-            current_direction, route_key, _ = self._direction_route_and_side(inventory_delta)
+            current_direction = trigger["direction"]
+            route_key = trigger["route_key"]
             if expected_direction is not None and current_direction != expected_direction:
                 self.logger().info("Transfer rebalance delay restarted due to inventory direction flip")
-                if self._hard_trigger_reached(inventory_delta):
-                    if self._begin_transfer_submission(
-                        inventory_delta=inventory_delta,
-                        now=now,
-                        reason="delay_direction_flip_hard_trigger",
-                    ):
-                        return
                 if route_key:
-                    self._enter_transfer_delay(inventory_delta=inventory_delta, now=now)
+                    self._enter_transfer_delay(trigger=trigger, now=now)
                 else:
                     self._complete_transfer_delay(reason="inventory direction flipped but route key missing")
                 return
 
-            if self._hard_trigger_reached(inventory_delta):
-                self.logger().info("Transfer rebalance delay escalated: hard trigger reached")
-                self._begin_transfer_submission(
-                    inventory_delta=inventory_delta,
-                    now=now,
-                    reason="delay_hard_trigger",
-                )
-                return
-
             if self._transfer_delay_deadline_ts is not None and now >= self._transfer_delay_deadline_ts:
                 self.logger().info("Transfer rebalance delay expired: proceeding with transfer submission")
-                self._begin_transfer_submission(
-                    inventory_delta=inventory_delta,
-                    now=now,
-                    reason="delay_expired",
-                )
+                self._begin_transfer_submission(trigger=trigger, now=now, reason="delay_expired")
                 return
 
             return
 
         # IDLE path
-        if abs(inventory_delta) < self.config.transfer_trigger_skew_base:
+        if trigger is None:
             return
-        direction, route_key, _ = self._direction_route_and_side(inventory_delta)
-        if not route_key:
+        if self.config.transfer_delay_before_submit_sec > 0:
+            self._enter_transfer_delay(trigger=trigger, now=now)
             return
-        if self.config.transfer_delay_before_submit_sec > 0 and not self._hard_trigger_reached(inventory_delta):
-            self._enter_transfer_delay(inventory_delta=inventory_delta, now=now)
-            return
-        self._begin_transfer_submission(
-            inventory_delta=inventory_delta,
-            now=now,
-            reason="soft_trigger_direct" if self.config.transfer_delay_before_submit_sec <= 0 else "hard_trigger_direct",
-        )
+        self._begin_transfer_submission(trigger=trigger, now=now, reason="shortage_direct")
 
     async def _signal_and_approve(self, *, route_key: str, amount: Decimal):
         if self._transfer_client is None:
@@ -1395,6 +1520,7 @@ class UpbitBithumbXemmController(ControllerBase):
         self._transfer_last_error = reason
         self._active_transfer_request_id = None
         self._transfer_recovery_started_ts = None
+        self._clear_transfer_pause_state()
         self._clear_transfer_delay_state()
         self._release_transfer_lock(force=False)
         self._save_transfer_state()
@@ -1402,6 +1528,7 @@ class UpbitBithumbXemmController(ControllerBase):
     def _enter_error(self, reason: str):
         self._rebalance_state = RebalanceState.ERROR
         self._transfer_last_error = reason
+        self._clear_transfer_pause_state()
         self._clear_transfer_delay_state()
         self._release_transfer_lock(force=False)
         self._save_transfer_state()
@@ -1409,8 +1536,7 @@ class UpbitBithumbXemmController(ControllerBase):
 
     def _complete_transfer_cycle(self, reason: str):
         self._rebalance_state = RebalanceState.IDLE
-        self._paused_side = None
-        self._transfer_direction = None
+        self._clear_transfer_pause_state()
         self._active_transfer_request_id = None
         self._transfer_cycle_id = None
         self._transfer_event_id = None
@@ -1426,17 +1552,15 @@ class UpbitBithumbXemmController(ControllerBase):
         self._clear_transfer_state()
         self.logger().info(f"Transfer rebalance cycle completed: {reason}")
 
-    def _direction_route_and_side(self, delta: Decimal) -> Tuple[str, str, TradeType]:
-        if delta > 0:
-            return "maker_to_taker", self.config.transfer_route_key_maker_to_taker, TradeType.BUY
-        return "taker_to_maker", self.config.transfer_route_key_taker_to_maker, TradeType.SELL
-
-    def _compute_transfer_amount(self, delta: Decimal, direction: str) -> Decimal:
-        abs_delta = abs(delta)
-        need = (abs_delta - self.config.transfer_recover_skew_base) / Decimal("2")
-        if need < Decimal("0"):
-            need = Decimal("0")
-        amount = need + self.config.transfer_target_buffer_base
+    def _compute_transfer_amount(
+        self,
+        direction: str,
+        target_available_base: Optional[Decimal] = None,
+        required_base: Optional[Decimal] = None,
+    ) -> Decimal:
+        if target_available_base is None or required_base is None:
+            return Decimal("0")
+        amount = max(Decimal("0"), required_base - target_available_base) + self.config.transfer_target_buffer_base
 
         if self.config.transfer_max_amount_base > Decimal("0"):
             amount = min(amount, self.config.transfer_max_amount_base)
@@ -1560,6 +1684,7 @@ class UpbitBithumbXemmController(ControllerBase):
             transfer_start_ts=self._transfer_started_ts,
             retry_at=self._transfer_retry_at,
             recovery_started_ts=self._transfer_recovery_started_ts,
+            required_base_threshold=str(self._transfer_required_base_threshold) if self._transfer_required_base_threshold is not None else None,
             last_error=self._transfer_last_error,
             last_qtg_state=self._transfer_last_qtg_state,
             lock_key=self._transfer_lock_key,
@@ -1609,6 +1734,9 @@ class UpbitBithumbXemmController(ControllerBase):
         self._transfer_started_ts = snapshot.transfer_start_ts
         self._transfer_retry_at = snapshot.retry_at
         self._transfer_recovery_started_ts = snapshot.recovery_started_ts
+        self._transfer_required_base_threshold = (
+            Decimal(snapshot.required_base_threshold) if snapshot.required_base_threshold is not None else None
+        )
         self._transfer_last_error = snapshot.last_error
         self._transfer_last_qtg_state = snapshot.last_qtg_state
         self._transfer_lock_key = snapshot.lock_key
@@ -1623,6 +1751,7 @@ class UpbitBithumbXemmController(ControllerBase):
             # intermediate state cannot be safely resumed, so retry through cooldown.
             self._rebalance_state = RebalanceState.COOLDOWN
             self._transfer_retry_at = 0.0
+            self._clear_transfer_pause_state()
             self._clear_transfer_delay_state()
             self._save_transfer_state()
             return
@@ -1655,6 +1784,7 @@ class UpbitBithumbXemmController(ControllerBase):
                 self._rebalance_state = RebalanceState.COOLDOWN
                 self._transfer_retry_at = 0.0
                 self._transfer_last_error = "Failed to reacquire transfer global lock during state restore (cooldown retry)"
+                self._clear_transfer_pause_state()
                 self._clear_transfer_delay_state()
                 self._save_transfer_state()
 
@@ -1702,10 +1832,9 @@ class UpbitBithumbXemmController(ControllerBase):
             f"net_bps_buy={self._opportunity_edge_net_bps[TradeType.BUY]}, net_bps_sell={self._opportunity_edge_net_bps[TradeType.SELL]}",
             f"  Risk cutoff: effective_session_pnl={self._risk_effective_session_pnl_quote}, "
             f"unhedged_notional={self._risk_unhedged_notional_quote}, pause_remaining={max(0.0, self._risk_pause_until_ts - self.market_data_provider.time()):.2f}s, reason={self._risk_pause_reason}",
-            f"  Transfer rebalance: enabled={self.config.transfer_rebalance_enabled}, state={self._rebalance_state.value}, direction={self._transfer_direction}, paused_side={self._paused_side.name if self._paused_side else None}",
+            f"  Transfer rebalance: enabled={self.config.transfer_rebalance_enabled}, policy=inventory_shortage, state={self._rebalance_state.value}, direction={self._transfer_direction}, paused_side={self._paused_side.name if self._paused_side else None}",
             f"  Transfer delay: active={self._rebalance_state == RebalanceState.DELAYING}, started={self._transfer_delay_started_ts}, "
-            f"deadline={self._transfer_delay_deadline_ts}, remaining={transfer_delay_remaining}s, "
-            f"hard_trigger={self.config.transfer_hard_trigger_skew_base}",
+            f"deadline={self._transfer_delay_deadline_ts}, remaining={transfer_delay_remaining}s",
             f"  Transfer request: id={self._active_transfer_request_id}, qtg_state={self._transfer_last_qtg_state}, amount={self._transfer_amount_base}, retry_at={self._transfer_retry_at}, error={self._transfer_last_error}",
         ]
 
@@ -1727,6 +1856,7 @@ class UpbitBithumbXemmController(ControllerBase):
             "inventory_delta": str(inventory_delta),
             "allow_buy": allow_buy,
             "allow_sell": allow_sell,
+            "inventory_skew_side_gating_enabled": self.config.inventory_skew_side_gating_enabled,
             "transfer_allow_buy": transfer_allow_buy,
             "transfer_allow_sell": transfer_allow_sell,
             "active_executors_total": len(active_executors),
@@ -1740,6 +1870,8 @@ class UpbitBithumbXemmController(ControllerBase):
             "market_data_stale_timeout_sec": self.config.market_data_stale_timeout_sec,
             "cancel_open_orders_on_stale": self.config.cancel_open_orders_on_stale,
             "stale_fill_hedge_mode": self.config.stale_fill_hedge_mode,
+            "latency_diagnostics_enabled": self.config.latency_diagnostics_enabled,
+            "close_out_loss_cap_bps": str(self.config.close_out_loss_cap_bps),
             "allow_one_sided_inventory_mode": self.config.allow_one_sided_inventory_mode,
             "maker_price_source": self.config.maker_price_source,
             "opportunity_gate_enabled": self.config.opportunity_gate_enabled,
@@ -1773,13 +1905,15 @@ class UpbitBithumbXemmController(ControllerBase):
             "transfer_request_id": self._active_transfer_request_id,
             "transfer_last_qtg_state": self._transfer_last_qtg_state,
             "transfer_amount_base": str(self._transfer_amount_base) if self._transfer_amount_base else None,
+            "transfer_required_base_threshold": (
+                str(self._transfer_required_base_threshold) if self._transfer_required_base_threshold is not None else None
+            ),
             "transfer_last_error": self._transfer_last_error,
             "transfer_retry_at": self._transfer_retry_at,
             "transfer_delay_active": self._rebalance_state == RebalanceState.DELAYING,
             "transfer_delay_started_ts": self._transfer_delay_started_ts,
             "transfer_delay_deadline_ts": self._transfer_delay_deadline_ts,
             "transfer_delay_remaining_sec": transfer_delay_remaining,
-            "transfer_hard_trigger_skew_base": str(self.config.transfer_hard_trigger_skew_base),
             "transfer_event_id": self._transfer_event_id,
             "transfer_cycle_id": self._transfer_cycle_id,
             "transfer_lock_key": self._transfer_lock_key,
