@@ -29,7 +29,7 @@ SHELL [ "/bin/bash", "-lc" ]
 RUN echo "conda activate hummingbot" >> ~/.bashrc
 
 COPY setup/pip_packages.txt /tmp/pip_packages.txt
-RUN python3 -m pip install --no-deps -r /tmp/pip_packages.txt && \
+RUN conda run -n hummingbot python -m pip install --no-deps -r /tmp/pip_packages.txt && \
     rm /tmp/pip_packages.txt
 
 
@@ -37,7 +37,7 @@ RUN python3 -m pip install --no-deps -r /tmp/pip_packages.txt && \
 # (pre-generated .cpp files are incompatible with numpy 2.x)
 # Preserve actual C++ source files in core/cpp/
 RUN find . -name "*.cpp" ! -path "./hummingbot/core/cpp/*" -delete && \
-    python3 setup.py build_ext --inplace -j 8 && \
+    conda run -n hummingbot python setup.py build_ext --inplace -j 8 && \
     rm -rf build/ && \
     find . -type f -name "*.cpp" ! -path "./hummingbot/core/cpp/*" -delete
 
