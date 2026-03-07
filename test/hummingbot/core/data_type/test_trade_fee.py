@@ -1,5 +1,6 @@
 from decimal import Decimal
 from unittest import TestCase
+from unittest.mock import MagicMock
 
 from hummingbot.core.data_type.common import PositionAction, TradeType
 from hummingbot.core.data_type.in_flight_order import TradeUpdate
@@ -247,6 +248,79 @@ class TradeFeeTests(TestCase):
             token="BNB")
 
         self.assertEqual(Decimal("0"), fee_amount)
+
+    def test_fee_amount_in_token_uses_inverse_exchange_pair_when_direct_pair_missing(self):
+        fee = AddedToCostTradeFee(flat_fees=[TokenAmount(token="KRW", amount=Decimal("1000"))])
+        exchange = MagicMock()
+        exchange.order_books = {"IP-KRW": object()}
+        exchange.get_price_by_type.return_value = Decimal("1250")
+
+        fee_amount = fee.fee_amount_in_token(
+            trading_pair="IP-KRW",
+            price=Decimal("1250"),
+            order_amount=Decimal("10"),
+            token="IP",
+            exchange=exchange,
+        )
+
+        self.assertEqual(Decimal("0.8"), fee_amount)
+
+    def test_fee_amount_in_token_uses_trade_price_for_quote_to_base_percent_conversion(self):
+        fee = AddedToCostTradeFee(percent=Decimal("0.001"), percent_token="KRW")
+
+        fee_amount = fee.fee_amount_in_token(
+            trading_pair="IP-KRW",
+            price=Decimal("1250"),
+            order_amount=Decimal("10"),
+            token="IP",
+        )
+
+        self.assertEqual(Decimal("0.01"), fee_amount)
+
+    def test_fee_amount_in_token_uses_trade_price_for_quote_to_base_flat_fee_conversion(self):
+        fee = AddedToCostTradeFee(flat_fees=[TokenAmount(token="KRW", amount=Decimal("1000"))])
+
+        fee_amount = fee.fee_amount_in_token(
+            trading_pair="IP-KRW",
+            price=Decimal("1250"),
+            order_amount=Decimal("10"),
+            token="IP",
+        )
+
+        self.assertEqual(Decimal("0.8"), fee_amount)
+
+    def test_fee_amount_in_token_uses_inverse_rate_source_when_direct_pair_missing(self):
+        fee = AddedToCostTradeFee(flat_fees=[TokenAmount(token="KRW", amount=Decimal("1000"))])
+        rate_source = MagicMock()
+        rate_source.get_pair_rate.side_effect = lambda pair: {
+            "KRW-IP": None,
+            "IP-KRW": Decimal("1250"),
+        }.get(pair)
+
+        fee_amount = fee.fee_amount_in_token(
+            trading_pair="IP-KRW",
+            price=Decimal("1250"),
+            order_amount=Decimal("10"),
+            token="IP",
+            rate_source=rate_source,
+        )
+
+        self.assertEqual(Decimal("0.8"), fee_amount)
+
+    def test_fee_amount_in_token_raises_value_error_when_inverse_pair_rate_is_zero(self):
+        fee = AddedToCostTradeFee(flat_fees=[TokenAmount(token="KRW", amount=Decimal("1000"))])
+        exchange = MagicMock()
+        exchange.order_books = {"USDT-KRW": object()}
+        exchange.get_price_by_type.return_value = Decimal("0")
+
+        with self.assertRaises(ValueError):
+            fee.fee_amount_in_token(
+                trading_pair="IP-KRW",
+                price=Decimal("1250"),
+                order_amount=Decimal("10"),
+                token="USDT",
+                exchange=exchange,
+            )
 
 
 class TokenAmountTests(TestCase):
