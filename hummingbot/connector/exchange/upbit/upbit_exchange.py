@@ -560,6 +560,11 @@ class UpbitExchange(ExchangePyBase):
             trade_update = self._parse_trade_from_ws_event(event_data, fillable_order)
             if trade_update is not None:
                 self._order_tracker.process_trade_update(trade_update)
+                self.logger().info(
+                    f"WS direct trade update processed for {exchange_order_id}: "
+                    f"trade_id={trade_update.trade_id}, base={trade_update.fill_base_amount}, "
+                    f"price={trade_update.fill_price}"
+                )
             elif (
                 (trade_uuid is not None and str(trade_uuid) not in fillable_order.order_fills)
                 or (
