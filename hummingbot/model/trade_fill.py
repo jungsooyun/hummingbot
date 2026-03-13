@@ -38,6 +38,9 @@ class TradeFill(HummingbotBase):
     leverage = Column(Integer, nullable=False, default=1)
     trade_fee = Column(JSON, nullable=False)
     trade_fee_in_quote = Column(SqliteDecimal(6))
+    executor_id = Column(Text, nullable=True)
+    execution_purpose = Column(Text, nullable=True)
+    order_role = Column(Text, nullable=True)
     exchange_trade_id = Column(Text, primary_key=True, nullable=False)
     position = Column(Text, nullable=True, default=PositionAction.NIL.value)
     order = relationship("Order", back_populates="trade_fills")
@@ -48,7 +51,8 @@ class TradeFill(HummingbotBase):
                f"quote_asset='{self.quote_asset}', timestamp={self.timestamp}, order_id='{self.order_id}', " \
                f"trade_type='{self.trade_type}', order_type='{self.order_type}', price={self.price}, " \
                f"amount={self.amount}, leverage={self.leverage}, trade_fee={self.trade_fee}, " \
-               f"exchange_trade_id={self.exchange_trade_id}, position={self.position})"
+               f"exchange_trade_id={self.exchange_trade_id}, executor_id={self.executor_id}, " \
+               f"execution_purpose={self.execution_purpose}, order_role={self.order_role}, position={self.position})"
 
     @staticmethod
     def get_trades(sql_session: Session,
@@ -165,4 +169,7 @@ class TradeFill(HummingbotBase):
             "leverage",
             "trade_fee",
             "trade_fee_in_quote",
+            "executor_id",
+            "execution_purpose",
+            "order_role",
             "position", ]

@@ -449,6 +449,8 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.executor._status = RunnableStatus.TERMINATED
         self.executor.maker_order = Mock(spec=TrackedOrder)
         self.executor.taker_order = Mock(spec=TrackedOrder)
+        self.executor.maker_order.is_done = True
+        self.executor.taker_order.is_done = True
         self.executor.maker_order.executed_amount_base = Decimal('1')
         self.executor.taker_order.executed_amount_base = Decimal('1')
         self.executor.maker_order.average_executed_price = Decimal('100')
@@ -463,10 +465,12 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         executor._status = RunnableStatus.TERMINATED
         executor.maker_order = Mock(spec=TrackedOrder)
         executor.taker_order = Mock(spec=TrackedOrder)
+        executor.maker_order.is_done = True
+        executor.taker_order.is_done = True
         executor.maker_order.executed_amount_base = Decimal('1')
         executor.taker_order.executed_amount_base = Decimal('1')
-        executor.maker_order.average_executed_price = Decimal('100')
-        executor.taker_order.average_executed_price = Decimal('200')
+        executor.maker_order.average_executed_price = Decimal('200')
+        executor.taker_order.average_executed_price = Decimal('100')
         executor.maker_order.cum_fees_quote = Decimal('1')
         executor.taker_order.cum_fees_quote = Decimal('1')
         self.assertEqual(executor.net_pnl_quote, Decimal('98'))
@@ -679,11 +683,12 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.assertEqual(executor.taker_order.order_id, "OID-SELL-0")
         self.strategy.cancel.assert_called_once_with("kucoin", "ETH-USDT", "OID-SELL-0")
 
-    def test_process_order_canceled_event_taker_replaces_order(self):
+    def test_process_order_canceled_event_taker_waits_before_replace(self):
         executor = XEMMExecutor(self.strategy, self.base_config_long_limit_taker, self.update_interval)
         executor._status = RunnableStatus.SHUTTING_DOWN
         executor.taker_order = TrackedOrder(order_id="OID-SELL-0")
         executor._taker_cancel_in_flight = True
+        self.strategy.sell.reset_mock()
 
         cancel_event = OrderCancelledEvent(
             timestamp=1234,
@@ -693,6 +698,38 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         executor.process_order_canceled_event(1, MagicMock(), cancel_event)
 
         self.assertFalse(executor._taker_cancel_in_flight)
+        self.assertTrue(executor._pending_taker_replace_after_cancel)
+        self.assertIsNotNone(executor.taker_order)
+        self.assertEqual(executor.taker_order.order_id, "OID-SELL-0")
+        self.strategy.sell.assert_not_called()
+
+    async def test_control_shutdown_process_replaces_taker_after_cancel_settlement_grace(self):
+        executor = XEMMExecutor(self.strategy, self.base_config_long_limit_taker, self.update_interval)
+        executor._status = RunnableStatus.SHUTTING_DOWN
+        executor.maker_order = Mock(spec=TrackedOrder)
+        executor.maker_order.is_done = True
+        executor.taker_order = TrackedOrder(order_id="OID-SELL-0")
+        executor.taker_order.order = InFlightOrder(
+            creation_timestamp=1000,
+            trading_pair="ETH-USDT",
+            client_order_id="OID-SELL-0",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.SELL,
+            amount=Decimal("100"),
+            price=Decimal("100"),
+            initial_state=OrderState.CANCELED,
+        )
+        executor.taker_order.order.executed_amount_base = Decimal("40")
+        executor.taker_order.order.executed_amount_quote = Decimal("4000")
+        executor._unhedged_base = Decimal("100")
+        executor._pending_taker_replace_after_cancel = True
+        executor._pending_taker_replace_started_ts = 1000
+        self.strategy.current_timestamp = 1006
+
+        await executor.control_shutdown_process()
+
+        self.assertFalse(executor._pending_taker_replace_after_cancel)
+        self.assertEqual(executor._unhedged_base, Decimal("60"))
         self.assertIsNotNone(executor.taker_order)
         self.assertEqual(executor.taker_order.order_id, "OID-SELL-1")
 

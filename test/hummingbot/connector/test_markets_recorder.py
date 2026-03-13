@@ -289,6 +289,65 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(self.config_file_path, trade_fills[0].config_file_path)
         self.assertEqual(fill_event.order_id, trade_fills[0].order_id)
 
+    def test_create_and_fill_records_executor_context(self):
+        recorder = MarketsRecorder(
+            sql=self.manager,
+            markets=[self],
+            config_file_path=self.config_file_path,
+            strategy_name=self.strategy_name,
+            market_data_collection=MarketDataCollectionConfigMap(
+                market_data_collection_enabled=False,
+                market_data_collection_interval=60,
+                market_data_collection_depth=20,
+            ),
+        )
+
+        self._executor_order_contexts = {
+            "OID1-1642010000000000": {
+                "executor_id": "executor-123",
+                "execution_purpose": "inventory_rebalance",
+                "order_role": "entry",
+            }
+        }
+
+        create_event = BuyOrderCreatedEvent(
+            timestamp=1642010000,
+            type=OrderType.LIMIT,
+            trading_pair=self.trading_pair,
+            amount=Decimal(1),
+            price=Decimal(1000),
+            order_id="OID1-1642010000000000",
+            creation_timestamp=1640001112.223,
+            exchange_order_id="EOID1",
+        )
+
+        recorder._did_create_order(MarketEvent.BuyOrderCreated.value, self, create_event)
+
+        fill_event = OrderFilledEvent(
+            timestamp=1642020000,
+            order_id=create_event.order_id,
+            trading_pair=create_event.trading_pair,
+            trade_type=TradeType.BUY,
+            order_type=create_event.type,
+            price=Decimal(1010),
+            amount=create_event.amount,
+            trade_fee=AddedToCostTradeFee(),
+            exchange_trade_id="TradeId1"
+        )
+
+        recorder._did_fill_order(MarketEvent.OrderFilled.value, self, fill_event)
+
+        with self.manager.get_new_session() as session:
+            order = session.query(Order).filter(Order.id == create_event.order_id).one()
+            trade_fill = session.query(TradeFill).filter(TradeFill.order_id == fill_event.order_id).one()
+
+        self.assertEqual("executor-123", order.executor_id)
+        self.assertEqual("inventory_rebalance", order.execution_purpose)
+        self.assertEqual("entry", order.order_role)
+        self.assertEqual("executor-123", trade_fill.executor_id)
+        self.assertEqual("inventory_rebalance", trade_fill.execution_purpose)
+        self.assertEqual("entry", trade_fill.order_role)
+
     def test_trade_fee_in_quote_not_available(self):
         recorder = MarketsRecorder(
             sql=self.manager,

@@ -138,6 +138,29 @@ class ExecutorBase(RunnableBase):
         """
         return {}
 
+    def get_execution_purpose(self) -> str:
+        return str(getattr(self.config, "execution_purpose", self.config.type))
+
+    def _register_order_context(self, connector_name: str, order_id: Optional[str], metadata: Optional[Dict] = None):
+        if not order_id:
+            return
+        connector = self.connectors.get(connector_name)
+        if connector is None:
+            return
+        contexts = getattr(connector, "_executor_order_contexts", None)
+        if not isinstance(contexts, dict):
+            contexts = {}
+            setattr(connector, "_executor_order_contexts", contexts)
+        payload = {
+            "executor_id": self.config.id,
+            "controller_id": self.config.controller_id,
+            "executor_type": self.config.type,
+            "execution_purpose": self.get_execution_purpose(),
+        }
+        if metadata:
+            payload.update(metadata)
+        contexts[order_id] = payload
+
     @staticmethod
     def is_perpetual_connector(connector_name: str):
         """
@@ -273,6 +296,7 @@ class ExecutorBase(RunnableBase):
                     amount: Decimal,
                     position_action: PositionAction = PositionAction.NIL,
                     price=Decimal("NaN"),
+                    metadata: Optional[Dict] = None,
                     ):
         """
         Places an order with the specified parameters.
@@ -287,9 +311,11 @@ class ExecutorBase(RunnableBase):
         :return: The result of the order placement.
         """
         if side == TradeType.BUY:
-            return self._strategy.buy(connector_name, trading_pair, amount, order_type, price, position_action)
+            order_id = self._strategy.buy(connector_name, trading_pair, amount, order_type, price, position_action)
         else:
-            return self._strategy.sell(connector_name, trading_pair, amount, order_type, price, position_action)
+            order_id = self._strategy.sell(connector_name, trading_pair, amount, order_type, price, position_action)
+        self._register_order_context(connector_name=connector_name, order_id=order_id, metadata=metadata)
+        return order_id
 
     def get_price(self, connector_name: str, trading_pair: str, price_type: PriceType = PriceType.MidPrice):
         """

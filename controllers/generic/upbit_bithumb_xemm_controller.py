@@ -32,6 +32,7 @@ from hummingbot.core.data_type.common import MarketDict, OrderType, PriceType, T
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
+from hummingbot.strategy_v2.executors.inventory_rebalance_executor.data_types import InventoryRebalanceExecutorConfig
 from hummingbot.strategy_v2.executors.xemm_executor.data_types import XEMMExecutorConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 
@@ -355,6 +356,7 @@ class UpbitBithumbXemmControllerConfig(ControllerConfigBase):
     transfer_max_amount_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
     transfer_amount_quantum_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
     transfer_source_balance_reserve_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
+    transfer_min_destination_balance_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
     transfer_poll_interval_sec: float = Field(default=5.0, json_schema_extra={"is_updatable": True})
     transfer_delay_before_submit_sec: float = Field(default=0.0, json_schema_extra={"is_updatable": True})
     transfer_request_cooldown_sec: float = Field(default=60.0, json_schema_extra={"is_updatable": True})
@@ -370,6 +372,18 @@ class UpbitBithumbXemmControllerConfig(ControllerConfigBase):
         json_schema_extra={"is_updatable": True},
     )
     transfer_global_lock_ttl_sec: float = Field(default=3600.0, json_schema_extra={"is_updatable": True})
+    inventory_rebalance_enabled: bool = Field(default=False, json_schema_extra={"is_updatable": True})
+    inventory_rebalance_soft_band_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
+    inventory_rebalance_hard_band_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
+    inventory_rebalance_min_slice_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
+    inventory_rebalance_max_slice_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
+    inventory_rebalance_min_expected_pnl_quote: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
+    inventory_rebalance_delay_between_creations: float = Field(default=10.0, json_schema_extra={"is_updatable": True})
+    inventory_rebalance_passive_order_max_age_seconds: float = Field(default=30.0, json_schema_extra={"is_updatable": True})
+    inventory_rebalance_passive_price_refresh_pct: Decimal = Field(default=Decimal("0.0002"), json_schema_extra={"is_updatable": True})
+    inventory_rebalance_entry_slippage_buffer_bps: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
+    inventory_rebalance_hedge_slippage_buffer_bps: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
+    inventory_rebalance_bithumb_rebate_bps: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
 
     @field_validator("buy_levels_targets_amount", "sell_levels_targets_amount", mode="before")
     @classmethod
@@ -451,6 +465,15 @@ class UpbitBithumbXemmControllerConfig(ControllerConfigBase):
                 raise ValueError("At least one transfer_route_key must be configured when transfer_rebalance_enabled is true")
         if self.transfer_delay_before_submit_sec < 0:
             raise ValueError("transfer_delay_before_submit_sec must be >= 0")
+        if self.inventory_rebalance_hard_band_base < self.inventory_rebalance_soft_band_base:
+            raise ValueError("inventory_rebalance_hard_band_base must be >= inventory_rebalance_soft_band_base")
+        if self.inventory_rebalance_min_slice_base < Decimal("0"):
+            raise ValueError("inventory_rebalance_min_slice_base must be >= 0")
+        if (
+            self.inventory_rebalance_max_slice_base > Decimal("0")
+            and self.inventory_rebalance_max_slice_base < self.inventory_rebalance_min_slice_base
+        ):
+            raise ValueError("inventory_rebalance_max_slice_base must be >= inventory_rebalance_min_slice_base")
         return self
 
     def update_markets(self, markets: MarketDict) -> MarketDict:
@@ -508,6 +531,7 @@ class UpbitBithumbXemmController(ControllerBase):
         self._transfer_poll_task: Optional[asyncio.Task] = None
         self._transfer_client: Optional[TransferGuardClient] = None
         self._transfer_client_ready: bool = False
+        self._last_inventory_rebalance_creation_ts: float = 0.0
         self._transfer_lock_owner: str = f"{os.getpid()}:{uuid.uuid4().hex[:8]}:{self._controller_id()}"
         self._transfer_lock_key: Optional[str] = None
         self._transfer_global_lease: Optional[TransferGlobalLease] = None
@@ -562,6 +586,12 @@ class UpbitBithumbXemmController(ControllerBase):
         transfer_allow_buy, transfer_allow_sell = self._transfer_allowed_sides()
         allow_buy = allow_buy and transfer_allow_buy
         allow_sell = allow_sell and transfer_allow_sell
+        if self._has_active_inventory_rebalance(active_executors=active_executors):
+            allow_buy, allow_sell = self._inventory_rebalance_allowed_sides(
+                inventory_delta=inventory_delta,
+                allow_buy=allow_buy,
+                allow_sell=allow_sell,
+            )
         risk_allow_buy, risk_allow_sell = self._risk_allowed_sides(
             now=now,
             mid_price=mid_price,
@@ -571,22 +601,36 @@ class UpbitBithumbXemmController(ControllerBase):
         allow_buy = allow_buy and risk_allow_buy
         allow_sell = allow_sell and risk_allow_sell
 
+        active_xemm_executors = [
+            executor
+            for executor in active_executors
+            if getattr(getattr(executor, "config", None), "type", None) != "inventory_rebalance_executor"
+        ]
+
         active_buy_targets = {
             executor.config.target_profitability
-            for executor in active_executors
+            for executor in active_xemm_executors
             if executor.side == TradeType.BUY and hasattr(executor.config, "target_profitability")
         }
         active_sell_targets = {
             executor.config.target_profitability
-            for executor in active_executors
+            for executor in active_xemm_executors
             if executor.side == TradeType.SELL and hasattr(executor.config, "target_profitability")
         }
 
-        active_buy_count = len([executor for executor in active_executors if executor.side == TradeType.BUY])
-        active_sell_count = len([executor for executor in active_executors if executor.side == TradeType.SELL])
+        active_buy_count = len([executor for executor in active_xemm_executors if executor.side == TradeType.BUY])
+        active_sell_count = len([executor for executor in active_xemm_executors if executor.side == TradeType.SELL])
 
         actions: List[ExecutorAction] = []
         actions.extend(self._transfer_pause_stop_actions(active_executors))
+        inventory_rebalance_action = self._create_inventory_rebalance_action(
+            now=now,
+            mid_price=mid_price,
+            inventory_delta=inventory_delta,
+            active_executors=active_executors,
+        )
+        if inventory_rebalance_action is not None:
+            actions.append(inventory_rebalance_action)
 
         if self.config.opportunity_gate_enabled:
             buy_gate_pass, _ = self._opportunity_gate_check(TradeType.BUY)
@@ -671,6 +715,343 @@ class UpbitBithumbXemmController(ControllerBase):
                     )
                 ]
         return actions
+
+    def _has_active_inventory_rebalance(self, active_executors: List) -> bool:
+        return any(
+            getattr(getattr(executor, "config", None), "type", None) == "inventory_rebalance_executor"
+            or getattr(executor, "type", None) == "inventory_rebalance_executor"
+            for executor in active_executors
+        )
+
+    @staticmethod
+    def _worsening_side_for_delta(inventory_delta: Decimal) -> Optional[TradeType]:
+        if inventory_delta > Decimal("0"):
+            return TradeType.BUY
+        if inventory_delta < Decimal("0"):
+            return TradeType.SELL
+        return None
+
+    def _inventory_rebalance_allowed_sides(
+        self,
+        inventory_delta: Decimal,
+        allow_buy: bool,
+        allow_sell: bool,
+    ) -> Tuple[bool, bool]:
+        worsening_side = self._worsening_side_for_delta(inventory_delta)
+        if worsening_side == TradeType.BUY:
+            allow_buy = False
+        elif worsening_side == TradeType.SELL:
+            allow_sell = False
+        return allow_buy, allow_sell
+
+    def _inventory_rebalance_creation_ready(self, now: float) -> bool:
+        return now >= self._last_inventory_rebalance_creation_ts + float(self.config.inventory_rebalance_delay_between_creations)
+
+    def _create_inventory_rebalance_action(
+        self,
+        now: float,
+        mid_price: Decimal,
+        inventory_delta: Decimal,
+        active_executors: List,
+    ) -> Optional[CreateExecutorAction]:
+        if not self.config.inventory_rebalance_enabled:
+            return None
+        if not self._inventory_rebalance_creation_ready(now):
+            return None
+        if self._has_active_inventory_rebalance(active_executors=active_executors):
+            return None
+        if self.config.transfer_rebalance_enabled and self._rebalance_state != RebalanceState.IDLE:
+            return None
+
+        candidate = self._select_inventory_rebalance_candidate(
+            inventory_delta=inventory_delta,
+            mid_price=mid_price,
+        )
+        if candidate is None:
+            return None
+
+        self._last_inventory_rebalance_creation_ts = now
+        return CreateExecutorAction(controller_id=self._controller_id(), executor_config=candidate)
+
+    def _select_inventory_rebalance_candidate(
+        self,
+        inventory_delta: Decimal,
+        mid_price: Decimal,
+    ) -> Optional[InventoryRebalanceExecutorConfig]:
+        abs_delta = abs(inventory_delta)
+        soft_band = self.config.inventory_rebalance_soft_band_base
+        hard_band = self.config.inventory_rebalance_hard_band_base
+        if abs_delta <= soft_band:
+            return None
+
+        slice_amount = max(Decimal("0"), (abs_delta - soft_band) / Decimal("2"))
+        slice_amount = max(slice_amount, self.config.inventory_rebalance_min_slice_base)
+        if self.config.inventory_rebalance_max_slice_base > Decimal("0"):
+            slice_amount = min(slice_amount, self.config.inventory_rebalance_max_slice_base)
+        if slice_amount <= Decimal("0"):
+            return None
+
+        controller_id = self._controller_id()
+        maker_market = ConnectorPair(connector_name=self.config.maker_connector, trading_pair=self.config.maker_trading_pair)
+        taker_market = ConnectorPair(connector_name=self.config.taker_connector, trading_pair=self.config.taker_trading_pair)
+        candidates: List[InventoryRebalanceExecutorConfig] = []
+
+        if inventory_delta > Decimal("0"):
+            candidates.extend(self._rebalance_candidate_variants(
+                entry_market=maker_market,
+                hedge_market=taker_market,
+                entry_side=TradeType.SELL,
+                order_amount=slice_amount,
+                inventory_delta=inventory_delta,
+                controller_id=controller_id,
+                allow_aggressive=abs_delta > hard_band,
+            ))
+            candidates.extend(self._rebalance_candidate_variants(
+                entry_market=taker_market,
+                hedge_market=maker_market,
+                entry_side=TradeType.BUY,
+                order_amount=slice_amount,
+                inventory_delta=inventory_delta,
+                controller_id=controller_id,
+                allow_aggressive=abs_delta > hard_band,
+            ))
+        elif inventory_delta < Decimal("0"):
+            candidates.extend(self._rebalance_candidate_variants(
+                entry_market=maker_market,
+                hedge_market=taker_market,
+                entry_side=TradeType.BUY,
+                order_amount=slice_amount,
+                inventory_delta=inventory_delta,
+                controller_id=controller_id,
+                allow_aggressive=abs_delta > hard_band,
+            ))
+            candidates.extend(self._rebalance_candidate_variants(
+                entry_market=taker_market,
+                hedge_market=maker_market,
+                entry_side=TradeType.SELL,
+                order_amount=slice_amount,
+                inventory_delta=inventory_delta,
+                controller_id=controller_id,
+                allow_aggressive=abs_delta > hard_band,
+            ))
+        else:
+            return None
+
+        eligible = [
+            candidate for candidate in candidates
+            if candidate.expected_pnl_quote > self.config.inventory_rebalance_min_expected_pnl_quote
+        ]
+        if not eligible:
+            return None
+        return max(eligible, key=lambda candidate: candidate.expected_pnl_quote)
+
+    def _rebalance_candidate_variants(
+        self,
+        entry_market: ConnectorPair,
+        hedge_market: ConnectorPair,
+        entry_side: TradeType,
+        order_amount: Decimal,
+        inventory_delta: Decimal,
+        controller_id: str,
+        allow_aggressive: bool,
+    ) -> List[InventoryRebalanceExecutorConfig]:
+        variants = [
+            self._build_inventory_rebalance_candidate(
+                entry_market=entry_market,
+                hedge_market=hedge_market,
+                entry_side=entry_side,
+                entry_style="passive",
+                order_amount=order_amount,
+                inventory_delta=inventory_delta,
+                controller_id=controller_id,
+            )
+        ]
+        if allow_aggressive:
+            variants.append(
+                self._build_inventory_rebalance_candidate(
+                    entry_market=entry_market,
+                    hedge_market=hedge_market,
+                    entry_side=entry_side,
+                    entry_style="aggressive",
+                    order_amount=order_amount,
+                    inventory_delta=inventory_delta,
+                    controller_id=controller_id,
+                )
+            )
+        return [variant for variant in variants if variant is not None]
+
+    def _build_inventory_rebalance_candidate(
+        self,
+        entry_market: ConnectorPair,
+        hedge_market: ConnectorPair,
+        entry_side: TradeType,
+        entry_style: str,
+        order_amount: Decimal,
+        inventory_delta: Decimal,
+        controller_id: str,
+    ) -> Optional[InventoryRebalanceExecutorConfig]:
+        quantized_amount = self.market_data_provider.quantize_order_amount(
+            entry_market.connector_name,
+            entry_market.trading_pair,
+            order_amount,
+        )
+        quantized_amount = self.market_data_provider.quantize_order_amount(
+            hedge_market.connector_name,
+            hedge_market.trading_pair,
+            quantized_amount,
+        )
+        if quantized_amount <= Decimal("0"):
+            return None
+
+        hedge_side = TradeType.SELL if entry_side == TradeType.BUY else TradeType.BUY
+        entry_price = self._rebalance_entry_price(entry_market, entry_side, entry_style)
+        hedge_price = self._rebalance_hedge_price(hedge_market, hedge_side)
+        if entry_price is None or hedge_price is None or entry_price <= Decimal("0") or hedge_price <= Decimal("0"):
+            return None
+
+        expected_pnl_quote = self._expected_inventory_rebalance_pnl_quote(
+            entry_market=entry_market,
+            hedge_market=hedge_market,
+            entry_side=entry_side,
+            entry_style=entry_style,
+            order_amount=quantized_amount,
+            entry_price=entry_price,
+            hedge_price=hedge_price,
+        )
+        if expected_pnl_quote <= Decimal("0"):
+            return None
+
+        delta_change = quantized_amount * Decimal("2")
+        target_delta_after = (
+            inventory_delta - delta_change if inventory_delta > Decimal("0") else inventory_delta + delta_change
+        )
+
+        return InventoryRebalanceExecutorConfig(
+            timestamp=self.market_data_provider.time(),
+            controller_id=controller_id,
+            entry_market=entry_market,
+            hedge_market=hedge_market,
+            entry_side=entry_side,
+            entry_style=entry_style,
+            order_amount=quantized_amount,
+            inventory_delta_before=inventory_delta,
+            target_inventory_delta_after=target_delta_after,
+            expected_pnl_quote=expected_pnl_quote,
+            entry_price_refresh_pct=self.config.inventory_rebalance_passive_price_refresh_pct,
+            entry_order_max_age_seconds=self.config.inventory_rebalance_passive_order_max_age_seconds,
+            hedge_order_type=self.config.taker_order_type,
+            hedge_slippage_buffer_bps=self.config.inventory_rebalance_hedge_slippage_buffer_bps,
+            hedge_max_retries=self.config.taker_max_retries,
+            hedge_fallback_to_market=True,
+        )
+
+    def _rebalance_entry_price(
+        self,
+        market: ConnectorPair,
+        side: TradeType,
+        entry_style: str,
+    ) -> Optional[Decimal]:
+        if entry_style == "passive":
+            price_type = PriceType.BestBid if side == TradeType.BUY else PriceType.BestAsk
+            return self.market_data_provider.get_price_by_type(market.connector_name, market.trading_pair, price_type)
+
+        book_price_type = PriceType.BestAsk if side == TradeType.BUY else PriceType.BestBid
+        reference_price = self.market_data_provider.get_price_by_type(market.connector_name, market.trading_pair, book_price_type)
+        if reference_price is None or reference_price <= Decimal("0"):
+            return None
+        slippage = self.config.inventory_rebalance_entry_slippage_buffer_bps / Decimal("10000")
+        if side == TradeType.BUY:
+            return reference_price * (Decimal("1") + slippage)
+        return reference_price * (Decimal("1") - slippage)
+
+    def _rebalance_hedge_price(self, market: ConnectorPair, side: TradeType) -> Optional[Decimal]:
+        price_type = PriceType.BestAsk if side == TradeType.BUY else PriceType.BestBid
+        reference_price = self.market_data_provider.get_price_by_type(market.connector_name, market.trading_pair, price_type)
+        if reference_price is None or reference_price <= Decimal("0"):
+            return None
+        slippage = self.config.inventory_rebalance_hedge_slippage_buffer_bps / Decimal("10000")
+        if side == TradeType.BUY:
+            return reference_price * (Decimal("1") + slippage)
+        return reference_price * (Decimal("1") - slippage)
+
+    def _expected_inventory_rebalance_pnl_quote(
+        self,
+        entry_market: ConnectorPair,
+        hedge_market: ConnectorPair,
+        entry_side: TradeType,
+        entry_style: str,
+        order_amount: Decimal,
+        entry_price: Decimal,
+        hedge_price: Decimal,
+    ) -> Decimal:
+        if entry_side == TradeType.SELL:
+            sell_notional = entry_price * order_amount
+            buy_notional = hedge_price * order_amount
+        else:
+            sell_notional = hedge_price * order_amount
+            buy_notional = entry_price * order_amount
+
+        gross_quote = sell_notional - buy_notional
+        entry_is_maker = entry_style == "passive"
+        hedge_is_maker = False
+        entry_fee = self._estimate_fee_quote(
+            connector_name=entry_market.connector_name,
+            trading_pair=entry_market.trading_pair,
+            side=entry_side,
+            amount=order_amount,
+            price=entry_price,
+            is_maker=entry_is_maker,
+        )
+        hedge_side = TradeType.SELL if entry_side == TradeType.BUY else TradeType.BUY
+        hedge_fee = self._estimate_fee_quote(
+            connector_name=hedge_market.connector_name,
+            trading_pair=hedge_market.trading_pair,
+            side=hedge_side,
+            amount=order_amount,
+            price=hedge_price,
+            is_maker=hedge_is_maker,
+        )
+        rebate_quote = Decimal("0")
+        if entry_is_maker and entry_market.connector_name == self.config.maker_connector:
+            rebate_quote += sell_notional * (self.config.inventory_rebalance_bithumb_rebate_bps / Decimal("10000"))
+        if hedge_is_maker and hedge_market.connector_name == self.config.maker_connector:
+            hedge_notional = hedge_price * order_amount
+            rebate_quote += hedge_notional * (self.config.inventory_rebalance_bithumb_rebate_bps / Decimal("10000"))
+        return gross_quote - entry_fee - hedge_fee + rebate_quote
+
+    def _estimate_fee_quote(
+        self,
+        connector_name: str,
+        trading_pair: str,
+        side: TradeType,
+        amount: Decimal,
+        price: Decimal,
+        is_maker: bool,
+    ) -> Decimal:
+        connector = self.market_data_provider.connectors.get(connector_name)
+        if connector is None or not hasattr(connector, "get_fee"):
+            return Decimal("0")
+        base_asset, quote_asset = split_hb_trading_pair(trading_pair)
+        try:
+            fee = connector.get_fee(
+                base_currency=base_asset,
+                quote_currency=quote_asset,
+                order_type=OrderType.LIMIT if is_maker else OrderType.MARKET,
+                order_side=side,
+                amount=amount,
+                price=price,
+                is_maker=is_maker,
+            )
+            fee_in_quote = fee.fee_amount_in_token(
+                trading_pair=trading_pair,
+                price=price,
+                order_amount=amount,
+                token=quote_asset,
+                exchange=connector,
+            )
+            return self._as_decimal(fee_in_quote)
+        except Exception:
+            return Decimal("0")
 
     def _create_level_actions(
         self,
@@ -954,9 +1335,16 @@ class UpbitBithumbXemmController(ControllerBase):
         order_amounts = self._planned_order_amounts_for_side(side=side, mid_price=mid_price)
         return max(order_amounts) if order_amounts else Decimal("0")
 
+    def _required_base_for_transfer_trigger(self, side: TradeType) -> Decimal:
+        next_cycle_required = self._required_base_for_next_cycle(side)
+        min_destination_balance = self.config.transfer_min_destination_balance_base
+        if min_destination_balance > Decimal("0"):
+            return max(next_cycle_required, min_destination_balance)
+        return next_cycle_required
+
     def _inventory_shortage_trigger(self) -> Optional[Dict[str, object]]:
-        buy_required_base = self._required_base_for_next_cycle(TradeType.BUY)
-        sell_required_base = self._required_base_for_next_cycle(TradeType.SELL)
+        buy_required_base = self._required_base_for_transfer_trigger(TradeType.BUY)
+        sell_required_base = self._required_base_for_transfer_trigger(TradeType.SELL)
         taker_available_base = self._available_base_balance(self.config.taker_connector)
         maker_available_base = self._available_base_balance(self.config.maker_connector)
 
@@ -1345,7 +1733,13 @@ class UpbitBithumbXemmController(ControllerBase):
                 self._transfer_recovery_started_ts is not None and
                 now - self._transfer_recovery_started_ts > self.config.transfer_recovery_max_wait_sec
             ):
-                self._complete_transfer_cycle(reason="recovery_deadline_exceeded")
+                deadline_message = (
+                    "Recovery deadline exceeded; keeping transfer pause active until balances recover."
+                )
+                if self._transfer_last_error != deadline_message:
+                    self.logger().warning(deadline_message)
+                    self._transfer_last_error = deadline_message
+                    self._save_transfer_state()
             return
 
         if self._rebalance_state == RebalanceState.IN_FLIGHT:
@@ -1383,8 +1777,17 @@ class UpbitBithumbXemmController(ControllerBase):
                 return
 
             if self._transfer_delay_deadline_ts is not None and now >= self._transfer_delay_deadline_ts:
-                self.logger().info("Transfer rebalance delay expired: proceeding with transfer submission")
-                self._begin_transfer_submission(trigger=trigger, now=now, reason="delay_expired")
+                submission_started = self._begin_transfer_submission(trigger=trigger, now=now, reason="delay_expired")
+                if submission_started:
+                    self.logger().info("Transfer rebalance delay expired: proceeding with transfer submission")
+                else:
+                    if self._transfer_last_error:
+                        self.logger().warning(
+                            f"Transfer rebalance delay expired but submission could not start: {self._transfer_last_error}"
+                        )
+                    self._complete_transfer_delay(
+                        reason="delay expired but transfer submission could not start"
+                    )
                 return
 
             return
@@ -1625,10 +2028,7 @@ class UpbitBithumbXemmController(ControllerBase):
                 self._transfer_last_error = f"Failed to initialize transfer lock directory: {e}"
 
     def _acquire_transfer_lock(self, direction: str) -> bool:
-        source = self.config.maker_connector if direction == "maker_to_taker" else self.config.taker_connector
-        destination = self.config.taker_connector if direction == "maker_to_taker" else self.config.maker_connector
-        base_asset, _ = split_hb_trading_pair(self.config.maker_trading_pair)
-        lock_key = f"{base_asset}:{source}:{destination}"
+        lock_key = self._transfer_lock_key_for_direction(direction)
         if self.config.transfer_global_lock_enabled and self._transfer_global_lease is None:
             self._transfer_last_error = "transfer_global_lock_enabled=true but lock subsystem is unavailable"
             return False
@@ -1640,7 +2040,79 @@ class UpbitBithumbXemmController(ControllerBase):
         acquired = self._transfer_global_lease.acquire(lock_key=lock_key, owner_id=self._transfer_lock_owner)
         if acquired:
             self._transfer_lock_key = lock_key
+        else:
+            payload = self._transfer_global_lease.peek(lock_key=lock_key)
+            if payload is not None:
+                owner_id = payload.get("owner_id")
+                updated_at = payload.get("updated_at")
+                age_seconds = None
+                if isinstance(updated_at, (int, float)):
+                    age_seconds = max(0.0, time.time() - float(updated_at))
+                owner_text = owner_id if isinstance(owner_id, str) else "unknown-owner"
+                age_text = f"{age_seconds:.1f}s" if age_seconds is not None else "unknown-age"
+                self._transfer_last_error = (
+                    f"transfer global lock busy: key={lock_key}, owner={owner_text}, age={age_text}"
+                )
+            else:
+                self._transfer_last_error = f"transfer global lock busy: key={lock_key}"
+            self.logger().warning(
+                f"Failed to acquire transfer global lock for direction={direction}: {self._transfer_last_error}"
+            )
         return acquired
+
+    def _transfer_lock_key_for_direction(self, direction: str) -> str:
+        source = self.config.maker_connector if direction == "maker_to_taker" else self.config.taker_connector
+        destination = self.config.taker_connector if direction == "maker_to_taker" else self.config.maker_connector
+        base_asset, _ = split_hb_trading_pair(self.config.maker_trading_pair)
+        return f"{base_asset}:{source}:{destination}"
+
+    def _configured_transfer_lock_keys(self) -> List[str]:
+        keys: List[str] = []
+        if self.config.transfer_route_key_maker_to_taker:
+            keys.append(self._transfer_lock_key_for_direction("maker_to_taker"))
+        if self.config.transfer_route_key_taker_to_maker:
+            keys.append(self._transfer_lock_key_for_direction("taker_to_maker"))
+        return list(dict.fromkeys(keys))
+
+    def _try_reclaim_same_controller_transfer_lock(self, lock_key: str) -> bool:
+        if not self.config.transfer_global_lock_enabled or self._transfer_global_lease is None:
+            return False
+        payload = self._transfer_global_lease.peek(lock_key=lock_key)
+        if payload is None:
+            return False
+        owner_id = payload.get("owner_id")
+        if not isinstance(owner_id, str):
+            return False
+        controller_suffix = f":{self._controller_id()}"
+        if not owner_id.endswith(controller_suffix):
+            return False
+        if owner_id == self._transfer_lock_owner:
+            return False
+        released = self._transfer_global_lease.release(
+            lock_key=lock_key,
+            owner_id=self._transfer_lock_owner,
+            force=True,
+        )
+        if released:
+            self.logger().warning(
+                f"Recovered abandoned transfer global lock for same controller: {lock_key} (owner={owner_id})"
+            )
+        return released
+
+    def _recover_same_controller_transfer_locks_on_restore(self):
+        if not self.config.transfer_global_lock_enabled or self._transfer_global_lease is None:
+            return
+        if self._active_transfer_request_id is not None:
+            return
+        if self._rebalance_state in {
+            RebalanceState.SIGNAL_SUBMITTING,
+            RebalanceState.APPROVAL_SUBMITTING,
+            RebalanceState.IN_FLIGHT,
+            RebalanceState.WAITING_RECOVERY,
+        }:
+            return
+        for lock_key in self._configured_transfer_lock_keys():
+            self._try_reclaim_same_controller_transfer_lock(lock_key)
 
     def _heartbeat_transfer_lock(self):
         if (
@@ -1747,6 +2219,8 @@ class UpbitBithumbXemmController(ControllerBase):
         else:
             self._paused_side = None
 
+        self._recover_same_controller_transfer_locks_on_restore()
+
         if self._rebalance_state in {RebalanceState.SIGNAL_SUBMITTING, RebalanceState.APPROVAL_SUBMITTING}:
             # intermediate state cannot be safely resumed, so retry through cooldown.
             self._rebalance_state = RebalanceState.COOLDOWN
@@ -1843,6 +2317,12 @@ class UpbitBithumbXemmController(ControllerBase):
         allow_buy, allow_sell = self._allowed_sides(inventory_delta)
         transfer_allow_buy, transfer_allow_sell = self._transfer_allowed_sides()
         active_executors = self.filter_executors(self.executors_info, lambda executor: not executor.is_done)
+        maker_available_base = self._available_base_balance(self.config.maker_connector)
+        taker_available_base = self._available_base_balance(self.config.taker_connector)
+        next_cycle_buy_required_base = self._required_base_for_next_cycle(TradeType.BUY)
+        next_cycle_sell_required_base = self._required_base_for_next_cycle(TradeType.SELL)
+        transfer_trigger_buy_required_base = self._required_base_for_transfer_trigger(TradeType.BUY)
+        transfer_trigger_sell_required_base = self._required_base_for_transfer_trigger(TradeType.SELL)
         active_buy = len([executor for executor in active_executors if executor.side == TradeType.BUY])
         active_sell = len([executor for executor in active_executors if executor.side == TradeType.SELL])
         recovery_grace_remaining = 0.0
@@ -1854,11 +2334,18 @@ class UpbitBithumbXemmController(ControllerBase):
         return {
             "loop_metrics": self.get_loop_metrics(),
             "inventory_delta": str(inventory_delta),
+            "maker_available_base": str(maker_available_base),
+            "taker_available_base": str(taker_available_base),
             "allow_buy": allow_buy,
             "allow_sell": allow_sell,
             "inventory_skew_side_gating_enabled": self.config.inventory_skew_side_gating_enabled,
             "transfer_allow_buy": transfer_allow_buy,
             "transfer_allow_sell": transfer_allow_sell,
+            "next_cycle_buy_required_base": str(next_cycle_buy_required_base),
+            "next_cycle_sell_required_base": str(next_cycle_sell_required_base),
+            "transfer_trigger_min_destination_balance_base": str(self.config.transfer_min_destination_balance_base),
+            "transfer_trigger_buy_required_base": str(transfer_trigger_buy_required_base),
+            "transfer_trigger_sell_required_base": str(transfer_trigger_sell_required_base),
             "active_executors_total": len(active_executors),
             "active_buy_executors": active_buy,
             "active_sell_executors": active_sell,

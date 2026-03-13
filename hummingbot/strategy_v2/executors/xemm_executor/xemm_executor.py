@@ -36,6 +36,9 @@ class XEMMExecutor(ExecutorBase):
             cls._logger = logging.getLogger(__name__)
         return cls._logger
 
+    def get_execution_purpose(self) -> str:
+        return "xemm"
+
     @staticmethod
     def _are_tokens_interchangeable(first_token: str, second_token: str):
         interchangeable_tokens = [
@@ -125,6 +128,10 @@ class XEMMExecutor(ExecutorBase):
         self._taker_cancel_in_flight = False
         self._taker_cancel_requested_timestamp = 0.0
         self._taker_cancel_retry_interval = 3.0
+        self._taker_cancel_settlement_grace_sec = max(5.0, self._taker_cancel_retry_interval * 2)
+        self._pending_taker_replace_after_cancel = False
+        self._pending_taker_replace_started_ts = 0.0
+        self._taker_accounted_executed_base: Decimal = Decimal("0")
         # Optional shadow maker (on taker connector) state
         self.shadow_order: Optional[TrackedOrder] = None
         self._shadow_cancel_in_flight = False
@@ -849,6 +856,7 @@ class XEMMExecutor(ExecutorBase):
             side=shadow_side,
             amount=shadow_amount,
             price=shadow_price,
+            metadata={"order_role": "shadow_maker"},
         )
         self.shadow_order = TrackedOrder(order_id=shadow_order_id)
         self.logger().info(
@@ -1101,6 +1109,7 @@ class XEMMExecutor(ExecutorBase):
             side=self.maker_order_side,
             amount=amount,
             price=price,
+            metadata={"order_role": "maker"},
         )
         self.maker_order = TrackedOrder(order_id=order_id)
         self._shadow_prefill_cross_order_active = True
@@ -1146,6 +1155,7 @@ class XEMMExecutor(ExecutorBase):
             side=unwind_side,
             amount=amount,
             price=price,
+            metadata={"order_role": "taker"},
         )
         self._shadow_prefill_unwind_order = TrackedOrder(order_id=order_id)
         self._shadow_prefill_stage_started_ts = self._strategy.current_timestamp
@@ -1310,7 +1320,8 @@ class XEMMExecutor(ExecutorBase):
             order_type=OrderType.LIMIT,
             side=self.maker_order_side,
             amount=self.config.order_amount,
-            price=maker_price)
+            price=maker_price,
+            metadata={"order_role": "maker"})
         self.maker_order = TrackedOrder(order_id=order_id)
         self._register_tracked_order_diag_context(self.maker_connector, self.maker_order, order_role="maker")
         self.logger().info(f"Created maker order {order_id} at price {maker_price}.")
@@ -1353,6 +1364,10 @@ class XEMMExecutor(ExecutorBase):
             else:
                 await self.control_pending_shadow_prefill_unwind_cancel()
 
+        if self._pending_taker_replace_after_cancel:
+            await self._control_pending_taker_replace_after_cancel()
+            return
+
         if self._should_refresh_taker_limit_order():
             await self._refresh_taker_limit_order()
             return
@@ -1367,7 +1382,14 @@ class XEMMExecutor(ExecutorBase):
             not self._tracked_order_is_open(self._shadow_prefill_unwind_order)
             and not self._shadow_prefill_unwind_cancel_in_flight
         )
-        if maker_done and taker_done and shadow_closed and unwind_closed:
+        if (
+            maker_done
+            and taker_done
+            and shadow_closed
+            and unwind_closed
+            and not self._pending_taker_replace_after_cancel
+            and self._unhedged_base == Decimal("0")
+        ):
             self.logger().info("Both orders are done, executor terminated.")
             self._emit_trace_end("both_orders_done")
             self.stop()
@@ -1481,7 +1503,71 @@ class XEMMExecutor(ExecutorBase):
             self._strategy.cancel(self.taker_connector, self.taker_trading_pair, self.taker_order.order_id)
             self._taker_cancel_requested_timestamp = now
 
-    def _replace_taker_order_after_cancel(self):
+    def _clear_pending_taker_replace_after_cancel(self):
+        self._pending_taker_replace_after_cancel = False
+        self._pending_taker_replace_started_ts = 0.0
+
+    def _apply_taker_execution_delta(
+        self,
+        executed_base: Decimal = None,
+        executed_quote: Decimal = None,
+    ) -> Decimal:
+        if self.taker_order is None:
+            return Decimal("0")
+        total_executed_base = executed_base if executed_base is not None else self.taker_order.executed_amount_base
+        if total_executed_base is None or total_executed_base.is_nan():
+            return Decimal("0")
+        if total_executed_base <= self._taker_accounted_executed_base:
+            return Decimal("0")
+
+        delta_base = total_executed_base - self._taker_accounted_executed_base
+        sign = Decimal("-1") if self.maker_order_side == TradeType.BUY else Decimal("1")
+        self._unhedged_base += delta_base * sign
+
+        delta_quote = Decimal("0")
+        if (
+            executed_quote is not None and
+            executed_quote > 0 and
+            total_executed_base > 0
+        ):
+            avg_price = executed_quote / total_executed_base
+            delta_quote = avg_price * delta_base
+        elif self.taker_order.average_executed_price and not self.taker_order.average_executed_price.is_nan():
+            delta_quote = self.taker_order.average_executed_price * delta_base
+
+        self._unhedged_quote += delta_quote * sign
+        self._taker_accounted_executed_base = total_executed_base
+        return delta_base
+
+    async def _control_pending_taker_replace_after_cancel(self):
+        if self.taker_order is None:
+            self._clear_pending_taker_replace_after_cancel()
+            return
+
+        now = self._strategy.current_timestamp
+        if now < self._pending_taker_replace_started_ts + self._taker_cancel_settlement_grace_sec:
+            return
+
+        self._apply_taker_execution_delta()
+        self._clear_pending_taker_replace_after_cancel()
+
+        if self._unhedged_base == Decimal("0"):
+            self.logger().info("Cancelled taker order settled during grace period. No replacement hedge needed.")
+            return
+
+        remaining_amount = abs(self._unhedged_base)
+        self.logger().warning(
+            f"Cancelled taker order {self.taker_order.order_id} did not settle further after "
+            f"{self._taker_cancel_settlement_grace_sec:.2f}s. Replacing hedge for remaining amount={remaining_amount}."
+        )
+        self.taker_order = None
+        self._taker_accounted_executed_base = Decimal("0")
+        self._replace_taker_order_after_cancel(order_amount=remaining_amount)
+
+    def _replace_taker_order_after_cancel(self, order_amount: Decimal = None):
+        resolved_order_amount = order_amount if order_amount is not None else (
+            abs(self._unhedged_base) if self._unhedged_base != 0 else self.config.order_amount
+        )
         self._current_retries += 1
         if self._current_retries > self._max_retries:
             if self.config.taker_fallback_to_market and not self._force_market_taker:
@@ -1498,8 +1584,8 @@ class XEMMExecutor(ExecutorBase):
                 self._emit_trace_end("taker_retries_exhausted")
                 self.stop()
                 return
-        self._log_taker_transition("replace_after_cancel", retries=self._current_retries)
-        self.place_taker_order()
+        self._log_taker_transition("replace_after_cancel", retries=self._current_retries, order_amount=resolved_order_amount)
+        self.place_taker_order(order_amount=resolved_order_amount)
 
     async def control_update_maker_order(self):
         if self.maker_order is None or self.maker_order.order is None:
@@ -1832,17 +1918,14 @@ class XEMMExecutor(ExecutorBase):
             executed_base = self.taker_order.executed_amount_base
             if executed_base == Decimal("0"):
                 executed_base = getattr(event, "base_asset_amount", Decimal("0"))
+            event_executed_quote = getattr(event, "quote_asset_amount", Decimal("0"))
             if executed_base and not executed_base.is_nan():
-                sign = Decimal("-1") if self.maker_order_side == TradeType.BUY else Decimal("1")
-                self._unhedged_base += executed_base * sign
-                # approximate quote using average executed price if available
-                if self.taker_order.average_executed_price and not self.taker_order.average_executed_price.is_nan():
-                    self._unhedged_quote += executed_base * self.taker_order.average_executed_price * sign
-                else:
-                    event_executed_quote = getattr(event, "quote_asset_amount", Decimal("0"))
-                    if event_executed_quote and not event_executed_quote.is_nan():
-                        self._unhedged_quote += event_executed_quote * sign
+                self._apply_taker_execution_delta(
+                    executed_base=executed_base,
+                    executed_quote=event_executed_quote,
+                )
             self._early_stop_hedge_initiated = False
+            self._clear_pending_taker_replace_after_cancel()
             self._log_taker_transition(
                 "completed",
                 event=self._event_snapshot(event),
@@ -1933,7 +2016,6 @@ class XEMMExecutor(ExecutorBase):
                 event=self._event_snapshot(event),
                 accounting_snapshot=self._accounting_snapshot(self.taker_order),
             )
-            self.taker_order = None
             self._taker_cancel_in_flight = False
             if self.close_type == CloseType.EARLY_STOP and self._early_stop_hedge_initiated:
                 hedge_amount = abs(self._unhedged_base)
@@ -1941,12 +2023,24 @@ class XEMMExecutor(ExecutorBase):
                     self.logger().warning(
                         f"Early-stop hedge taker was cancelled. Replacing MARKET hedge order amount={hedge_amount}."
                     )
+                    self.taker_order = None
+                    self._taker_accounted_executed_base = Decimal("0")
+                    self._clear_pending_taker_replace_after_cancel()
                     self._force_market_taker = True
                     self.place_taker_order(order_amount=hedge_amount)
                     return
                 self._early_stop_hedge_initiated = False
             if self.status == RunnableStatus.SHUTTING_DOWN and self.close_type != CloseType.EARLY_STOP:
-                self._replace_taker_order_after_cancel()
+                self._pending_taker_replace_after_cancel = True
+                self._pending_taker_replace_started_ts = self._strategy.current_timestamp
+                self.logger().warning(
+                    f"Taker order {event.order_id} cancelled while hedging. Waiting "
+                    f"{self._taker_cancel_settlement_grace_sec:.2f}s before replacement to avoid duplicate hedge."
+                )
+                return
+            self.taker_order = None
+            self._taker_accounted_executed_base = Decimal("0")
+            self._clear_pending_taker_replace_after_cancel()
         elif self.shadow_order and event.order_id == self.shadow_order.order_id:
             self.logger().info(f"Shadow maker order {event.order_id} cancelled.")
             executed_base = self.shadow_order.executed_amount_base if self.shadow_order.executed_amount_base else Decimal("0")
@@ -2006,8 +2100,11 @@ class XEMMExecutor(ExecutorBase):
             order_type=taker_order_type,
             side=effective_side,
             amount=amount,
-            price=taker_price)
+            price=taker_price,
+            metadata={"order_role": "taker"})
         self.taker_order = TrackedOrder(order_id=taker_order_id)
+        self._taker_accounted_executed_base = Decimal("0")
+        self._clear_pending_taker_replace_after_cancel()
         self._register_tracked_order_diag_context(self.taker_connector, self.taker_order, order_role="taker")
         self._log_taker_transition(
             "submit_request",
@@ -2205,9 +2302,14 @@ class XEMMExecutor(ExecutorBase):
 
     def get_net_pnl_quote(self) -> Decimal:
         if self.is_closed and self.maker_order and self.taker_order and self.maker_order.is_done and self.taker_order.is_done:
-            maker_pnl = self.maker_order.executed_amount_base * self.maker_order.average_executed_price
-            taker_pnl = self.taker_order.executed_amount_base * self.taker_order.average_executed_price
-            return taker_pnl - maker_pnl - self.get_cum_fees_quote()
+            maker_notional = self.maker_order.executed_amount_base * self.maker_order.average_executed_price
+            taker_notional = self.taker_order.executed_amount_base * self.taker_order.average_executed_price
+            gross_pnl = (
+                taker_notional - maker_notional
+                if self.maker_order_side == TradeType.BUY
+                else maker_notional - taker_notional
+            )
+            return gross_pnl - self.get_cum_fees_quote()
         else:
             return Decimal("0")
 

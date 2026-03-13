@@ -59,6 +59,10 @@ class TransferGlobalLease:
             return True
         return True
 
+    def peek(self, *, lock_key: str) -> Optional[dict[str, Any]]:
+        path = self._lock_path(lock_key)
+        return self._read_payload(path)
+
     def _lock_path(self, lock_key: str) -> str:
         safe_key = re.sub(r"[^a-zA-Z0-9._-]", "_", lock_key)
         return os.path.join(self._lock_dir, f"{safe_key}.lock")

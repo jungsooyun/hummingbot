@@ -17,6 +17,7 @@ from hummingbot.strategy_v2.executors.arbitrage_executor.arbitrage_executor impo
 from hummingbot.strategy_v2.executors.data_types import PositionSummary
 from hummingbot.strategy_v2.executors.dca_executor.dca_executor import DCAExecutor
 from hummingbot.strategy_v2.executors.grid_executor.grid_executor import GridExecutor
+from hummingbot.strategy_v2.executors.inventory_rebalance_executor.inventory_rebalance_executor import InventoryRebalanceExecutor
 from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
 from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
 from hummingbot.strategy_v2.executors.twap_executor.twap_executor import TWAPExecutor
@@ -144,6 +145,7 @@ class ExecutorOrchestrator:
         "arbitrage_executor": ArbitrageExecutor,
         "twap_executor": TWAPExecutor,
         "xemm_executor": XEMMExecutor,
+        "inventory_rebalance_executor": InventoryRebalanceExecutor,
         "order_executor": OrderExecutor,
     }
 

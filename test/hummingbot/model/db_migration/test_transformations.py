@@ -1,7 +1,11 @@
 from unittest import TestCase
 from unittest.mock import MagicMock
 
-from hummingbot.model.db_migration.transformations import AddTradeFeeInQuote, ConvertPriceAndAmountColumnsToBigint
+from hummingbot.model.db_migration.transformations import (
+    AddExecutionContextColumns,
+    AddTradeFeeInQuote,
+    ConvertPriceAndAmountColumnsToBigint,
+)
 
 
 class ConvertPriceAndAmountColumnsToBigintTests(TestCase):
@@ -41,3 +45,11 @@ class AddTradeFeeInQuoteTests(TestCase):
 
     def test_to_version(self):
         self.assertEqual(20230516, AddTradeFeeInQuote(self).to_version)
+
+
+class AddExecutionContextColumnsTests(TestCase):
+    def test_name(self):
+        self.assertEqual("AddExecutionContextColumns", AddExecutionContextColumns(self).name)
+
+    def test_to_version(self):
+        self.assertEqual(20260308, AddExecutionContextColumns(self).to_version)

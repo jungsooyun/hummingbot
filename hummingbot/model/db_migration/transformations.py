@@ -149,3 +149,20 @@ class AddTradeFeeInQuote(DatabaseTransformation):
     @property
     def to_version(self):
         return 20230516
+
+
+class AddExecutionContextColumns(DatabaseTransformation):
+    def apply(self, db_handle: SQLConnectionManager) -> SQLConnectionManager:
+        for table in ("Order", "TradeFill"):
+            self.add_column(db_handle.engine, table, Column("executor_id", Text, nullable=True), dry_run=False)
+            self.add_column(db_handle.engine, table, Column("execution_purpose", Text, nullable=True), dry_run=False)
+            self.add_column(db_handle.engine, table, Column("order_role", Text, nullable=True), dry_run=False)
+        return db_handle
+
+    @property
+    def name(self):
+        return "AddExecutionContextColumns"
+
+    @property
+    def to_version(self):
+        return 20260308

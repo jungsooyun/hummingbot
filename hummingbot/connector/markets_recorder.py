@@ -65,6 +65,16 @@ class MarketsRecorder:
             cls._logger = logging.getLogger(__name__)
         return cls._logger
 
+    @staticmethod
+    def _executor_order_context(market: ConnectorBase, order_id: str) -> Dict[str, Optional[str]]:
+        contexts = getattr(market, "_executor_order_contexts", None)
+        if not isinstance(contexts, dict):
+            return {}
+        context = contexts.get(order_id)
+        if not isinstance(context, dict):
+            return {}
+        return context
+
     @classmethod
     def get_instance(cls, *args, **kwargs) -> "MarketsRecorder":
         if cls._shared_instance is None:
@@ -379,6 +389,7 @@ class MarketsRecorder:
 
         with self._sql_manager.get_new_session() as session:
             with session.begin():
+                order_context = self._executor_order_context(market=market, order_id=evt.order_id)
                 order_record: Order = Order(id=evt.order_id,
                                             config_file_path=self._config_file_path,
                                             strategy=self._strategy_name,
@@ -394,7 +405,10 @@ class MarketsRecorder:
                                             position=evt.position if evt.position else PositionAction.NIL.value,
                                             last_status=event_type.name,
                                             last_update_timestamp=timestamp,
-                                            exchange_order_id=evt.exchange_order_id)
+                                            exchange_order_id=evt.exchange_order_id,
+                                            executor_id=order_context.get("executor_id"),
+                                            execution_purpose=order_context.get("execution_purpose"),
+                                            order_role=order_context.get("order_role"))
                 order_status: OrderStatus = OrderStatus(order=order_record,
                                                         timestamp=timestamp,
                                                         status=event_type.name)
@@ -423,6 +437,14 @@ class MarketsRecorder:
                 if order_record is not None:
                     order_record.last_status = event_type.name
                     order_record.last_update_timestamp = timestamp
+                order_context = self._executor_order_context(market=market, order_id=order_id)
+                executor_id = order_context.get("executor_id") if order_context else None
+                execution_purpose = order_context.get("execution_purpose") if order_context else None
+                order_role = order_context.get("order_role") if order_context else None
+                if order_record is not None:
+                    executor_id = executor_id or order_record.executor_id
+                    execution_purpose = execution_purpose or order_record.execution_purpose
+                    order_role = order_role or order_record.order_role
 
                 # Order status and trade fill record should be added even if the order record is not found, because it's
                 # possible for fill event to come in before the order created event for market orders.
@@ -456,6 +478,9 @@ class MarketsRecorder:
                     leverage=evt.leverage if evt.leverage else 1,
                     trade_fee=evt.trade_fee.to_json(),
                     trade_fee_in_quote=fee_in_quote,
+                    executor_id=executor_id,
+                    execution_purpose=execution_purpose,
+                    order_role=order_role,
                     exchange_trade_id=evt.exchange_trade_id,
                     position=evt.position if evt.position else PositionAction.NIL.value,
                 )

@@ -214,6 +214,107 @@ class TestUpbitBithumbXemmController(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(any(action.executor_config.maker_side == TradeType.BUY for action in actions))
         self.assertTrue(any(action.executor_config.maker_side == TradeType.SELL for action in actions))
 
+    def test_inventory_rebalance_creates_best_positive_candidate_and_prefers_rebated_passive_path(self):
+        self.controller.config.inventory_rebalance_enabled = True
+        self.controller.config.inventory_rebalance_hard_band_base = Decimal("6")
+        self.controller.config.inventory_rebalance_soft_band_base = Decimal("2")
+        self.controller.config.inventory_rebalance_min_slice_base = Decimal("1")
+        self.controller.config.inventory_rebalance_max_slice_base = Decimal("10")
+        self.controller.config.inventory_rebalance_min_expected_pnl_quote = Decimal("0")
+        self.controller.config.inventory_rebalance_bithumb_rebate_bps = Decimal("2.5")
+        self.controller.config.max_executors_per_side = 1
+        self.mock_market_data_provider.connectors["bithumb"].get_available_balance.return_value = Decimal("12")
+        self.mock_market_data_provider.connectors["upbit"].get_available_balance.return_value = Decimal("0")
+        self.controller.executors_info = [
+            SimpleNamespace(id="buy-xemm", is_done=False, side=TradeType.BUY, config=SimpleNamespace(target_profitability=Decimal("0.001"), type="xemm_executor")),
+            SimpleNamespace(id="sell-xemm", is_done=False, side=TradeType.SELL, config=SimpleNamespace(target_profitability=Decimal("0.001"), type="xemm_executor")),
+        ]
+
+        prices = {
+            ("bithumb", PriceType.BestBid): Decimal("100"),
+            ("bithumb", PriceType.BestAsk): Decimal("101"),
+            ("upbit", PriceType.BestBid): Decimal("99"),
+            ("upbit", PriceType.BestAsk): Decimal("100"),
+            ("bithumb", PriceType.MidPrice): Decimal("100.5"),
+            ("upbit", PriceType.MidPrice): Decimal("99.5"),
+        }
+        self.mock_market_data_provider.get_price_by_type.side_effect = (
+            lambda connector, trading_pair, price_type: prices[(connector, price_type)]
+        )
+
+        actions = self.controller.determine_executor_actions()
+
+        self.assertEqual(1, len(actions))
+        rebalance_action = actions[0]
+        self.assertEqual("inventory_rebalance_executor", rebalance_action.executor_config.type)
+        self.assertEqual("bithumb", rebalance_action.executor_config.entry_market.connector_name)
+        self.assertEqual("upbit", rebalance_action.executor_config.hedge_market.connector_name)
+        self.assertEqual(TradeType.SELL, rebalance_action.executor_config.entry_side)
+        self.assertEqual("passive", rebalance_action.executor_config.entry_style)
+        self.assertGreater(rebalance_action.executor_config.expected_pnl_quote, Decimal("0"))
+        self.assertEqual(Decimal("5"), rebalance_action.executor_config.order_amount)
+
+    def test_inventory_rebalance_hard_band_allows_aggressive_candidate(self):
+        self.controller.config.inventory_rebalance_enabled = True
+        self.controller.config.inventory_rebalance_hard_band_base = Decimal("6")
+        self.controller.config.inventory_rebalance_soft_band_base = Decimal("2")
+        self.controller.config.inventory_rebalance_min_slice_base = Decimal("1")
+        self.controller.config.inventory_rebalance_max_slice_base = Decimal("10")
+        self.controller.config.inventory_rebalance_min_expected_pnl_quote = Decimal("0")
+        self.controller.config.inventory_rebalance_entry_slippage_buffer_bps = Decimal("0")
+        self.controller.config.inventory_rebalance_hedge_slippage_buffer_bps = Decimal("0")
+        self.controller.config.max_executors_per_side = 1
+        self.mock_market_data_provider.connectors["bithumb"].get_available_balance.return_value = Decimal("12")
+        self.mock_market_data_provider.connectors["upbit"].get_available_balance.return_value = Decimal("0")
+        self.controller.executors_info = [
+            SimpleNamespace(id="buy-xemm", is_done=False, side=TradeType.BUY, config=SimpleNamespace(target_profitability=Decimal("0.001"), type="xemm_executor")),
+            SimpleNamespace(id="sell-xemm", is_done=False, side=TradeType.SELL, config=SimpleNamespace(target_profitability=Decimal("0.001"), type="xemm_executor")),
+        ]
+
+        prices = {
+            ("bithumb", PriceType.BestBid): Decimal("100"),
+            ("upbit", PriceType.BestAsk): Decimal("99"),
+            ("bithumb", PriceType.MidPrice): Decimal("100.5"),
+            ("upbit", PriceType.MidPrice): Decimal("99"),
+        }
+        self.mock_market_data_provider.get_price_by_type.side_effect = (
+            lambda connector, trading_pair, price_type: prices.get((connector, price_type))
+        )
+
+        actions = self.controller.determine_executor_actions()
+
+        self.assertEqual(1, len(actions))
+        rebalance_action = actions[0]
+        self.assertEqual("inventory_rebalance_executor", rebalance_action.executor_config.type)
+        self.assertEqual("aggressive", rebalance_action.executor_config.entry_style)
+        self.assertIn(rebalance_action.executor_config.entry_market.connector_name, {"bithumb", "upbit"})
+        self.assertIn(rebalance_action.executor_config.entry_side, {TradeType.BUY, TradeType.SELL})
+
+    def test_active_inventory_rebalance_suppresses_only_worsening_xemm_side(self):
+        self.controller.config.inventory_rebalance_enabled = True
+        self.controller.config.inventory_rebalance_hard_band_base = Decimal("6")
+        self.controller.config.inventory_rebalance_soft_band_base = Decimal("2")
+        self.controller.config.max_executors_per_side = 2
+        self.mock_market_data_provider.connectors["bithumb"].get_available_balance.return_value = Decimal("12")
+        self.mock_market_data_provider.connectors["upbit"].get_available_balance.return_value = Decimal("0")
+        self.controller.executors_info = [
+            SimpleNamespace(
+                id="rebalance-1",
+                is_done=False,
+                side=TradeType.SELL,
+                type="inventory_rebalance_executor",
+                custom_info={"inventory_rebalance_reduces_delta": True},
+                config=SimpleNamespace(type="inventory_rebalance_executor"),
+            )
+        ]
+
+        actions = self.controller.determine_executor_actions()
+
+        create_actions = [action for action in actions if isinstance(action, CreateExecutorAction)]
+        self.assertGreater(len(create_actions), 0)
+        self.assertTrue(all(action.executor_config.type != "inventory_rebalance_executor" for action in create_actions))
+        self.assertTrue(all(action.executor_config.maker_side == TradeType.SELL for action in create_actions))
+
     def test_quote_mismatch_raises_validation_error(self):
         with self.assertRaises(ValueError):
             UpbitBithumbXemmControllerConfig(
@@ -563,6 +664,27 @@ class TestUpbitBithumbXemmController(IsolatedAsyncioWrapperTestCase):
         self.assertIsNotNone(self.controller._transfer_delay_started_ts)
         self.assertIsNotNone(self.controller._transfer_delay_deadline_ts)
 
+    async def test_transfer_trigger_uses_min_destination_balance_floor(self):
+        self.controller.config.transfer_delay_before_submit_sec = 180.0
+        self.controller.config.transfer_route_key_maker_to_taker = "bithumb-upbit-xrp"
+        self.controller.config.transfer_global_lock_enabled = False
+        self.controller.config.transfer_state_file_path = f"{self.temp_dir.name}/state_{{controller_id}}.json"
+        self.controller.config.transfer_rebalance_enabled = True
+        self.controller.config.transfer_min_destination_balance_base = Decimal("400")
+        self.mock_market_data_provider.connectors["bithumb"].get_available_balance.return_value = Decimal("1000")
+        self.mock_market_data_provider.connectors["upbit"].get_available_balance.return_value = Decimal("250")
+        fake_client = _FakeTransferClient()
+        self.controller._transfer_client = fake_client
+        self.controller._transfer_client_ready = True
+
+        await self.controller.update_processed_data()
+
+        self.assertEqual(RebalanceState.DELAYING, self.controller._rebalance_state)
+        self.assertEqual(TradeType.BUY, self.controller._paused_side)
+        self.assertEqual("maker_to_taker", self.controller._transfer_direction)
+        self.assertEqual(Decimal("400"), self.controller._transfer_required_base_threshold)
+        self.assertEqual(0, len(fake_client.sent_signals))
+
     async def test_delaying_expires_then_submits_transfer(self):
         self.controller.config.transfer_target_buffer_base = Decimal("100")
         self.controller.config.transfer_min_amount_base = Decimal("250")
@@ -591,6 +713,34 @@ class TestUpbitBithumbXemmController(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(1, len(fake_client.sent_signals))
         self.assertEqual(RebalanceState.IN_FLIGHT, self.controller._rebalance_state)
+
+    async def test_delaying_expiry_clears_when_submission_cannot_start(self):
+        self.controller.config.transfer_target_buffer_base = Decimal("100")
+        self.controller.config.transfer_min_amount_base = Decimal("250")
+        self.controller.config.transfer_max_amount_base = Decimal("350")
+        self.controller.config.transfer_amount_quantum_base = Decimal("0.1")
+        self.controller.config.transfer_source_balance_reserve_base = Decimal("20")
+        self.controller.config.transfer_delay_before_submit_sec = 180.0
+        self.controller.config.transfer_route_key_maker_to_taker = "bithumb-upbit-xrp"
+        self.controller.config.transfer_global_lock_enabled = False
+        self.controller.config.transfer_state_file_path = f"{self.temp_dir.name}/state_{{controller_id}}.json"
+        self.controller.config.transfer_rebalance_enabled = True
+        fake_client = _FakeTransferClient()
+        self.controller._transfer_client = fake_client
+        self.controller._transfer_client_ready = True
+
+        self.mock_market_data_provider.time.return_value = 100.0
+        self.mock_market_data_provider.connectors["bithumb"].get_available_balance.return_value = Decimal("10")
+        self.mock_market_data_provider.connectors["upbit"].get_available_balance.return_value = Decimal("1")
+        await self.controller.update_processed_data()
+        self.assertEqual(RebalanceState.DELAYING, self.controller._rebalance_state)
+
+        self.mock_market_data_provider.time.return_value = 281.0
+        await self.controller.update_processed_data()
+
+        self.assertEqual(0, len(fake_client.sent_signals))
+        self.assertEqual(RebalanceState.IDLE, self.controller._rebalance_state)
+        self.assertIsNone(self.controller._paused_side)
 
     async def test_delaying_clears_when_shortage_recovers(self):
         self.controller.config.transfer_delay_before_submit_sec = 180.0
@@ -841,7 +991,7 @@ class TestUpbitBithumbXemmController(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(RebalanceState.WAITING_RECOVERY, self.controller._rebalance_state)
 
-    async def test_forced_resume_on_recovery_deadline(self):
+    async def test_recovery_deadline_keeps_pause_until_balance_recovers(self):
         self.controller.config.transfer_route_key_maker_to_taker = "upbit-bithumb-btc"
         self.controller.config.transfer_global_lock_enabled = False
         self.controller.config.transfer_recovery_max_wait_sec = 10
@@ -860,9 +1010,9 @@ class TestUpbitBithumbXemmController(IsolatedAsyncioWrapperTestCase):
 
         await self.controller.update_processed_data()
 
-        # Issue A fix: recovery deadline → IDLE (not ERROR)
-        self.assertEqual(RebalanceState.IDLE, self.controller._rebalance_state)
-        self.assertIsNone(self.controller._paused_side)
+        self.assertEqual(RebalanceState.WAITING_RECOVERY, self.controller._rebalance_state)
+        self.assertEqual(TradeType.BUY, self.controller._paused_side)
+        self.assertIn("keeping transfer pause active", self.controller._transfer_last_error)
 
     async def test_cooldown_to_idle_transition(self):
         self.controller.config.transfer_route_key_maker_to_taker = "upbit-bithumb-btc"
@@ -1216,6 +1366,81 @@ class TestUpbitBithumbXemmController(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(TradeType.BUY, controller._paused_side)
         self.assertEqual(100.0, controller._transfer_delay_started_ts)
         self.assertEqual(280.0, controller._transfer_delay_deadline_ts)
+
+    def test_restore_delaying_reclaims_same_controller_abandoned_lock(self):
+        lock_dir = tempfile.mkdtemp(dir=self.temp_dir.name)
+        state_file_path = f"{self.temp_dir.name}/state_delay_reclaim_{{controller_id}}.json"
+        controller_id = "test-delay-reclaim"
+        store = TransferRebalanceStateStore(path_template=state_file_path, controller_id=controller_id)
+        store.save(
+            RebalanceSnapshot(
+                version=1,
+                state="DELAYING",
+                request_id=None,
+                direction="maker_to_taker",
+                paused_side="BUY",
+                amount=None,
+                cycle_id=None,
+                event_id=None,
+                transfer_start_ts=None,
+                retry_at=None,
+                recovery_started_ts=None,
+                last_error=None,
+                last_qtg_state=None,
+                lock_key=None,
+                delay_started_ts=100.0,
+                delay_deadline_ts=130.0,
+            )
+        )
+
+        stale_owner = f"999:oldowner:{controller_id}"
+        lease = TransferGlobalLease(lock_dir=lock_dir, ttl_seconds=3600.0)
+        lock_key = "XRP:bithumb:upbit"
+        self.assertTrue(lease.acquire(lock_key=lock_key, owner_id=stale_owner))
+        self.assertTrue(os.path.exists(lease._lock_path(lock_key)))
+
+        config = UpbitBithumbXemmControllerConfig(
+            id=controller_id,
+            maker_connector="bithumb",
+            maker_trading_pair="XRP-KRW",
+            taker_connector="upbit",
+            taker_trading_pair="XRP-KRW",
+            transfer_rebalance_enabled=True,
+            transfer_delay_before_submit_sec=30.0,
+            transfer_route_key_maker_to_taker="bithumb-upbit-xrp",
+            transfer_route_key_taker_to_maker="upbit-bithumb-xrp",
+            transfer_global_lock_enabled=True,
+            transfer_global_lock_dir_path=lock_dir,
+            transfer_global_lock_ttl_sec=3600.0,
+            transfer_state_file_path=state_file_path,
+        )
+        controller = UpbitBithumbXemmController(
+            config=config,
+            market_data_provider=self.mock_market_data_provider,
+            actions_queue=self.mock_actions_queue,
+        )
+
+        self.assertEqual(RebalanceState.DELAYING, controller._rebalance_state)
+        self.assertFalse(os.path.exists(lease._lock_path(lock_key)))
+
+    def test_acquire_transfer_lock_sets_detailed_error_when_busy(self):
+        lock_dir = tempfile.mkdtemp(dir=self.temp_dir.name)
+        lease = TransferGlobalLease(lock_dir=lock_dir, ttl_seconds=3600.0)
+        lock_key = "BTC:bithumb:upbit"
+        self.assertTrue(lease.acquire(lock_key=lock_key, owner_id="owner-old"))
+
+        self.controller.config.transfer_rebalance_enabled = True
+        self.controller.config.transfer_global_lock_enabled = True
+        self.controller.config.transfer_route_key_maker_to_taker = "bithumb-upbit-btc"
+        self.controller._transfer_global_lease = lease
+        self.controller._transfer_lock_key = None
+
+        acquired = self.controller._acquire_transfer_lock("maker_to_taker")
+
+        self.assertFalse(acquired)
+        self.assertIn("transfer global lock busy", self.controller._transfer_last_error)
+        self.assertIn("owner=owner-old", self.controller._transfer_last_error)
+        self.assertIn(f"key={lock_key}", self.controller._transfer_last_error)
 
     def test_old_snapshot_without_delay_fields_still_loads(self):
         state_file_path = Path(self.temp_dir.name) / "state_old_schema_test.json"
