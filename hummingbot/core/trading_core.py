@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 
 from sqlalchemy.orm import Query, Session
 
+from hummingbot.client import settings
 from hummingbot.client.config.client_config_map import ClientConfigMap
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.client.config.config_helpers import ClientConfigAdapter, get_strategy_starter_file
@@ -492,8 +493,13 @@ class TradingCore:
             # Start the trading execution loop
             await self._start_strategy_execution()
 
-            # Start rate oracle (required for PNL calculation)
-            RateOracle.get_instance().start()
+            # Start rate oracle only for strategies that explicitly require FX/oracle conversion.
+            # Our KRW-based local XEMM / inventory rebalance flows do not need the global oracle,
+            # and leaving it off avoids third-party rate-source churn (e.g. CoinGecko 429 loops).
+            if settings.required_rate_oracle:
+                RateOracle.get_instance().start()
+            else:
+                self.logger().info("Skipping RateOracle startup because the active strategy does not require it.")
 
             self._strategy_running = True
 

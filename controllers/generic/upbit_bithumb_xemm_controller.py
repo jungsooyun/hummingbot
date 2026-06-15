@@ -1,6 +1,7 @@
 import asyncio
 import math
 import os
+import time
 import uuid
 from collections import deque
 from decimal import Decimal
@@ -349,6 +350,9 @@ class UpbitBithumbXemmControllerConfig(ControllerConfigBase):
     transfer_guard_approval_secret_env: str = Field(default="QTG_APPROVAL_HMAC_SECRET", json_schema_extra={"is_updatable": True})
     transfer_guard_read_key_id: str = Field(default="", json_schema_extra={"is_updatable": True})
     transfer_guard_read_secret_env: str = Field(default="QTG_READ_HMAC_SECRET", json_schema_extra={"is_updatable": True})
+    transfer_guard_admin_key_id: str = Field(default="", json_schema_extra={"is_updatable": True})
+    transfer_guard_admin_secret_env: str = Field(default="QTG_ADMIN_HMAC_SECRET", json_schema_extra={"is_updatable": True})
+    transfer_route_pause_precheck_enabled: bool = Field(default=False, json_schema_extra={"is_updatable": True})
     transfer_route_key_maker_to_taker: str = Field(default="", json_schema_extra={"is_updatable": True})
     transfer_route_key_taker_to_maker: str = Field(default="", json_schema_extra={"is_updatable": True})
     transfer_target_buffer_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
@@ -1806,6 +1810,16 @@ class UpbitBithumbXemmController(ControllerBase):
             return
         current_time = self.market_data_provider.time()
         try:
+            route_allowed, route_reason = await self._precheck_transfer_route(route_key=route_key)
+            if not route_allowed:
+                self.logger().info(
+                    f"Skipping transfer signal because paused-route precheck blocked {route_key}: {route_reason}"
+                )
+                self._enter_cooldown(
+                    reason=route_reason or f"QTG route precheck blocked transfer: {route_key}",
+                    now=current_time,
+                )
+                return
             signal_result: SignalResult = await self._transfer_client.send_signal(
                 route_key=route_key,
                 amount=amount,
@@ -1865,6 +1879,21 @@ class UpbitBithumbXemmController(ControllerBase):
         except Exception as e:
             self._enter_error(f"Unexpected transfer signal/approval error: {e}")
 
+    async def _precheck_transfer_route(self, *, route_key: str) -> Tuple[bool, Optional[str]]:
+        if not self.config.transfer_route_pause_precheck_enabled:
+            return True, None
+        if self._transfer_client is None:
+            return False, "TransferGuardClient is not initialized"
+        route = await self._transfer_client.get_route_by_key(route_key=route_key)
+        if route is None:
+            return False, f"QTG route not found during paused-route precheck: {route_key}"
+        if not route.enabled:
+            return False, f"QTG route disabled during paused-route precheck: {route_key}"
+        if route.is_paused:
+            pause_reason = route.pause_reason or "no pause reason provided"
+            return False, f"QTG route paused during precheck: {route_key} ({pause_reason})"
+        return True, None
+
     async def _resolve_conflicted_request(self):
         if self._transfer_client is None or self._active_transfer_request_id is None:
             self._enter_error("Approval conflict without active request id")
@@ -1923,10 +1952,16 @@ class UpbitBithumbXemmController(ControllerBase):
         self._transfer_last_error = reason
         self._active_transfer_request_id = None
         self._transfer_recovery_started_ts = None
-        self._clear_transfer_pause_state()
+        if not self._should_preserve_transfer_pause_on_cooldown(reason):
+            self._clear_transfer_pause_state()
         self._clear_transfer_delay_state()
         self._release_transfer_lock(force=False)
         self._save_transfer_state()
+
+    @staticmethod
+    def _should_preserve_transfer_pause_on_cooldown(reason: str) -> bool:
+        normalized = (reason or "").lower()
+        return normalized.startswith("qtg route paused during precheck:")
 
     def _enter_error(self, reason: str):
         self._rebalance_state = RebalanceState.ERROR
@@ -1991,6 +2026,7 @@ class UpbitBithumbXemmController(ControllerBase):
         signal_secret = os.getenv(self.config.transfer_guard_signal_secret_env, "")
         approval_secret = os.getenv(self.config.transfer_guard_approval_secret_env, "")
         read_secret = os.getenv(self.config.transfer_guard_read_secret_env, "")
+        admin_secret = os.getenv(self.config.transfer_guard_admin_secret_env, "")
         if not (
             self.config.transfer_guard_signal_key_id and
             self.config.transfer_guard_approval_key_id and
@@ -1999,11 +2035,18 @@ class UpbitBithumbXemmController(ControllerBase):
         ):
             self._transfer_last_error = "Missing QTG credential configuration for transfer rebalance"
             return False
+        if self.config.transfer_route_pause_precheck_enabled and not (
+            self.config.transfer_guard_admin_key_id and admin_secret
+        ):
+            self._transfer_last_error = "Missing QTG admin credential configuration for paused-route precheck"
+            return False
         keys = {
             "signal": (self.config.transfer_guard_signal_key_id, signal_secret),
             "approval": (self.config.transfer_guard_approval_key_id, approval_secret),
             "read": (self.config.transfer_guard_read_key_id, read_secret),
         }
+        if self.config.transfer_guard_admin_key_id and admin_secret:
+            keys["admin"] = (self.config.transfer_guard_admin_key_id, admin_secret)
         self._transfer_client = TransferGuardClient(
             base_url=self.config.transfer_guard_base_url,
             keys=keys,

@@ -269,11 +269,30 @@ class TradingCoreTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(self.trading_core.strategy_name, "test_script")
         self.assertEqual(self.trading_core._strategy_file_name, "config.yml")
         self.assertTrue(self.trading_core._strategy_running)
-        mock_oracle_instance.start.assert_called_once()
+        mock_oracle_instance.start.assert_not_called()
 
         # Test starting when already running
         result = await self.trading_core.start_strategy("another_script")
         self.assertFalse(result)
+
+    @patch.object(TradingCore, "_start_strategy_execution")
+    @patch.object(TradingCore, "_initialize_script_strategy")
+    @patch.object(TradingCore, "detect_strategy_type")
+    @patch("hummingbot.core.trading_core.RateOracle")
+    async def test_start_strategy_starts_rate_oracle_only_when_required(
+        self, mock_rate_oracle, mock_detect, mock_init_script, mock_start_exec
+    ):
+        mock_detect.return_value = StrategyType.SCRIPT
+        mock_init_script.return_value = None
+        mock_start_exec.return_value = None
+        mock_oracle_instance = Mock()
+        mock_rate_oracle.get_instance.return_value = mock_oracle_instance
+
+        with patch("hummingbot.core.trading_core.settings.required_rate_oracle", True):
+            result = await self.trading_core.start_strategy("test_script", "config.yml", "config.yml")
+
+        self.assertTrue(result)
+        mock_oracle_instance.start.assert_called_once()
 
     async def test_stop_strategy(self):
         """Test stopping a strategy"""

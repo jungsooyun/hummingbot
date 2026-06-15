@@ -69,6 +69,15 @@ class RequestStatus:
     updated_at: Optional[str] = None
 
 
+@dataclass
+class RouteStatus:
+    route_id: str
+    route_key: str
+    enabled: bool
+    is_paused: bool
+    pause_reason: Optional[str] = None
+
+
 def build_canonical_string(
     *,
     method: str,
@@ -177,6 +186,24 @@ class TransferGuardClient:
             updated_at=data.get("updated_at"),
         )
 
+    async def get_route_by_key(self, *, route_key: str) -> Optional[RouteStatus]:
+        data = await self._request("admin", "GET", "/v1/routes")
+        if not isinstance(data, list):
+            raise TransferGuardError("Unexpected routes response")
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("route_key")) != route_key:
+                continue
+            return RouteStatus(
+                route_id=str(entry.get("id")),
+                route_key=str(entry.get("route_key")),
+                enabled=bool(entry.get("enabled", False)),
+                is_paused=bool(entry.get("is_paused", False)),
+                pause_reason=entry.get("pause_reason"),
+            )
+        return None
+
     async def _request(
         self,
         purpose: str,
@@ -184,7 +211,7 @@ class TransferGuardClient:
         path: str,
         payload: Optional[dict] = None,
         query: Optional[Mapping[str, Any]] = None,
-    ) -> dict:
+    ) -> Any:
         if self._session is None:
             self._session = aiohttp.ClientSession()
 
@@ -226,7 +253,7 @@ class TransferGuardClient:
         except (aiohttp.ClientError, TimeoutError) as e:
             raise NetworkError(f"Network error while calling {method} {request_path}: {e}") from e
 
-        data: dict = {}
+        data: Any = {}
         if text:
             try:
                 data = json.loads(text)
@@ -267,7 +294,7 @@ class TransferGuardClient:
         }
 
     @staticmethod
-    def _raise_for_status(*, status: int, data: dict, method: str, path: str):
+    def _raise_for_status(*, status: int, data: Any, method: str, path: str):
         detail = data.get("detail") if isinstance(data, dict) else None
         message = f"QTG {method.upper()} {path} failed: status={status}, detail={detail}"
         if status == 401:

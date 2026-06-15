@@ -159,6 +159,9 @@ class XEMMExecutor(ExecutorBase):
         self._hedge_block_reason: str = ""
         self._last_hedge_guard_mode: str = "normal"
         self._early_stop_hedge_initiated: bool = False
+        self._known_maker_order_ids: set[str] = set()
+        self._maker_accounted_base_by_order_id: Dict[str, Decimal] = {}
+        self._maker_accounted_quote_by_order_id: Dict[str, Decimal] = {}
         # Bithumb self-trade prevention (STP) guard state
         self._stp_reject_streak: int = 0
         self._stp_dynamic_offset_ticks: int = max(1, int(self.config.bithumb_stp_base_offset_ticks))
@@ -178,7 +181,7 @@ class XEMMExecutor(ExecutorBase):
             self._acquire_connector_diag_handles()
 
     def _diag_enabled(self) -> bool:
-        return bool(getattr(self.config, "latency_diagnostics_enabled", False))
+        return False
 
     def _diag_connector_context(self, order_role: str) -> Dict[str, Any]:
         return {
@@ -719,6 +722,70 @@ class XEMMExecutor(ExecutorBase):
         self._unhedged_quote += executed_quote * sign
         self._last_fill_timestamp = self._strategy.current_timestamp
 
+    def _apply_maker_execution_delta(
+        self,
+        order_id: Optional[str],
+        executed_base: Decimal = None,
+        executed_quote: Decimal = None,
+        is_total: bool = False,
+    ) -> Decimal:
+        if not order_id or executed_base is None or executed_base.is_nan() or executed_base <= Decimal("0"):
+            return Decimal("0")
+
+        accounted_base = self._maker_accounted_base_by_order_id.get(order_id, Decimal("0"))
+        accounted_quote = self._maker_accounted_quote_by_order_id.get(order_id, Decimal("0"))
+
+        if is_total:
+            if executed_base <= accounted_base:
+                return Decimal("0")
+            delta_base = executed_base - accounted_base
+            if executed_quote is not None and not executed_quote.is_nan() and executed_quote > Decimal("0"):
+                total_quote = executed_quote
+                delta_quote = total_quote - accounted_quote if total_quote > accounted_quote else Decimal("0")
+                self._maker_accounted_quote_by_order_id[order_id] = total_quote
+            else:
+                avg_price = None
+                if self.maker_order and self.maker_order.order_id == order_id:
+                    if self.maker_order.average_executed_price and not self.maker_order.average_executed_price.is_nan():
+                        avg_price = self.maker_order.average_executed_price
+                    elif self.maker_order.price and not self.maker_order.price.is_nan():
+                        avg_price = self.maker_order.price
+                delta_quote = (avg_price * delta_base) if avg_price is not None else Decimal("0")
+                self._maker_accounted_quote_by_order_id[order_id] = accounted_quote + delta_quote
+            self._maker_accounted_base_by_order_id[order_id] = executed_base
+        else:
+            delta_base = executed_base
+            delta_quote = (
+                executed_quote
+                if executed_quote is not None and not executed_quote.is_nan() and executed_quote > Decimal("0")
+                else Decimal("0")
+            )
+            self._maker_accounted_base_by_order_id[order_id] = accounted_base + delta_base
+            self._maker_accounted_quote_by_order_id[order_id] = accounted_quote + delta_quote
+
+        if delta_base <= Decimal("0"):
+            return Decimal("0")
+
+        self._record_maker_fill(executed_base=delta_base, executed_quote=delta_quote)
+        return delta_base
+
+    def _mark_shutdown_after_maker_fill(self, filled_order_id: Optional[str]) -> None:
+        if self.close_type == CloseType.EARLY_STOP:
+            return
+        self._current_retries = 0
+        self._status = RunnableStatus.SHUTTING_DOWN
+        if (
+            self.maker_order is not None
+            and self.maker_order.order_id != filled_order_id
+            and self._tracked_order_is_open(self.maker_order)
+            and not self._maker_cancel_in_flight
+        ):
+            self.logger().warning(
+                f"Late maker fill detected for {filled_order_id}. Cancelling active maker order "
+                f"{self.maker_order.order_id} before hedging."
+            )
+            self.request_maker_cancel(reason=f"late_fill_detected:{filled_order_id}")
+
     def _use_market_hedge_on_early_stop(self) -> bool:
         return str(self.config.stale_fill_hedge_mode).lower() == "market"
 
@@ -1112,6 +1179,7 @@ class XEMMExecutor(ExecutorBase):
             metadata={"order_role": "maker"},
         )
         self.maker_order = TrackedOrder(order_id=order_id)
+        self._known_maker_order_ids.add(order_id)
         self._shadow_prefill_cross_order_active = True
         self._shadow_prefill_stage_started_ts = self._strategy.current_timestamp
         self.logger().warning(
@@ -1323,6 +1391,7 @@ class XEMMExecutor(ExecutorBase):
             price=maker_price,
             metadata={"order_role": "maker"})
         self.maker_order = TrackedOrder(order_id=order_id)
+        self._known_maker_order_ids.add(order_id)
         self._register_tracked_order_diag_context(self.maker_connector, self.maker_order, order_role="maker")
         self.logger().info(f"Created maker order {order_id} at price {maker_price}.")
         self._log_maker_transition(
@@ -1372,7 +1441,11 @@ class XEMMExecutor(ExecutorBase):
             await self._refresh_taker_limit_order()
             return
 
-        if self.maker_order is not None and self.maker_order.is_done and (self.taker_order is None):
+        if (
+            self.taker_order is None
+            and self._unhedged_base != Decimal("0")
+            and (self.maker_order is None or self.maker_order.is_done or not self._tracked_order_is_open(self.maker_order))
+        ):
             await self._maybe_place_taker_after_fill()
 
         maker_done = self.maker_order is not None and self.maker_order.is_done
@@ -1787,6 +1860,7 @@ class XEMMExecutor(ExecutorBase):
         if self.maker_order and event.order_id == self.maker_order.order_id:
             self.logger().info(f"Maker order {event.order_id} created.")
             self.maker_order.order = self.get_in_flight_order(self.maker_connector, event.order_id)
+            self._known_maker_order_ids.add(event.order_id)
             self._maker_post_create_grace_until_ts = self._strategy.current_timestamp + self._maker_post_create_grace_sec
             self._register_tracked_order_diag_context(self.maker_connector, self.maker_order, order_role="maker")
             self._reset_stp_state_on_success()
@@ -1807,7 +1881,10 @@ class XEMMExecutor(ExecutorBase):
                                    event_tag: int,
                                    market: ConnectorBase,
                                    event: OrderFilledEvent):
-        if self.maker_order and event.order_id == self.maker_order.order_id:
+        if (
+            (self.maker_order and event.order_id == self.maker_order.order_id)
+            or event.order_id in self._known_maker_order_ids
+        ):
             self._log_maker_transition(
                 "fill",
                 event=self._event_snapshot(event),
@@ -1817,6 +1894,15 @@ class XEMMExecutor(ExecutorBase):
                     event_quote=(event.amount * event.price) if event.price is not None else None,
                 ),
             )
+            self._known_maker_order_ids.add(event.order_id)
+            delta_base = self._apply_maker_execution_delta(
+                order_id=event.order_id,
+                executed_base=getattr(event, "amount", None),
+                executed_quote=(event.amount * event.price) if event.price is not None else None,
+                is_total=False,
+            )
+            if delta_base > Decimal("0"):
+                self._mark_shutdown_after_maker_fill(event.order_id)
         elif self.taker_order and event.order_id == self.taker_order.order_id:
             self._log_taker_transition(
                 "fill",
@@ -1846,11 +1932,19 @@ class XEMMExecutor(ExecutorBase):
                                       event_tag: int,
                                       market: ConnectorBase,
                                       event: Union[BuyOrderCompletedEvent, SellOrderCompletedEvent]):
-        if self.maker_order and event.order_id == self.maker_order.order_id:
+        if (
+            (self.maker_order and event.order_id == self.maker_order.order_id)
+            or event.order_id in self._known_maker_order_ids
+        ):
             event_executed_base = getattr(event, "base_asset_amount", Decimal("0"))
             event_executed_quote = getattr(event, "quote_asset_amount", Decimal("0"))
             if not self._shadow_prefill_mode:
-                self._record_maker_fill(executed_base=event_executed_base, executed_quote=event_executed_quote)
+                self._apply_maker_execution_delta(
+                    order_id=event.order_id,
+                    executed_base=event_executed_base,
+                    executed_quote=event_executed_quote,
+                    is_total=True,
+                )
             self._log_maker_transition(
                 "completed",
                 event=self._event_snapshot(event),
@@ -1908,9 +2002,7 @@ class XEMMExecutor(ExecutorBase):
                 return
             self.logger().info(f"Maker order {event.order_id} completed. Executing taker order.")
             self._maker_cancel_in_flight = False
-            self._current_retries = 0
-            # Taker will be placed in shutdown control with guard
-            self._status = RunnableStatus.SHUTTING_DOWN
+            self._mark_shutdown_after_maker_fill(event.order_id)
         elif self.taker_order and event.order_id == self.taker_order.order_id:
             self.logger().info(f"Taker order {event.order_id} completed.")
             self._taker_cancel_in_flight = False

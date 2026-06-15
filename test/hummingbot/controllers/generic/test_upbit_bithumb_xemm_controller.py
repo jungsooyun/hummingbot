@@ -23,13 +23,25 @@ from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction,
 
 
 class _FakeTransferClient:
-    def __init__(self, signal_state="PENDING_APPROVAL", approval_state="READY_FOR_EXECUTION", request_state="WITHDRAWAL_SUBMITTED"):
+    def __init__(
+        self,
+        signal_state="PENDING_APPROVAL",
+        approval_state="READY_FOR_EXECUTION",
+        request_state="WITHDRAWAL_SUBMITTED",
+        route_enabled=True,
+        route_is_paused=False,
+        route_pause_reason=None,
+    ):
         self.signal_state = signal_state
         self.approval_state = approval_state
         self.request_state = request_state
+        self.route_enabled = route_enabled
+        self.route_is_paused = route_is_paused
+        self.route_pause_reason = route_pause_reason
         self.sent_signals = []
         self.approvals = []
         self.requests = []
+        self.route_checks = []
 
     async def send_signal(self, route_key, amount, signal_type, event_id, metadata, callback_url=None):
         self.sent_signals.append(
@@ -64,6 +76,16 @@ class _FakeTransferClient:
             to_exchange="bithumb",
             created_at=None,
             updated_at=None,
+        )
+
+    async def get_route_by_key(self, route_key):
+        self.route_checks.append(route_key)
+        return SimpleNamespace(
+            route_id="route-1",
+            route_key=route_key,
+            enabled=self.route_enabled,
+            is_paused=self.route_is_paused,
+            pause_reason=self.route_pause_reason,
         )
 
     async def close(self):
@@ -901,6 +923,29 @@ class TestUpbitBithumbXemmController(IsolatedAsyncioWrapperTestCase):
         self.assertIsNone(self.controller._paused_side)
         self.assertIsNone(self.controller._transfer_direction)
 
+    async def test_paused_route_precheck_blocks_signal_submission(self):
+        self.controller.config.transfer_route_key_maker_to_taker = "upbit-bithumb-btc"
+        self.controller.config.transfer_route_pause_precheck_enabled = True
+        self.controller.config.transfer_global_lock_enabled = False
+        self.controller.config.transfer_state_file_path = f"{self.temp_dir.name}/state_{{controller_id}}.json"
+        self.controller.config.transfer_rebalance_enabled = True
+        self.mock_market_data_provider.connectors["bithumb"].get_available_balance.return_value = Decimal("10")
+        self.mock_market_data_provider.connectors["upbit"].get_available_balance.return_value = Decimal("1")
+        fake_client = _FakeTransferClient(route_is_paused=True, route_pause_reason="daily withdrawal exhausted")
+        self.controller._transfer_client = fake_client
+        self.controller._transfer_client_ready = True
+
+        await self.controller.update_processed_data()
+        await asyncio.sleep(0)
+        await self.controller.update_processed_data()
+
+        self.assertEqual(RebalanceState.COOLDOWN, self.controller._rebalance_state)
+        self.assertEqual(["upbit-bithumb-btc"], fake_client.route_checks)
+        self.assertEqual(0, len(fake_client.sent_signals))
+        self.assertEqual(TradeType.BUY, self.controller._paused_side)
+        self.assertEqual("maker_to_taker", self.controller._transfer_direction)
+        self.assertIn("route paused during precheck", self.controller._transfer_last_error.lower())
+
     async def test_in_flight_timeout_to_error(self):
         self.controller.config.transfer_route_key_maker_to_taker = "upbit-bithumb-btc"
         self.controller.config.transfer_global_lock_enabled = False
@@ -1429,9 +1474,9 @@ class TestUpbitBithumbXemmController(IsolatedAsyncioWrapperTestCase):
         lock_key = "BTC:bithumb:upbit"
         self.assertTrue(lease.acquire(lock_key=lock_key, owner_id="owner-old"))
 
+        self.controller.config.transfer_route_key_maker_to_taker = "bithumb-upbit-btc"
         self.controller.config.transfer_rebalance_enabled = True
         self.controller.config.transfer_global_lock_enabled = True
-        self.controller.config.transfer_route_key_maker_to_taker = "bithumb-upbit-btc"
         self.controller._transfer_global_lease = lease
         self.controller._transfer_lock_key = None
 
