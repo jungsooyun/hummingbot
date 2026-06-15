@@ -18,6 +18,7 @@ from hummingbot.strategy_v2.executors.data_types import PositionSummary
 from hummingbot.strategy_v2.executors.dca_executor.dca_executor import DCAExecutor
 from hummingbot.strategy_v2.executors.grid_executor.grid_executor import GridExecutor
 from hummingbot.strategy_v2.executors.inventory_rebalance_executor.inventory_rebalance_executor import InventoryRebalanceExecutor
+from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_maker_executor import LadderMakerExecutor
 from hummingbot.strategy_v2.executors.lp_executor.lp_executor import LPExecutor
 from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
 from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
@@ -144,6 +145,7 @@ class ExecutorOrchestrator:
         "inventory_rebalance_executor": InventoryRebalanceExecutor,
         "order_executor": OrderExecutor,
         "lp_executor": LPExecutor,
+        "ladder_maker_executor": LadderMakerExecutor,
     }
 
     @classmethod

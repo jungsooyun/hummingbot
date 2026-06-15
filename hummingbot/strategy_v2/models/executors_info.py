@@ -8,6 +8,7 @@ from hummingbot.strategy_v2.executors.arbitrage_executor.data_types import Arbit
 from hummingbot.strategy_v2.executors.dca_executor.data_types import DCAExecutorConfig
 from hummingbot.strategy_v2.executors.grid_executor.data_types import GridExecutorConfig
 from hummingbot.strategy_v2.executors.inventory_rebalance_executor.data_types import InventoryRebalanceExecutorConfig
+from hummingbot.strategy_v2.executors.ladder_maker_executor.data_types import LadderMakerExecutorConfig
 from hummingbot.strategy_v2.executors.lp_executor.data_types import LPExecutorConfig
 from hummingbot.strategy_v2.executors.order_executor.data_types import OrderExecutorConfig
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
@@ -26,6 +27,7 @@ AnyExecutorConfig = Union[
     OrderExecutorConfig,
     TWAPExecutorConfig,
     LPExecutorConfig,
+    LadderMakerExecutorConfig,
 ]
 
 
