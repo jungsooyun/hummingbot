@@ -1,33 +1,10 @@
-import asyncio
 import math
-import os
-import time
-import uuid
 from collections import deque
 from decimal import Decimal
 from typing import Deque, Dict, List, Literal, Optional, Set, Tuple
 
 from pydantic import Field, field_validator, model_validator
 
-from controllers.generic.transfer_global_lease import TransferGlobalLease
-from controllers.generic.transfer_guard_client import (
-    ApprovalResult,
-    AuthError,
-    ConflictError,
-    NetworkError,
-    NotFoundError,
-    RateLimitError,
-    RequestStatus,
-    ServerError,
-    SignalResult,
-    TransferGuardClient,
-    TransferGuardError,
-)
-from controllers.generic.transfer_rebalance_state import (
-    RebalanceSnapshot,
-    RebalanceState,
-    TransferRebalanceStateStore,
-)
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.data_type.common import MarketDict, OrderType, PriceType, TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -36,25 +13,6 @@ from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.executors.inventory_rebalance_executor.data_types import InventoryRebalanceExecutorConfig
 from hummingbot.strategy_v2.executors.xemm_executor.data_types import XEMMExecutorConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
-
-PENDING_STATES = {"PENDING_APPROVAL", "APPROVED", "READY_FOR_EXECUTION"}
-IN_FLIGHT_STATES = {
-    "WITHDRAWAL_SUBMITTING",
-    "WITHDRAWAL_SUBMITTED",
-    "WITHDRAWAL_PROCESSING",
-    "WITHDRAWAL_COMPLETED",
-    "DEPOSIT_PENDING",
-}
-SUCCESS_STATES = {"DEPOSIT_CREDITED", "COMPLETED"}
-TERMINAL_FAILURE_STATES = {
-    "FAILED",
-    "REJECTED",
-    "EXPIRED",
-    "WITHDRAWAL_FAILED",
-    "DEPOSIT_TIMEOUT",
-    "EXECUTION_SKIPPED",
-}
-UNKNOWN_STATES = {"WITHDRAWAL_UNKNOWN"}
 
 
 class _MidPriceBuffer:
@@ -338,44 +296,6 @@ class UpbitBithumbXemmControllerConfig(ControllerConfigBase):
         json_schema_extra={"prompt": "Treat pending-cancel orders as STP conflicts (True/False): ", "prompt_on_new": True, "is_updatable": True},
     )
 
-    transfer_rebalance_enabled: bool = Field(default=False, json_schema_extra={"is_updatable": True})
-    transfer_guard_base_url: str = Field(default="http://127.0.0.1:8100", json_schema_extra={"is_updatable": True})
-    transfer_guard_callback_url: str = Field(
-        default="http://dashboard:3001/api/qtg-callbacks/receive",
-        json_schema_extra={"is_updatable": True},
-    )
-    transfer_guard_signal_key_id: str = Field(default="", json_schema_extra={"is_updatable": True})
-    transfer_guard_signal_secret_env: str = Field(default="QTG_SIGNAL_HMAC_SECRET", json_schema_extra={"is_updatable": True})
-    transfer_guard_approval_key_id: str = Field(default="", json_schema_extra={"is_updatable": True})
-    transfer_guard_approval_secret_env: str = Field(default="QTG_APPROVAL_HMAC_SECRET", json_schema_extra={"is_updatable": True})
-    transfer_guard_read_key_id: str = Field(default="", json_schema_extra={"is_updatable": True})
-    transfer_guard_read_secret_env: str = Field(default="QTG_READ_HMAC_SECRET", json_schema_extra={"is_updatable": True})
-    transfer_guard_admin_key_id: str = Field(default="", json_schema_extra={"is_updatable": True})
-    transfer_guard_admin_secret_env: str = Field(default="QTG_ADMIN_HMAC_SECRET", json_schema_extra={"is_updatable": True})
-    transfer_route_pause_precheck_enabled: bool = Field(default=False, json_schema_extra={"is_updatable": True})
-    transfer_route_key_maker_to_taker: str = Field(default="", json_schema_extra={"is_updatable": True})
-    transfer_route_key_taker_to_maker: str = Field(default="", json_schema_extra={"is_updatable": True})
-    transfer_target_buffer_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
-    transfer_min_amount_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
-    transfer_max_amount_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
-    transfer_amount_quantum_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
-    transfer_source_balance_reserve_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
-    transfer_min_destination_balance_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
-    transfer_poll_interval_sec: float = Field(default=5.0, json_schema_extra={"is_updatable": True})
-    transfer_delay_before_submit_sec: float = Field(default=0.0, json_schema_extra={"is_updatable": True})
-    transfer_request_cooldown_sec: float = Field(default=60.0, json_schema_extra={"is_updatable": True})
-    transfer_request_timeout_sec: float = Field(default=1800.0, json_schema_extra={"is_updatable": True})
-    transfer_recovery_max_wait_sec: float = Field(default=300.0, json_schema_extra={"is_updatable": True})
-    transfer_state_file_path: str = Field(
-        default="/home/hummingbot/data/transfer_rebalance_state_{controller_id}.json",
-        json_schema_extra={"is_updatable": True},
-    )
-    transfer_global_lock_enabled: bool = Field(default=True, json_schema_extra={"is_updatable": True})
-    transfer_global_lock_dir_path: str = Field(
-        default="/home/hummingbot/data/transfer_rebalance_locks",
-        json_schema_extra={"is_updatable": True},
-    )
-    transfer_global_lock_ttl_sec: float = Field(default=3600.0, json_schema_extra={"is_updatable": True})
     inventory_rebalance_enabled: bool = Field(default=False, json_schema_extra={"is_updatable": True})
     inventory_rebalance_soft_band_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
     inventory_rebalance_hard_band_base: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
@@ -464,11 +384,6 @@ class UpbitBithumbXemmControllerConfig(ControllerConfigBase):
                 raise ValueError("opportunity_gate_enabled requires single buy/sell level configuration.")
             if self.max_executors_per_side > 1:
                 raise ValueError("opportunity_gate_enabled requires max_executors_per_side <= 1.")
-        if self.transfer_rebalance_enabled:
-            if not (self.transfer_route_key_maker_to_taker or self.transfer_route_key_taker_to_maker):
-                raise ValueError("At least one transfer_route_key must be configured when transfer_rebalance_enabled is true")
-        if self.transfer_delay_before_submit_sec < 0:
-            raise ValueError("transfer_delay_before_submit_sec must be >= 0")
         if self.inventory_rebalance_hard_band_base < self.inventory_rebalance_soft_band_base:
             raise ValueError("inventory_rebalance_hard_band_base must be >= inventory_rebalance_soft_band_base")
         if self.inventory_rebalance_min_slice_base < Decimal("0"):
@@ -514,53 +429,11 @@ class UpbitBithumbXemmController(ControllerBase):
         self._risk_pause_reason: str = ""
         self._risk_effective_session_pnl_quote: Decimal = Decimal("0")
         self._risk_unhedged_notional_quote: Decimal = Decimal("0")
-        self._transfer_stop_sent_executor_ids: Set[str] = set()
-        self._rebalance_state: RebalanceState = RebalanceState.IDLE
-        self._paused_side: Optional[TradeType] = None
-        self._transfer_direction: Optional[str] = None
-        self._active_transfer_request_id: Optional[str] = None
-        self._transfer_cycle_id: Optional[str] = None
-        self._transfer_event_id: Optional[str] = None
-        self._transfer_amount_base: Optional[Decimal] = None
-        self._transfer_started_ts: Optional[float] = None
-        self._transfer_delay_started_ts: Optional[float] = None
-        self._transfer_delay_deadline_ts: Optional[float] = None
-        self._transfer_retry_at: Optional[float] = None
-        self._transfer_recovery_started_ts: Optional[float] = None
-        self._transfer_required_base_threshold: Optional[Decimal] = None
-        self._transfer_last_poll_ts: float = 0.0
-        self._transfer_last_qtg_state: Optional[str] = None
-        self._transfer_last_error: Optional[str] = None
-        self._transfer_task: Optional[asyncio.Task] = None
-        self._transfer_poll_task: Optional[asyncio.Task] = None
-        self._transfer_client: Optional[TransferGuardClient] = None
-        self._transfer_client_ready: bool = False
         self._last_inventory_rebalance_creation_ts: float = 0.0
-        self._transfer_lock_owner: str = f"{os.getpid()}:{uuid.uuid4().hex[:8]}:{self._controller_id()}"
-        self._transfer_lock_key: Optional[str] = None
-        self._transfer_global_lease: Optional[TransferGlobalLease] = None
-        if self.config.transfer_rebalance_enabled and self.config.transfer_global_lock_enabled:
-            try:
-                self._transfer_global_lease = TransferGlobalLease(
-                    lock_dir=self.config.transfer_global_lock_dir_path,
-                    ttl_seconds=self.config.transfer_global_lock_ttl_sec,
-                )
-            except OSError as e:
-                self._transfer_last_error = f"Failed to initialize transfer lock directory: {e}"
-        self._transfer_state_store: Optional[TransferRebalanceStateStore] = (
-            TransferRebalanceStateStore(
-                path_template=self.config.transfer_state_file_path,
-                controller_id=self._controller_id(),
-            )
-            if self.config.transfer_rebalance_enabled
-            else None
-        )
         super().__init__(config, *args, **kwargs)
-        self._restore_transfer_state()
 
     async def update_processed_data(self):
         self._update_opportunity_buffers()
-        await self._transfer_rebalance_tick()
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
         if not self.market_data_provider.ready:
@@ -587,9 +460,6 @@ class UpbitBithumbXemmController(ControllerBase):
 
         inventory_delta = self._inventory_delta()
         allow_buy, allow_sell = self._allowed_sides(inventory_delta)
-        transfer_allow_buy, transfer_allow_sell = self._transfer_allowed_sides()
-        allow_buy = allow_buy and transfer_allow_buy
-        allow_sell = allow_sell and transfer_allow_sell
         if self._has_active_inventory_rebalance(active_executors=active_executors):
             allow_buy, allow_sell = self._inventory_rebalance_allowed_sides(
                 inventory_delta=inventory_delta,
@@ -626,7 +496,6 @@ class UpbitBithumbXemmController(ControllerBase):
         active_sell_count = len([executor for executor in active_xemm_executors if executor.side == TradeType.SELL])
 
         actions: List[ExecutorAction] = []
-        actions.extend(self._transfer_pause_stop_actions(active_executors))
         inventory_rebalance_action = self._create_inventory_rebalance_action(
             now=now,
             mid_price=mid_price,
@@ -763,8 +632,6 @@ class UpbitBithumbXemmController(ControllerBase):
         if not self._inventory_rebalance_creation_ready(now):
             return None
         if self._has_active_inventory_rebalance(active_executors=active_executors):
-            return None
-        if self.config.transfer_rebalance_enabled and self._rebalance_state != RebalanceState.IDLE:
             return None
 
         candidate = self._select_inventory_rebalance_candidate(
@@ -1277,17 +1144,6 @@ class UpbitBithumbXemmController(ControllerBase):
             self._stale_stop_sent_executor_ids.add(executor.id)
         return actions
 
-    def _transfer_pause_stop_actions(self, active_executors: List) -> List[ExecutorAction]:
-        self._transfer_stop_sent_executor_ids.clear()
-        return []
-
-    def _transfer_allowed_sides(self) -> Tuple[bool, bool]:
-        if self._paused_side == TradeType.BUY:
-            return False, True
-        if self._paused_side == TradeType.SELL:
-            return True, False
-        return True, True
-
     def _inventory_delta(self) -> Decimal:
         base_asset, _ = split_hb_trading_pair(self.config.maker_trading_pair)
         maker_base = self.market_data_provider.connectors[self.config.maker_connector].get_available_balance(base_asset)
@@ -1300,91 +1156,6 @@ class UpbitBithumbXemmController(ControllerBase):
         base_asset, _ = split_hb_trading_pair(self.config.maker_trading_pair)
         balance = self.market_data_provider.connectors[connector_name].get_available_balance(base_asset)
         return balance if balance is not None else Decimal("0")
-
-    def _transfer_reference_mid_price(self) -> Optional[Decimal]:
-        maker_mid = self.market_data_provider.get_price_by_type(
-            self.config.maker_connector, self.config.maker_trading_pair, PriceType.MidPrice
-        )
-        if maker_mid is not None and maker_mid > Decimal("0"):
-            return maker_mid
-        taker_mid = self.market_data_provider.get_price_by_type(
-            self.config.taker_connector, self.config.taker_trading_pair, PriceType.MidPrice
-        )
-        if taker_mid is not None and taker_mid > Decimal("0"):
-            return taker_mid
-        return None
-
-    def _planned_order_amounts_for_side(self, side: TradeType, mid_price: Decimal) -> List[Decimal]:
-        levels = self.config.buy_levels_targets_amount if side == TradeType.BUY else self.config.sell_levels_targets_amount
-        total_weight = sum(weight for _, weight in levels)
-        if total_weight <= Decimal("0") or mid_price <= Decimal("0"):
-            return []
-        side_budget_quote = self.config.total_amount_quote / Decimal("2")
-        order_amounts: List[Decimal] = []
-        for _, weight in levels:
-            quote_amount = side_budget_quote * (weight / total_weight)
-            base_amount = self.market_data_provider.quantize_order_amount(
-                self.config.maker_connector,
-                self.config.maker_trading_pair,
-                quote_amount / mid_price,
-            )
-            if base_amount is not None and base_amount > Decimal("0"):
-                order_amounts.append(base_amount)
-        return order_amounts
-
-    def _required_base_for_next_cycle(self, side: TradeType) -> Decimal:
-        mid_price = self._transfer_reference_mid_price()
-        if mid_price is None:
-            return Decimal("0")
-        order_amounts = self._planned_order_amounts_for_side(side=side, mid_price=mid_price)
-        return max(order_amounts) if order_amounts else Decimal("0")
-
-    def _required_base_for_transfer_trigger(self, side: TradeType) -> Decimal:
-        next_cycle_required = self._required_base_for_next_cycle(side)
-        min_destination_balance = self.config.transfer_min_destination_balance_base
-        if min_destination_balance > Decimal("0"):
-            return max(next_cycle_required, min_destination_balance)
-        return next_cycle_required
-
-    def _inventory_shortage_trigger(self) -> Optional[Dict[str, object]]:
-        buy_required_base = self._required_base_for_transfer_trigger(TradeType.BUY)
-        sell_required_base = self._required_base_for_transfer_trigger(TradeType.SELL)
-        taker_available_base = self._available_base_balance(self.config.taker_connector)
-        maker_available_base = self._available_base_balance(self.config.maker_connector)
-
-        candidates: List[Dict[str, object]] = []
-        if self.config.transfer_route_key_maker_to_taker and buy_required_base > Decimal("0"):
-            buy_shortfall = max(Decimal("0"), buy_required_base - taker_available_base)
-            if buy_shortfall > Decimal("0"):
-                candidates.append({
-                    "direction": "maker_to_taker",
-                    "route_key": self.config.transfer_route_key_maker_to_taker,
-                    "paused_side": TradeType.BUY,
-                    "required_base": buy_required_base,
-                    "target_available_base": taker_available_base,
-                    "shortfall_base": buy_shortfall,
-                })
-
-        if self.config.transfer_route_key_taker_to_maker and sell_required_base > Decimal("0"):
-            sell_shortfall = max(Decimal("0"), sell_required_base - maker_available_base)
-            if sell_shortfall > Decimal("0"):
-                candidates.append({
-                    "direction": "taker_to_maker",
-                    "route_key": self.config.transfer_route_key_taker_to_maker,
-                    "paused_side": TradeType.SELL,
-                    "required_base": sell_required_base,
-                    "target_available_base": maker_available_base,
-                    "shortfall_base": sell_shortfall,
-                })
-
-        if not candidates:
-            return None
-
-        candidates.sort(key=lambda candidate: (candidate["shortfall_base"], candidate["required_base"]), reverse=True)
-        return candidates[0]
-
-    def _current_transfer_trigger(self) -> Optional[Dict[str, object]]:
-        return self._inventory_shortage_trigger()
 
     def _allowed_sides(self, inventory_delta: Decimal) -> Tuple[bool, bool]:
         if not self.config.inventory_skew_side_gating_enabled:
@@ -1595,743 +1366,13 @@ class UpbitBithumbXemmController(ControllerBase):
         self._risk_pause_reason = ""
         return True, True
 
-    def _clear_transfer_delay_state(self):
-        self._transfer_delay_started_ts = None
-        self._transfer_delay_deadline_ts = None
-
-    def _clear_transfer_pause_state(self):
-        self._paused_side = None
-        self._transfer_direction = None
-        self._transfer_required_base_threshold = None
-        self._transfer_stop_sent_executor_ids.clear()
-
-    def _enter_transfer_delay(self, *, trigger: Dict[str, object], now: float):
-        route_key = trigger.get("route_key")
-        if not route_key:
-            return
-        self._rebalance_state = RebalanceState.DELAYING
-        self._paused_side = trigger["paused_side"]
-        self._transfer_direction = trigger["direction"]
-        self._active_transfer_request_id = None
-        self._transfer_cycle_id = None
-        self._transfer_event_id = None
-        self._transfer_amount_base = None
-        self._transfer_started_ts = None
-        self._transfer_retry_at = None
-        self._transfer_recovery_started_ts = None
-        self._transfer_required_base_threshold = (
-            Decimal(str(trigger["required_base"])) if trigger.get("required_base") is not None else None
-        )
-        self._transfer_last_qtg_state = None
-        self._transfer_last_error = None
-        self._clear_transfer_delay_state()
-        self._transfer_delay_started_ts = now
-        self._transfer_delay_deadline_ts = now + self.config.transfer_delay_before_submit_sec
-        self._save_transfer_state()
-        self.logger().info(
-            f"Transfer rebalance delay armed: direction={self._transfer_direction}, paused_side={self._paused_side.name}, "
-            f"deadline_in={self.config.transfer_delay_before_submit_sec}s"
-        )
-
-    def _complete_transfer_delay(self, *, reason: str):
-        self._rebalance_state = RebalanceState.IDLE
-        self._clear_transfer_pause_state()
-        self._active_transfer_request_id = None
-        self._transfer_cycle_id = None
-        self._transfer_event_id = None
-        self._transfer_amount_base = None
-        self._transfer_started_ts = None
-        self._transfer_retry_at = None
-        self._transfer_recovery_started_ts = None
-        self._transfer_last_qtg_state = None
-        self._transfer_last_error = None
-        self._clear_transfer_delay_state()
-        self._transfer_stop_sent_executor_ids.clear()
-        self._clear_transfer_state()
-        self.logger().info(f"Transfer rebalance delay cleared: {reason}")
-
-    def _begin_transfer_submission(self, *, trigger: Dict[str, object], now: float, reason: str) -> bool:
-        direction = trigger["direction"]
-        route_key = trigger["route_key"]
-        paused_side = trigger["paused_side"]
-        amount = self._compute_transfer_amount(
-            direction,
-            target_available_base=(
-                Decimal(str(trigger["target_available_base"])) if trigger.get("target_available_base") is not None else None
-            ),
-            required_base=Decimal(str(trigger["required_base"])) if trigger.get("required_base") is not None else None,
-        )
-        if amount <= Decimal("0"):
-            return False
-        if not self._acquire_transfer_lock(direction):
-            return False
-
-        self._rebalance_state = RebalanceState.SIGNAL_SUBMITTING
-        self._paused_side = paused_side
-        self._transfer_direction = direction
-        self._transfer_cycle_id = uuid.uuid4().hex[:12]
-        self._transfer_event_id = f"{self._controller_id()}:{direction}:{self._transfer_cycle_id}"
-        self._transfer_amount_base = amount
-        self._transfer_started_ts = now
-        self._transfer_retry_at = None
-        self._transfer_recovery_started_ts = None
-        self._transfer_required_base_threshold = (
-            Decimal(str(trigger["required_base"])) if trigger.get("required_base") is not None else None
-        )
-        self._transfer_last_qtg_state = None
-        self._transfer_last_error = None
-        self._clear_transfer_delay_state()
-        self._save_transfer_state()
-        self.logger().info(
-            f"Transfer rebalance submission started: reason={reason}, direction={direction}, "
-            f"paused_side={paused_side.name}, amount={amount}"
-        )
-        self._transfer_task = asyncio.create_task(self._signal_and_approve(route_key=route_key, amount=amount))
-        return True
-
-    async def _transfer_rebalance_tick(self):
-        if not self.config.transfer_rebalance_enabled:
-            return
-        if not self.market_data_provider.ready:
-            return
-        self._ensure_transfer_runtime_components()
-        if not self._ensure_transfer_client():
-            return
-
-        now = self.market_data_provider.time()
-        self._heartbeat_transfer_lock()
-
-        if self._transfer_task is not None and self._transfer_task.done():
-            self._consume_task_result(self._transfer_task, context="transfer_task")
-            self._transfer_task = None
-        if self._transfer_poll_task is not None and self._transfer_poll_task.done():
-            self._consume_task_result(self._transfer_poll_task, context="transfer_poll_task")
-            self._transfer_poll_task = None
-
-        if self._rebalance_state == RebalanceState.COOLDOWN:
-            if self._transfer_retry_at is not None and now >= self._transfer_retry_at:
-                self._rebalance_state = RebalanceState.IDLE
-                self._clear_transfer_pause_state()
-                self._clear_transfer_delay_state()
-                self._release_transfer_lock(force=False)
-                self._save_transfer_state()
-            return
-
-        if self._rebalance_state == RebalanceState.ERROR:
-            return
-
-        if self._rebalance_state == RebalanceState.WAITING_RECOVERY:
-            required_base_threshold = self._transfer_required_base_threshold
-            if required_base_threshold is not None:
-                target_connector = (
-                    self.config.taker_connector if self._transfer_direction == "maker_to_taker" else self.config.maker_connector
-                )
-                target_available_base = self._available_base_balance(target_connector)
-                if target_available_base >= required_base_threshold:
-                    self._complete_transfer_cycle(reason="recovery_reached")
-                    return
-            else:
-                self._complete_transfer_cycle(reason="recovery_reached")
-                return
-            if (
-                self._transfer_recovery_started_ts is not None and
-                now - self._transfer_recovery_started_ts > self.config.transfer_recovery_max_wait_sec
-            ):
-                deadline_message = (
-                    "Recovery deadline exceeded; keeping transfer pause active until balances recover."
-                )
-                if self._transfer_last_error != deadline_message:
-                    self.logger().warning(deadline_message)
-                    self._transfer_last_error = deadline_message
-                    self._save_transfer_state()
-            return
-
-        if self._rebalance_state == RebalanceState.IN_FLIGHT:
-            if self._transfer_started_ts is not None and now - self._transfer_started_ts > self.config.transfer_request_timeout_sec:
-                self._enter_error("Transfer request timeout exceeded")
-                return
-            if (
-                self._transfer_poll_task is None and
-                now >= self._transfer_last_poll_ts + self.config.transfer_poll_interval_sec and
-                self._active_transfer_request_id is not None
-            ):
-                self._transfer_last_poll_ts = now
-                self._transfer_poll_task = asyncio.create_task(self._poll_transfer_request())
-            return
-
-        if self._rebalance_state in {RebalanceState.SIGNAL_SUBMITTING, RebalanceState.APPROVAL_SUBMITTING}:
-            return
-
-        trigger = self._current_transfer_trigger()
-
-        if self._rebalance_state == RebalanceState.DELAYING:
-            if trigger is None:
-                self._complete_transfer_delay(reason="transfer trigger no longer active")
-                return
-
-            expected_direction = self._transfer_direction
-            current_direction = trigger["direction"]
-            route_key = trigger["route_key"]
-            if expected_direction is not None and current_direction != expected_direction:
-                self.logger().info("Transfer rebalance delay restarted due to inventory direction flip")
-                if route_key:
-                    self._enter_transfer_delay(trigger=trigger, now=now)
-                else:
-                    self._complete_transfer_delay(reason="inventory direction flipped but route key missing")
-                return
-
-            if self._transfer_delay_deadline_ts is not None and now >= self._transfer_delay_deadline_ts:
-                submission_started = self._begin_transfer_submission(trigger=trigger, now=now, reason="delay_expired")
-                if submission_started:
-                    self.logger().info("Transfer rebalance delay expired: proceeding with transfer submission")
-                else:
-                    if self._transfer_last_error:
-                        self.logger().warning(
-                            f"Transfer rebalance delay expired but submission could not start: {self._transfer_last_error}"
-                        )
-                    self._complete_transfer_delay(
-                        reason="delay expired but transfer submission could not start"
-                    )
-                return
-
-            return
-
-        # IDLE path
-        if trigger is None:
-            return
-        if self.config.transfer_delay_before_submit_sec > 0:
-            self._enter_transfer_delay(trigger=trigger, now=now)
-            return
-        self._begin_transfer_submission(trigger=trigger, now=now, reason="shortage_direct")
-
-    async def _signal_and_approve(self, *, route_key: str, amount: Decimal):
-        if self._transfer_client is None:
-            self._enter_error("TransferGuardClient is not initialized")
-            return
-        current_time = self.market_data_provider.time()
-        try:
-            route_allowed, route_reason = await self._precheck_transfer_route(route_key=route_key)
-            if not route_allowed:
-                self.logger().info(
-                    f"Skipping transfer signal because paused-route precheck blocked {route_key}: {route_reason}"
-                )
-                self._enter_cooldown(
-                    reason=route_reason or f"QTG route precheck blocked transfer: {route_key}",
-                    now=current_time,
-                )
-                return
-            signal_result: SignalResult = await self._transfer_client.send_signal(
-                route_key=route_key,
-                amount=amount,
-                signal_type="insufficient_balance",
-                event_id=self._transfer_event_id or f"{self._controller_id()}:{uuid.uuid4().hex[:12]}",
-                callback_url=self.config.transfer_guard_callback_url,
-                metadata={
-                    "controller_id": self._controller_id(),
-                    "maker_connector": self.config.maker_connector,
-                    "taker_connector": self.config.taker_connector,
-                },
-            )
-            self._active_transfer_request_id = signal_result.request_id
-            self._transfer_last_qtg_state = signal_result.state
-
-            if signal_result.state == "FAILED":
-                self._enter_cooldown(
-                    reason=f"QTG signal rejected: {signal_result.reason}",
-                    now=current_time,
-                )
-                return
-            if signal_result.state in SUCCESS_STATES:
-                self._rebalance_state = RebalanceState.WAITING_RECOVERY
-                self._transfer_recovery_started_ts = current_time
-                self._save_transfer_state()
-                return
-
-            self._rebalance_state = RebalanceState.APPROVAL_SUBMITTING
-            self._save_transfer_state()
-
-            approval_result: ApprovalResult = await self._transfer_client.approve_request(
-                request_id=signal_result.request_id,
-                approver_id=self._controller_id(),
-            )
-            self._transfer_last_qtg_state = approval_result.state
-            if approval_result.state in SUCCESS_STATES:
-                self._rebalance_state = RebalanceState.WAITING_RECOVERY
-                self._transfer_recovery_started_ts = self.market_data_provider.time()
-            elif approval_result.state in TERMINAL_FAILURE_STATES:
-                self._enter_cooldown(
-                    reason=f"Approval returned terminal state: {approval_result.state}",
-                    now=self.market_data_provider.time(),
-                )
-                return
-            else:
-                self._rebalance_state = RebalanceState.IN_FLIGHT
-            self._save_transfer_state()
-
-        except ConflictError:
-            await self._resolve_conflicted_request()
-        except (RateLimitError, NetworkError, ServerError) as e:
-            self._enter_cooldown(reason=f"Transient QTG error during signal/approval: {e}", now=self.market_data_provider.time())
-        except (AuthError, NotFoundError) as e:
-            self._enter_error(f"Permanent QTG error during signal/approval: {e}")
-        except TransferGuardError as e:
-            self._enter_cooldown(reason=f"QTG error during signal/approval: {e}", now=self.market_data_provider.time())
-        except Exception as e:
-            self._enter_error(f"Unexpected transfer signal/approval error: {e}")
-
-    async def _precheck_transfer_route(self, *, route_key: str) -> Tuple[bool, Optional[str]]:
-        if not self.config.transfer_route_pause_precheck_enabled:
-            return True, None
-        if self._transfer_client is None:
-            return False, "TransferGuardClient is not initialized"
-        route = await self._transfer_client.get_route_by_key(route_key=route_key)
-        if route is None:
-            return False, f"QTG route not found during paused-route precheck: {route_key}"
-        if not route.enabled:
-            return False, f"QTG route disabled during paused-route precheck: {route_key}"
-        if route.is_paused:
-            pause_reason = route.pause_reason or "no pause reason provided"
-            return False, f"QTG route paused during precheck: {route_key} ({pause_reason})"
-        return True, None
-
-    async def _resolve_conflicted_request(self):
-        if self._transfer_client is None or self._active_transfer_request_id is None:
-            self._enter_error("Approval conflict without active request id")
-            return
-        try:
-            status = await self._transfer_client.get_request(request_id=self._active_transfer_request_id)
-        except TransferGuardError as e:
-            self._enter_error(f"Approval conflict and unable to fetch request: {e}")
-            return
-        self._handle_polled_state(status)
-
-    async def _poll_transfer_request(self):
-        if self._transfer_client is None or self._active_transfer_request_id is None:
-            return
-        try:
-            status = await self._transfer_client.get_request(request_id=self._active_transfer_request_id)
-        except (RateLimitError, NetworkError, ServerError):
-            return
-        except NotFoundError as e:
-            self._enter_cooldown(reason=f"Active transfer request not found: {e}", now=self.market_data_provider.time())
-            return
-        except TransferGuardError as e:
-            self._enter_cooldown(reason=f"Polling failed: {e}", now=self.market_data_provider.time())
-            return
-        except Exception as e:
-            self._enter_error(f"Unexpected transfer polling error: {e}")
-            return
-        self._handle_polled_state(status)
-
-    def _handle_polled_state(self, status: RequestStatus):
-        self._transfer_last_qtg_state = status.state
-        if status.state in SUCCESS_STATES:
-            self._rebalance_state = RebalanceState.WAITING_RECOVERY
-            if self._transfer_recovery_started_ts is None:
-                self._transfer_recovery_started_ts = self.market_data_provider.time()
-            self._save_transfer_state()
-            return
-        if status.state in TERMINAL_FAILURE_STATES:
-            self._enter_cooldown(
-                reason=f"Transfer terminal failure state: {status.state}",
-                now=self.market_data_provider.time(),
-            )
-            return
-        if status.state in UNKNOWN_STATES:
-            self._enter_error(f"Transfer entered unknown state requiring manual intervention: {status.state}")
-            return
-        if status.state in PENDING_STATES or status.state in IN_FLIGHT_STATES:
-            self._rebalance_state = RebalanceState.IN_FLIGHT
-            self._save_transfer_state()
-            return
-        self._enter_error(f"Unexpected QTG request state: {status.state}")
-
-    def _enter_cooldown(self, *, reason: str, now: float):
-        self._rebalance_state = RebalanceState.COOLDOWN
-        self._transfer_retry_at = now + self.config.transfer_request_cooldown_sec
-        self._transfer_last_error = reason
-        self._active_transfer_request_id = None
-        self._transfer_recovery_started_ts = None
-        if not self._should_preserve_transfer_pause_on_cooldown(reason):
-            self._clear_transfer_pause_state()
-        self._clear_transfer_delay_state()
-        self._release_transfer_lock(force=False)
-        self._save_transfer_state()
-
-    @staticmethod
-    def _should_preserve_transfer_pause_on_cooldown(reason: str) -> bool:
-        normalized = (reason or "").lower()
-        return normalized.startswith("qtg route paused during precheck:")
-
-    def _enter_error(self, reason: str):
-        self._rebalance_state = RebalanceState.ERROR
-        self._transfer_last_error = reason
-        self._clear_transfer_pause_state()
-        self._clear_transfer_delay_state()
-        self._release_transfer_lock(force=False)
-        self._save_transfer_state()
-        self.logger().warning(f"Transfer rebalance entered ERROR state: {reason}")
-
-    def _complete_transfer_cycle(self, reason: str):
-        self._rebalance_state = RebalanceState.IDLE
-        self._clear_transfer_pause_state()
-        self._active_transfer_request_id = None
-        self._transfer_cycle_id = None
-        self._transfer_event_id = None
-        self._transfer_amount_base = None
-        self._transfer_started_ts = None
-        self._transfer_retry_at = None
-        self._transfer_recovery_started_ts = None
-        self._transfer_last_qtg_state = None
-        self._transfer_last_error = None
-        self._clear_transfer_delay_state()
-        self._transfer_stop_sent_executor_ids.clear()
-        self._release_transfer_lock(force=False)
-        self._clear_transfer_state()
-        self.logger().info(f"Transfer rebalance cycle completed: {reason}")
-
-    def _compute_transfer_amount(
-        self,
-        direction: str,
-        target_available_base: Optional[Decimal] = None,
-        required_base: Optional[Decimal] = None,
-    ) -> Decimal:
-        if target_available_base is None or required_base is None:
-            return Decimal("0")
-        amount = max(Decimal("0"), required_base - target_available_base) + self.config.transfer_target_buffer_base
-
-        if self.config.transfer_max_amount_base > Decimal("0"):
-            amount = min(amount, self.config.transfer_max_amount_base)
-        amount = max(amount, self.config.transfer_min_amount_base)
-
-        available = self._source_available_balance(direction) - self.config.transfer_source_balance_reserve_base
-        if available <= Decimal("0"):
-            return Decimal("0")
-        amount = min(amount, available)
-
-        quantum = self.config.transfer_amount_quantum_base
-        if quantum > Decimal("0") and amount > Decimal("0"):
-            amount = (amount // quantum) * quantum
-        return max(amount, Decimal("0"))
-
-    def _source_available_balance(self, direction: str) -> Decimal:
-        source_connector = self.config.maker_connector if direction == "maker_to_taker" else self.config.taker_connector
-        base_asset, _ = split_hb_trading_pair(self.config.maker_trading_pair)
-        balance = self.market_data_provider.connectors[source_connector].get_available_balance(base_asset)
-        return balance if balance is not None else Decimal("0")
-
-    def _ensure_transfer_client(self) -> bool:
-        if self._transfer_client_ready and self._transfer_client is not None:
-            return True
-        signal_secret = os.getenv(self.config.transfer_guard_signal_secret_env, "")
-        approval_secret = os.getenv(self.config.transfer_guard_approval_secret_env, "")
-        read_secret = os.getenv(self.config.transfer_guard_read_secret_env, "")
-        admin_secret = os.getenv(self.config.transfer_guard_admin_secret_env, "")
-        if not (
-            self.config.transfer_guard_signal_key_id and
-            self.config.transfer_guard_approval_key_id and
-            self.config.transfer_guard_read_key_id and
-            signal_secret and approval_secret and read_secret
-        ):
-            self._transfer_last_error = "Missing QTG credential configuration for transfer rebalance"
-            return False
-        if self.config.transfer_route_pause_precheck_enabled and not (
-            self.config.transfer_guard_admin_key_id and admin_secret
-        ):
-            self._transfer_last_error = "Missing QTG admin credential configuration for paused-route precheck"
-            return False
-        keys = {
-            "signal": (self.config.transfer_guard_signal_key_id, signal_secret),
-            "approval": (self.config.transfer_guard_approval_key_id, approval_secret),
-            "read": (self.config.transfer_guard_read_key_id, read_secret),
-        }
-        if self.config.transfer_guard_admin_key_id and admin_secret:
-            keys["admin"] = (self.config.transfer_guard_admin_key_id, admin_secret)
-        self._transfer_client = TransferGuardClient(
-            base_url=self.config.transfer_guard_base_url,
-            keys=keys,
-            timeout_seconds=max(self.config.transfer_poll_interval_sec, 5.0),
-        )
-        self._transfer_client_ready = True
-        return True
-
-    def _ensure_transfer_runtime_components(self):
-        if self._transfer_state_store is None:
-            self._transfer_state_store = TransferRebalanceStateStore(
-                path_template=self.config.transfer_state_file_path,
-                controller_id=self._controller_id(),
-            )
-        if self.config.transfer_global_lock_enabled and self._transfer_global_lease is None:
-            try:
-                self._transfer_global_lease = TransferGlobalLease(
-                    lock_dir=self.config.transfer_global_lock_dir_path,
-                    ttl_seconds=self.config.transfer_global_lock_ttl_sec,
-                )
-            except OSError as e:
-                self._transfer_last_error = f"Failed to initialize transfer lock directory: {e}"
-
-    def _acquire_transfer_lock(self, direction: str) -> bool:
-        lock_key = self._transfer_lock_key_for_direction(direction)
-        if self.config.transfer_global_lock_enabled and self._transfer_global_lease is None:
-            self._transfer_last_error = "transfer_global_lock_enabled=true but lock subsystem is unavailable"
-            return False
-        if not self.config.transfer_global_lock_enabled:
-            self._transfer_lock_key = lock_key
-            return True
-        if self._transfer_lock_key == lock_key:
-            return True
-        acquired = self._transfer_global_lease.acquire(lock_key=lock_key, owner_id=self._transfer_lock_owner)
-        if acquired:
-            self._transfer_lock_key = lock_key
-        else:
-            payload = self._transfer_global_lease.peek(lock_key=lock_key)
-            if payload is not None:
-                owner_id = payload.get("owner_id")
-                updated_at = payload.get("updated_at")
-                age_seconds = None
-                if isinstance(updated_at, (int, float)):
-                    age_seconds = max(0.0, time.time() - float(updated_at))
-                owner_text = owner_id if isinstance(owner_id, str) else "unknown-owner"
-                age_text = f"{age_seconds:.1f}s" if age_seconds is not None else "unknown-age"
-                self._transfer_last_error = (
-                    f"transfer global lock busy: key={lock_key}, owner={owner_text}, age={age_text}"
-                )
-            else:
-                self._transfer_last_error = f"transfer global lock busy: key={lock_key}"
-            self.logger().warning(
-                f"Failed to acquire transfer global lock for direction={direction}: {self._transfer_last_error}"
-            )
-        return acquired
-
-    def _transfer_lock_key_for_direction(self, direction: str) -> str:
-        source = self.config.maker_connector if direction == "maker_to_taker" else self.config.taker_connector
-        destination = self.config.taker_connector if direction == "maker_to_taker" else self.config.maker_connector
-        base_asset, _ = split_hb_trading_pair(self.config.maker_trading_pair)
-        return f"{base_asset}:{source}:{destination}"
-
-    def _configured_transfer_lock_keys(self) -> List[str]:
-        keys: List[str] = []
-        if self.config.transfer_route_key_maker_to_taker:
-            keys.append(self._transfer_lock_key_for_direction("maker_to_taker"))
-        if self.config.transfer_route_key_taker_to_maker:
-            keys.append(self._transfer_lock_key_for_direction("taker_to_maker"))
-        return list(dict.fromkeys(keys))
-
-    def _try_reclaim_same_controller_transfer_lock(self, lock_key: str) -> bool:
-        if not self.config.transfer_global_lock_enabled or self._transfer_global_lease is None:
-            return False
-        payload = self._transfer_global_lease.peek(lock_key=lock_key)
-        if payload is None:
-            return False
-        owner_id = payload.get("owner_id")
-        if not isinstance(owner_id, str):
-            return False
-        controller_suffix = f":{self._controller_id()}"
-        if not owner_id.endswith(controller_suffix):
-            return False
-        if owner_id == self._transfer_lock_owner:
-            return False
-        released = self._transfer_global_lease.release(
-            lock_key=lock_key,
-            owner_id=self._transfer_lock_owner,
-            force=True,
-        )
-        if released:
-            self.logger().warning(
-                f"Recovered abandoned transfer global lock for same controller: {lock_key} (owner={owner_id})"
-            )
-        return released
-
-    def _recover_same_controller_transfer_locks_on_restore(self):
-        if not self.config.transfer_global_lock_enabled or self._transfer_global_lease is None:
-            return
-        if self._active_transfer_request_id is not None:
-            return
-        if self._rebalance_state in {
-            RebalanceState.SIGNAL_SUBMITTING,
-            RebalanceState.APPROVAL_SUBMITTING,
-            RebalanceState.IN_FLIGHT,
-            RebalanceState.WAITING_RECOVERY,
-        }:
-            return
-        for lock_key in self._configured_transfer_lock_keys():
-            self._try_reclaim_same_controller_transfer_lock(lock_key)
-
-    def _heartbeat_transfer_lock(self):
-        if (
-            self.config.transfer_global_lock_enabled and
-            self._transfer_global_lease is not None and
-            self._transfer_lock_key is not None and
-            self._rebalance_state in {
-                RebalanceState.SIGNAL_SUBMITTING,
-                RebalanceState.APPROVAL_SUBMITTING,
-                RebalanceState.IN_FLIGHT,
-                RebalanceState.WAITING_RECOVERY,
-            }
-        ):
-            self._transfer_global_lease.heartbeat(lock_key=self._transfer_lock_key, owner_id=self._transfer_lock_owner)
-
-    def _release_transfer_lock(self, force: bool):
-        if not self.config.transfer_global_lock_enabled or self._transfer_global_lease is None:
-            self._transfer_lock_key = None
-            return
-        if self._transfer_lock_key is None:
-            return
-        self._transfer_global_lease.release(
-            lock_key=self._transfer_lock_key,
-            owner_id=self._transfer_lock_owner,
-            force=force,
-        )
-        self._transfer_lock_key = None
-
-    def _save_transfer_state(self):
-        if self._transfer_state_store is None:
-            return
-        snapshot = RebalanceSnapshot(
-            version=1,
-            state=self._rebalance_state.value,
-            request_id=self._active_transfer_request_id,
-            direction=self._transfer_direction,
-            paused_side=self._paused_side.name if self._paused_side is not None else None,
-            amount=str(self._transfer_amount_base) if self._transfer_amount_base is not None else None,
-            cycle_id=self._transfer_cycle_id,
-            event_id=self._transfer_event_id,
-            transfer_start_ts=self._transfer_started_ts,
-            retry_at=self._transfer_retry_at,
-            recovery_started_ts=self._transfer_recovery_started_ts,
-            required_base_threshold=str(self._transfer_required_base_threshold) if self._transfer_required_base_threshold is not None else None,
-            last_error=self._transfer_last_error,
-            last_qtg_state=self._transfer_last_qtg_state,
-            lock_key=self._transfer_lock_key,
-            delay_started_ts=self._transfer_delay_started_ts,
-            delay_deadline_ts=self._transfer_delay_deadline_ts,
-        )
-        try:
-            self._transfer_state_store.save(snapshot)
-        except Exception as e:
-            self.logger().warning(f"Failed to persist transfer rebalance state: {e}")
-
-    def _clear_transfer_state(self):
-        if self._transfer_state_store is None:
-            return
-        try:
-            self._transfer_state_store.clear()
-        except Exception as e:
-            self.logger().warning(f"Failed to clear transfer rebalance state: {e}")
-
-    def _restore_transfer_state(self):
-        if not self.config.transfer_rebalance_enabled:
-            return
-        if self._transfer_state_store is None:
-            return
-        try:
-            snapshot = self._transfer_state_store.load()
-        except Exception as e:
-            self.logger().warning(f"Failed to load transfer rebalance state. Entering ERROR state: {e}")
-            self._rebalance_state = RebalanceState.ERROR
-            self._transfer_last_error = f"State file load error: {e}"
-            return
-        if snapshot is None:
-            return
-
-        try:
-            self._rebalance_state = RebalanceState(snapshot.state)
-        except ValueError:
-            self._rebalance_state = RebalanceState.ERROR
-            self._transfer_last_error = f"Invalid rebalance state in snapshot: {snapshot.state}"
-            return
-
-        self._active_transfer_request_id = snapshot.request_id
-        self._transfer_direction = snapshot.direction
-        self._transfer_cycle_id = snapshot.cycle_id
-        self._transfer_event_id = snapshot.event_id
-        self._transfer_amount_base = Decimal(snapshot.amount) if snapshot.amount is not None else None
-        self._transfer_started_ts = snapshot.transfer_start_ts
-        self._transfer_retry_at = snapshot.retry_at
-        self._transfer_recovery_started_ts = snapshot.recovery_started_ts
-        self._transfer_required_base_threshold = (
-            Decimal(snapshot.required_base_threshold) if snapshot.required_base_threshold is not None else None
-        )
-        self._transfer_last_error = snapshot.last_error
-        self._transfer_last_qtg_state = snapshot.last_qtg_state
-        self._transfer_lock_key = snapshot.lock_key
-        self._transfer_delay_started_ts = snapshot.delay_started_ts
-        self._transfer_delay_deadline_ts = snapshot.delay_deadline_ts
-        if snapshot.paused_side in TradeType.__members__:
-            self._paused_side = TradeType[snapshot.paused_side]
-        else:
-            self._paused_side = None
-
-        self._recover_same_controller_transfer_locks_on_restore()
-
-        if self._rebalance_state in {RebalanceState.SIGNAL_SUBMITTING, RebalanceState.APPROVAL_SUBMITTING}:
-            # intermediate state cannot be safely resumed, so retry through cooldown.
-            self._rebalance_state = RebalanceState.COOLDOWN
-            self._transfer_retry_at = 0.0
-            self._clear_transfer_pause_state()
-            self._clear_transfer_delay_state()
-            self._save_transfer_state()
-            return
-
-        terminal_qtg_state = (
-            self._transfer_last_qtg_state is not None and
-            self._transfer_last_qtg_state in (SUCCESS_STATES | TERMINAL_FAILURE_STATES)
-        )
-        if terminal_qtg_state:
-            # Snapshot already reached terminal QTG state in previous process.
-            # Clear lock/state and return to normal IDLE regardless of lock owner drift.
-            self._release_transfer_lock(force=True)
-            self._complete_transfer_cycle(reason="restore_terminal_state_recovered")
-            return
-
-        if self._transfer_lock_key and self.config.transfer_global_lock_enabled and self._transfer_global_lease is not None:
-            acquired = self._transfer_global_lease.acquire(
-                lock_key=self._transfer_lock_key,
-                owner_id=self._transfer_lock_owner,
-            )
-            if not acquired:
-                terminal_or_unknown_qtg_state = (
-                    self._transfer_last_qtg_state is not None and
-                    self._transfer_last_qtg_state in (SUCCESS_STATES | TERMINAL_FAILURE_STATES | UNKNOWN_STATES)
-                )
-                if terminal_or_unknown_qtg_state:
-                    self._release_transfer_lock(force=True)
-                    self._complete_transfer_cycle(reason="restore_terminal_state_recovered")
-                    return
-                self._rebalance_state = RebalanceState.COOLDOWN
-                self._transfer_retry_at = 0.0
-                self._transfer_last_error = "Failed to reacquire transfer global lock during state restore (cooldown retry)"
-                self._clear_transfer_pause_state()
-                self._clear_transfer_delay_state()
-                self._save_transfer_state()
-
-    def _consume_task_result(self, task: asyncio.Task, context: str):
-        try:
-            task.result()
-        except Exception as e:
-            self._enter_error(f"{context} failed: {e}")
-
-    def on_stop(self):
-        for task in [self._transfer_task, self._transfer_poll_task]:
-            if task is not None and not task.done():
-                task.cancel()
-        if self._transfer_client is not None:
-            asyncio.create_task(self._transfer_client.close())
-        self._release_transfer_lock(force=False)
-
     def to_format_status(self) -> List[str]:
         inventory_delta = self._inventory_delta()
         allow_buy, allow_sell = self._allowed_sides(inventory_delta)
-        transfer_allow_buy, transfer_allow_sell = self._transfer_allowed_sides()
         recovery_grace_remaining = Decimal("0")
         if self._market_data_recovery_grace_until_ts is not None:
             recovery_grace_remaining = Decimal(
                 max(0.0, self._market_data_recovery_grace_until_ts - self.market_data_provider.time())
-            )
-        transfer_delay_remaining = Decimal("0")
-        if self._transfer_delay_deadline_ts is not None:
-            transfer_delay_remaining = Decimal(
-                max(0.0, self._transfer_delay_deadline_ts - self.market_data_provider.time())
             )
         return [
             f"  Pair: maker={self.config.maker_connector} {self.config.maker_trading_pair} | taker={self.config.taker_connector} {self.config.taker_trading_pair}",
@@ -2343,37 +1384,25 @@ class UpbitBithumbXemmController(ControllerBase):
             f"  Stale controls: timeout={self.config.market_data_stale_timeout_sec}s, grace={self.config.market_data_recovery_grace_sec}s, grace_remaining={recovery_grace_remaining}s, cancel_on_stale={self.config.cancel_open_orders_on_stale}, stale_fill_hedge_mode={self.config.stale_fill_hedge_mode}",
             f"  Loop metrics: {self.format_loop_metrics()}",
             f"  Inventory delta (maker-taker-target): {inventory_delta}",
-            f"  Side gating -> inventory BUY:{allow_buy} SELL:{allow_sell} | transfer BUY:{transfer_allow_buy} SELL:{transfer_allow_sell}",
+            f"  Side gating -> inventory BUY:{allow_buy} SELL:{allow_sell}",
             f"  Opportunity gate: enabled={self.config.opportunity_gate_enabled}, required_ticks={self._opportunity_required_ticks}, "
             f"edge_ticks_buy={self._opportunity_edge_ticks[TradeType.BUY]}, edge_ticks_sell={self._opportunity_edge_ticks[TradeType.SELL]}, "
             f"net_bps_buy={self._opportunity_edge_net_bps[TradeType.BUY]}, net_bps_sell={self._opportunity_edge_net_bps[TradeType.SELL]}",
             f"  Risk cutoff: effective_session_pnl={self._risk_effective_session_pnl_quote}, "
             f"unhedged_notional={self._risk_unhedged_notional_quote}, pause_remaining={max(0.0, self._risk_pause_until_ts - self.market_data_provider.time()):.2f}s, reason={self._risk_pause_reason}",
-            f"  Transfer rebalance: enabled={self.config.transfer_rebalance_enabled}, policy=inventory_shortage, state={self._rebalance_state.value}, direction={self._transfer_direction}, paused_side={self._paused_side.name if self._paused_side else None}",
-            f"  Transfer delay: active={self._rebalance_state == RebalanceState.DELAYING}, started={self._transfer_delay_started_ts}, "
-            f"deadline={self._transfer_delay_deadline_ts}, remaining={transfer_delay_remaining}s",
-            f"  Transfer request: id={self._active_transfer_request_id}, qtg_state={self._transfer_last_qtg_state}, amount={self._transfer_amount_base}, retry_at={self._transfer_retry_at}, error={self._transfer_last_error}",
         ]
 
     def get_custom_info(self) -> dict:
         inventory_delta = self._inventory_delta()
         allow_buy, allow_sell = self._allowed_sides(inventory_delta)
-        transfer_allow_buy, transfer_allow_sell = self._transfer_allowed_sides()
         active_executors = self.filter_executors(self.executors_info, lambda executor: not executor.is_done)
         maker_available_base = self._available_base_balance(self.config.maker_connector)
         taker_available_base = self._available_base_balance(self.config.taker_connector)
-        next_cycle_buy_required_base = self._required_base_for_next_cycle(TradeType.BUY)
-        next_cycle_sell_required_base = self._required_base_for_next_cycle(TradeType.SELL)
-        transfer_trigger_buy_required_base = self._required_base_for_transfer_trigger(TradeType.BUY)
-        transfer_trigger_sell_required_base = self._required_base_for_transfer_trigger(TradeType.SELL)
         active_buy = len([executor for executor in active_executors if executor.side == TradeType.BUY])
         active_sell = len([executor for executor in active_executors if executor.side == TradeType.SELL])
         recovery_grace_remaining = 0.0
         if self._market_data_recovery_grace_until_ts is not None:
             recovery_grace_remaining = max(0.0, self._market_data_recovery_grace_until_ts - self.market_data_provider.time())
-        transfer_delay_remaining = 0.0
-        if self._transfer_delay_deadline_ts is not None:
-            transfer_delay_remaining = max(0.0, self._transfer_delay_deadline_ts - self.market_data_provider.time())
         return {
             "loop_metrics": self.get_loop_metrics(),
             "inventory_delta": str(inventory_delta),
@@ -2382,13 +1411,6 @@ class UpbitBithumbXemmController(ControllerBase):
             "allow_buy": allow_buy,
             "allow_sell": allow_sell,
             "inventory_skew_side_gating_enabled": self.config.inventory_skew_side_gating_enabled,
-            "transfer_allow_buy": transfer_allow_buy,
-            "transfer_allow_sell": transfer_allow_sell,
-            "next_cycle_buy_required_base": str(next_cycle_buy_required_base),
-            "next_cycle_sell_required_base": str(next_cycle_sell_required_base),
-            "transfer_trigger_min_destination_balance_base": str(self.config.transfer_min_destination_balance_base),
-            "transfer_trigger_buy_required_base": str(transfer_trigger_buy_required_base),
-            "transfer_trigger_sell_required_base": str(transfer_trigger_sell_required_base),
             "active_executors_total": len(active_executors),
             "active_buy_executors": active_buy,
             "active_sell_executors": active_sell,
@@ -2428,23 +1450,4 @@ class UpbitBithumbXemmController(ControllerBase):
             "bithumb_stp_retry_cooldown_sec": self.config.bithumb_stp_retry_cooldown_sec,
             "bithumb_stp_pause_after_rejects": self.config.bithumb_stp_pause_after_rejects,
             "bithumb_stp_pause_duration_sec": self.config.bithumb_stp_pause_duration_sec,
-            "transfer_rebalance_enabled": self.config.transfer_rebalance_enabled,
-            "transfer_state": self._rebalance_state.value,
-            "transfer_direction": self._transfer_direction,
-            "transfer_paused_side": self._paused_side.name if self._paused_side else None,
-            "transfer_request_id": self._active_transfer_request_id,
-            "transfer_last_qtg_state": self._transfer_last_qtg_state,
-            "transfer_amount_base": str(self._transfer_amount_base) if self._transfer_amount_base else None,
-            "transfer_required_base_threshold": (
-                str(self._transfer_required_base_threshold) if self._transfer_required_base_threshold is not None else None
-            ),
-            "transfer_last_error": self._transfer_last_error,
-            "transfer_retry_at": self._transfer_retry_at,
-            "transfer_delay_active": self._rebalance_state == RebalanceState.DELAYING,
-            "transfer_delay_started_ts": self._transfer_delay_started_ts,
-            "transfer_delay_deadline_ts": self._transfer_delay_deadline_ts,
-            "transfer_delay_remaining_sec": transfer_delay_remaining,
-            "transfer_event_id": self._transfer_event_id,
-            "transfer_cycle_id": self._transfer_cycle_id,
-            "transfer_lock_key": self._transfer_lock_key,
         }
