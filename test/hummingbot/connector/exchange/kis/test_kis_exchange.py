@@ -1,5 +1,6 @@
 import json
 import re
+import time
 from decimal import Decimal
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -307,12 +308,18 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         return base_token
 
     def create_exchange_instance(self):
-        return KisExchange(
+        exchange = KisExchange(
             kis_app_key="testAppKey",
             kis_app_secret="testAppSecret",
             kis_account_number="12345678-01",
             trading_pairs=[self.trading_pair],
         )
+        # Inject a cached OAuth2 access token so framework auth tests don't hit
+        # the (unmocked) KIS token endpoint. Production code fetches a real token
+        # lazily — this mirrors that state only for the test connector instance.
+        exchange._auth._access_token = "test_access_token"
+        exchange._auth._token_expires_at = time.time() + 86400
+        return exchange
 
     # ------------------------------------------------------------------
     # SOR/NXT routing — constructor wiring
@@ -351,6 +358,15 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
             "KRX",
             self._make_exchange(kis_market_routing="sor", domain="sandbox")._excg_for_routing(),
         )
+
+    def test_authenticator_has_no_placeholder_token(self):
+        # The authenticator must NOT inject a fake/placeholder access token.
+        # A non-None initial token sets a 24h expiry, so _get_access_token
+        # returns the placeholder instead of fetching a real OAuth2 token,
+        # and every live request fails KIS EGW00121 "유효하지 않은 token".
+        auth = self._make_exchange().authenticator
+        self.assertIsNone(auth._access_token)
+        self.assertEqual(0.0, auth._token_expires_at)
 
     def test_constructor_accepts_kis_sandbox_kwarg(self):
         # The non-trading instantiation path (settings.

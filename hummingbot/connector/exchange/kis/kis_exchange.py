@@ -116,7 +116,6 @@ class KisExchange(ExchangePyBase):
             app_key=self._app_key,
             app_secret=self._app_secret,
             sandbox=self._sandbox,
-            initial_token=f"placeholder_{self._app_key}",
         )
 
     @property
