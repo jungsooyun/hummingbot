@@ -314,6 +314,44 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
             trading_pairs=[self.trading_pair],
         )
 
+    # ------------------------------------------------------------------
+    # SOR/NXT routing — constructor wiring
+    # ------------------------------------------------------------------
+
+    def _make_exchange(self, kis_market_routing="sor", domain=CONSTANTS.DEFAULT_DOMAIN):
+        return KisExchange(
+            kis_app_key="testAppKey",
+            kis_app_secret="testAppSecret",
+            kis_account_number="12345678-01",
+            trading_pairs=[self.trading_pair],
+            kis_market_routing=kis_market_routing,
+            domain=domain,
+        )
+
+    def test_market_routing_default_is_sor(self):
+        self.assertEqual("sor", self._make_exchange()._market_routing)
+
+    def test_market_routing_explicit_krx(self):
+        self.assertEqual("krx", self._make_exchange(kis_market_routing="krx")._market_routing)
+
+    def test_sandbox_forces_krx_routing(self):
+        ex = self._make_exchange(kis_market_routing="sor", domain="sandbox")
+        self.assertEqual("krx", ex._market_routing)
+
+    def test_invalid_routing_fails_closed(self):
+        # Live: a typo must NOT silently route to KRX — fail closed
+        with self.assertRaises(ValueError):
+            self._make_exchange(kis_market_routing="bogus")
+
+    def test_excg_for_routing_mapping(self):
+        self.assertEqual("SOR", self._make_exchange(kis_market_routing="sor")._excg_for_routing())
+        self.assertEqual("NXT", self._make_exchange(kis_market_routing="nxt")._excg_for_routing())
+        self.assertEqual("KRX", self._make_exchange(kis_market_routing="krx")._excg_for_routing())
+        self.assertEqual(
+            "KRX",
+            self._make_exchange(kis_market_routing="sor", domain="sandbox")._excg_for_routing(),
+        )
+
     def validate_auth_credentials_present(self, request_call: RequestCall):
         request_headers = request_call.kwargs["headers"]
         self.assertIn("Authorization", request_headers)

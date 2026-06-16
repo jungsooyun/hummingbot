@@ -95,6 +95,16 @@ class KisConfigMap(BaseConnectorConfigMap):
             "prompt_on_new": True,
         },
     )
+    kis_market_routing: str = Field(
+        default="sor",
+        json_schema_extra={
+            "prompt": lambda cm: "Order routing? (krx/nxt/sor) — sor enables NXT after-market",
+            "is_secure": False,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+            "is_updatable": True,
+        },
+    )
     model_config = ConfigDict(title="kis")
 
 

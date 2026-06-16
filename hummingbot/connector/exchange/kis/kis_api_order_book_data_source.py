@@ -50,12 +50,16 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         api_factory: WebAssistantsFactory,
         auth: "KisAuth",
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
+        market_routing: str = CONSTANTS.MARKET_ROUTING_KRX,
     ):
         super().__init__(trading_pairs)
         self._connector = connector
         self._api_factory = api_factory
         self._auth = auth
         self._domain = domain
+        self._market_routing = market_routing
+        self._ob_tr_id = CONSTANTS.WS_ORDERBOOK_TR_ID_BY_ROUTING[market_routing]
+        self._trade_tr_id = CONSTANTS.WS_TRADE_TR_ID_BY_ROUTING[market_routing]
 
     # ------------------------------------------------------------------
     # Public interface

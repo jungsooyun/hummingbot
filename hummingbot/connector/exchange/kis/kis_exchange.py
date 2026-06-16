@@ -55,6 +55,7 @@ class KisExchange(ExchangePyBase):
         kis_account_number: str,
         trading_pairs: Optional[List[str]] = None,
         trading_required: bool = True,
+        kis_market_routing: str = CONSTANTS.MARKET_ROUTING_SOR,
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
     ):
         self._app_key = kis_app_key
@@ -65,14 +66,37 @@ class KisExchange(ExchangePyBase):
         self._domain = domain
         self._sandbox = domain == "sandbox"
 
+        # Resolve order routing BEFORE super().__init__() — ExchangePyBase.__init__
+        # constructs the order book data source, which needs self._market_routing.
+        # Invalid live values fail closed (raise); only sandbox sor/nxt -> krx falls back.
+        routing = (kis_market_routing or CONSTANTS.MARKET_ROUTING_SOR).lower()
+        self._routing_warnings: List[str] = []
+        if routing not in CONSTANTS.VALID_MARKET_ROUTINGS:
+            raise ValueError(
+                f"Invalid kis_market_routing '{kis_market_routing}'. "
+                f"Expected one of {CONSTANTS.VALID_MARKET_ROUTINGS}."
+            )
+        if self._sandbox and routing != CONSTANTS.MARKET_ROUTING_KRX:
+            self._routing_warnings.append(
+                f"KIS sandbox does not support '{routing}' routing; using 'krx'."
+            )
+            routing = CONSTANTS.MARKET_ROUTING_KRX
+        self._market_routing = routing
+
         # Parse account parts: "12345678-01" -> cano="12345678", acnt_prdt_cd="01"
         parts = kis_account_number.split("-")
         self._cano = parts[0] if len(parts) > 1 else kis_account_number
         self._acnt_prdt_cd = parts[1] if len(parts) > 1 else "01"
 
         super().__init__()
+        for _warning in self._routing_warnings:
+            self.logger().warning(_warning)
         # Balance updates are still REST-polled; order/fill events come via WS
         self.real_time_balance_update = False
+
+    def _excg_for_routing(self) -> str:
+        """Map the active routing mode to its EXCG_ID_DVSN_CD value."""
+        return CONSTANTS.EXCG_BY_ROUTING[self._market_routing]
 
     # ------------------------------------------------------------------
     # Abstract property implementations
@@ -165,6 +189,7 @@ class KisExchange(ExchangePyBase):
             api_factory=self._web_assistants_factory,
             auth=self._auth,
             domain=self._domain,
+            market_routing=self._market_routing,
         )
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
