@@ -1,4 +1,7 @@
 import asyncio
+import json
+import os
+import tempfile
 import time
 import unittest
 from contextlib import asynccontextmanager
@@ -69,10 +72,25 @@ class TestKisAuth(unittest.TestCase):
     def setUp(self):
         self.app_key = "test_app_key_12345"
         self.app_secret = "test_app_secret_67890"
+        # Isolate the on-disk token cache so tests never read/write the real
+        # hummingbot data dir or leak cached tokens across tests.
+        self._cache_dir = tempfile.mkdtemp(prefix="kis_auth_test_")
         self.auth = KisAuth(
             app_key=self.app_key,
             app_secret=self.app_secret,
+            token_cache_path=self._cache_dir,
         )
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(getattr(self, "_cache_dir", None) or "", ignore_errors=True)
+
+    def _new_auth(self, **kwargs):
+        """KisAuth with an isolated, per-call temp cache dir (no real I/O)."""
+        kwargs.setdefault("app_key", self.app_key)
+        kwargs.setdefault("app_secret", self.app_secret)
+        kwargs.setdefault("token_cache_path", tempfile.mkdtemp(prefix="kis_auth_test_"))
+        return KisAuth(**kwargs)
 
     # ------------------------------------------------------------------
     # Properties
@@ -96,6 +114,7 @@ class TestKisAuth(unittest.TestCase):
             app_key=self.app_key,
             app_secret=self.app_secret,
             sandbox=True,
+            token_cache_path=self._cache_dir,
         )
         self.assertTrue(auth.sandbox)
 
@@ -158,6 +177,7 @@ class TestKisAuth(unittest.TestCase):
             app_key=self.app_key,
             app_secret=self.app_secret,
             sandbox=True,
+            token_cache_path=self._cache_dir,
         )
         future_expiry = (datetime.now() + timedelta(hours=23)).strftime("%Y-%m-%d %H:%M:%S")
         token_response = {
@@ -501,6 +521,7 @@ class TestKisAuth(unittest.TestCase):
             app_key=self.app_key,
             app_secret=self.app_secret,
             initial_approval_key="pre-loaded-approval-key",
+            token_cache_path=self._cache_dir,
         )
 
         session_cls, captured = _make_mock_session(
@@ -591,6 +612,7 @@ class TestKisAuth(unittest.TestCase):
             app_key=self.app_key,
             app_secret=self.app_secret,
             sandbox=True,
+            token_cache_path=self._cache_dir,
         )
         approval_response = {"approval_key": "sandbox-approval-key"}
 
@@ -606,6 +628,252 @@ class TestKisAuth(unittest.TestCase):
         self.assertEqual(len(captured["calls"]), 1)
         self.assertIn("openapivts.koreainvestment.com:29443", captured["calls"][0]["url"])
         self.assertIn("/oauth2/Approval", captured["calls"][0]["url"])
+
+
+class TestKisAuthDiskPersistence(unittest.TestCase):
+    """Tests for the on-disk persistence of the KIS daily OAuth token and the
+    WebSocket approval key.  KIS issues at most one token/approval key per
+    app_key per day and expects reuse; persisting it to disk lets a process
+    restart within the validity window reuse the cached token instead of
+    re-issuing (which would burn the 1-call/60s rate limit and the day's token)."""
+
+    def setUp(self):
+        self.app_key = "test_app_key_disk"
+        self.app_secret = "test_app_secret_disk"
+        self._tmpdir = tempfile.mkdtemp(prefix="kis_token_cache_")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _cache_file(self, auth: KisAuth) -> str:
+        return auth.token_cache_path
+
+    # ------------------------------------------------------------------
+    # Token persistence
+    # ------------------------------------------------------------------
+
+    def test_valid_on_disk_token_loaded_on_construction_no_http(self):
+        """A valid (non-expired) cached token on disk should be loaded at
+        construction so _get_access_token() returns it with ZERO HTTP calls."""
+        # Seed: write a cache file as a prior process would have.
+        auth1 = KisAuth(self.app_key, self.app_secret, token_cache_path=self._tmpdir)
+        cache_file = self._cache_file(auth1)
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+        with open(cache_file, "w") as f:
+            json.dump({
+                "access_token": "disk_token",
+                "token_expires_at": time.time() + 23 * 3600,
+                "approval_key": None,
+                "approval_key_expires_at": 0.0,
+            }, f)
+
+        # New process: construct a fresh KisAuth pointed at the same path.
+        auth2 = KisAuth(self.app_key, self.app_secret, token_cache_path=self._tmpdir)
+
+        session_cls, captured = _make_mock_session(
+            lambda url, json=None, **kw: _make_mock_response({"access_token": "should-not-be-used"})
+        )
+        with patch("aiohttp.ClientSession", session_cls):
+            loop = asyncio.get_event_loop()
+            token = loop.run_until_complete(auth2._get_access_token())
+
+        self.assertEqual(token, "disk_token")
+        self.assertEqual(len(captured["calls"]), 0, "Valid on-disk token must avoid all HTTP calls")
+
+    def test_fetch_writes_file_and_new_instance_reuses_with_zero_http(self):
+        """After a real fetch the cache file is written; a NEW KisAuth at the
+        same path reuses it with zero HTTP calls."""
+        future_expiry = (datetime.now() + timedelta(hours=23)).strftime("%Y-%m-%d %H:%M:%S")
+        token_response = {
+            "access_token": "persisted_token",
+            "access_token_token_expired": future_expiry,
+            "token_type": "Bearer",
+        }
+        session_cls, captured = _make_mock_session(
+            lambda url, json=None, **kw: _make_mock_response(token_response)
+        )
+
+        auth1 = KisAuth(self.app_key, self.app_secret, token_cache_path=self._tmpdir)
+        with patch("aiohttp.ClientSession", session_cls):
+            loop = asyncio.get_event_loop()
+            t1 = loop.run_until_complete(auth1._get_access_token())
+
+        self.assertEqual(t1, "persisted_token")
+        self.assertEqual(len(captured["calls"]), 1)
+        self.assertTrue(os.path.exists(self._cache_file(auth1)))
+
+        # Second process reuses it without HTTP.
+        auth2 = KisAuth(self.app_key, self.app_secret, token_cache_path=self._tmpdir)
+        session_cls2, captured2 = _make_mock_session(
+            lambda url, json=None, **kw: _make_mock_response({"access_token": "fresh"})
+        )
+        with patch("aiohttp.ClientSession", session_cls2):
+            t2 = loop.run_until_complete(auth2._get_access_token())
+
+        self.assertEqual(t2, "persisted_token")
+        self.assertEqual(len(captured2["calls"]), 0, "Reuse from disk must avoid HTTP")
+
+    def test_expired_on_disk_token_triggers_fetch_and_rewrite(self):
+        """An expired on-disk token must NOT be reused: a fetch happens and the
+        file is rewritten with the fresh token."""
+        auth_seed = KisAuth(self.app_key, self.app_secret, token_cache_path=self._tmpdir)
+        cache_file = self._cache_file(auth_seed)
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+        with open(cache_file, "w") as f:
+            json.dump({
+                "access_token": "expired_token",
+                "token_expires_at": time.time() - 10,  # already expired
+                "approval_key": None,
+                "approval_key_expires_at": 0.0,
+            }, f)
+
+        future_expiry = (datetime.now() + timedelta(hours=23)).strftime("%Y-%m-%d %H:%M:%S")
+        token_response = {
+            "access_token": "renewed_token",
+            "access_token_token_expired": future_expiry,
+        }
+        session_cls, captured = _make_mock_session(
+            lambda url, json=None, **kw: _make_mock_response(token_response)
+        )
+
+        auth = KisAuth(self.app_key, self.app_secret, token_cache_path=self._tmpdir)
+        with patch("aiohttp.ClientSession", session_cls):
+            loop = asyncio.get_event_loop()
+            token = loop.run_until_complete(auth._get_access_token())
+
+        self.assertEqual(token, "renewed_token")
+        self.assertEqual(len(captured["calls"]), 1, "Expired disk token must trigger a fetch")
+        with open(cache_file) as f:
+            data = json.load(f)
+        self.assertEqual(data["access_token"], "renewed_token")
+
+    def test_corrupt_cache_file_does_not_crash_and_fetches_fresh(self):
+        """A corrupt/invalid JSON cache file must be silently ignored; the
+        connector fetches fresh and does not crash on construction."""
+        auth_seed = KisAuth(self.app_key, self.app_secret, token_cache_path=self._tmpdir)
+        cache_file = self._cache_file(auth_seed)
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+        with open(cache_file, "w") as f:
+            f.write("{not valid json at all ::::")
+
+        future_expiry = (datetime.now() + timedelta(hours=23)).strftime("%Y-%m-%d %H:%M:%S")
+        session_cls, captured = _make_mock_session(
+            lambda url, json=None, **kw: _make_mock_response({
+                "access_token": "after_corrupt",
+                "access_token_token_expired": future_expiry,
+            })
+        )
+
+        # Construction must not raise despite the corrupt file.
+        auth = KisAuth(self.app_key, self.app_secret, token_cache_path=self._tmpdir)
+        with patch("aiohttp.ClientSession", session_cls):
+            loop = asyncio.get_event_loop()
+            token = loop.run_until_complete(auth._get_access_token())
+
+        self.assertEqual(token, "after_corrupt")
+        self.assertEqual(len(captured["calls"]), 1)
+
+    def test_missing_cache_file_no_crash(self):
+        """Missing cache file → construction succeeds and a fetch happens."""
+        future_expiry = (datetime.now() + timedelta(hours=23)).strftime("%Y-%m-%d %H:%M:%S")
+        session_cls, captured = _make_mock_session(
+            lambda url, json=None, **kw: _make_mock_response({
+                "access_token": "no_file_token",
+                "access_token_token_expired": future_expiry,
+            })
+        )
+        auth = KisAuth(self.app_key, self.app_secret, token_cache_path=self._tmpdir)
+        with patch("aiohttp.ClientSession", session_cls):
+            loop = asyncio.get_event_loop()
+            token = loop.run_until_complete(auth._get_access_token())
+        self.assertEqual(token, "no_file_token")
+        self.assertEqual(len(captured["calls"]), 1)
+
+    # ------------------------------------------------------------------
+    # Approval key persistence
+    # ------------------------------------------------------------------
+
+    def test_valid_on_disk_approval_key_loaded_no_http(self):
+        """A valid cached approval key on disk should be loaded at construction
+        so get_ws_approval_key() returns it with ZERO HTTP calls."""
+        auth_seed = KisAuth(self.app_key, self.app_secret, token_cache_path=self._tmpdir)
+        cache_file = self._cache_file(auth_seed)
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+        with open(cache_file, "w") as f:
+            json.dump({
+                "access_token": None,
+                "token_expires_at": 0.0,
+                "approval_key": "disk_approval",
+                "approval_key_expires_at": time.time() + 86400,
+            }, f)
+
+        auth = KisAuth(self.app_key, self.app_secret, token_cache_path=self._tmpdir)
+        session_cls, captured = _make_mock_session(
+            lambda url, json=None, **kw: _make_mock_response({"approval_key": "should-not-be-used"})
+        )
+        with patch("aiohttp.ClientSession", session_cls):
+            loop = asyncio.get_event_loop()
+            key = loop.run_until_complete(auth.get_ws_approval_key())
+
+        self.assertEqual(key, "disk_approval")
+        self.assertEqual(len(captured["calls"]), 0)
+
+    def test_approval_key_fetch_persists_and_new_instance_reuses(self):
+        """After fetching an approval key it is persisted; a new KisAuth reuses
+        it with zero HTTP calls."""
+        session_cls, captured = _make_mock_session(
+            lambda url, json=None, **kw: _make_mock_response({"approval_key": "persisted_approval"})
+        )
+        auth1 = KisAuth(self.app_key, self.app_secret, token_cache_path=self._tmpdir)
+        with patch("aiohttp.ClientSession", session_cls):
+            loop = asyncio.get_event_loop()
+            k1 = loop.run_until_complete(auth1.get_ws_approval_key())
+
+        self.assertEqual(k1, "persisted_approval")
+        self.assertEqual(len(captured["calls"]), 1)
+
+        auth2 = KisAuth(self.app_key, self.app_secret, token_cache_path=self._tmpdir)
+        session_cls2, captured2 = _make_mock_session(
+            lambda url, json=None, **kw: _make_mock_response({"approval_key": "fresh"})
+        )
+        with patch("aiohttp.ClientSession", session_cls2):
+            k2 = loop.run_until_complete(auth2.get_ws_approval_key())
+
+        self.assertEqual(k2, "persisted_approval")
+        self.assertEqual(len(captured2["calls"]), 0)
+
+    def test_token_and_approval_share_one_file_without_clobbering(self):
+        """Persisting the approval key must not wipe a previously persisted
+        token (and vice-versa) — both live in the same cache file."""
+        future_expiry = (datetime.now() + timedelta(hours=23)).strftime("%Y-%m-%d %H:%M:%S")
+        token_resp = {"access_token": "tok", "access_token_token_expired": future_expiry}
+        approval_resp = {"approval_key": "appr"}
+
+        def handler(url, json=None, **kw):
+            if "Approval" in url:
+                return _make_mock_response(approval_resp)
+            return _make_mock_response(token_resp)
+
+        session_cls, _ = _make_mock_session(handler)
+        auth = KisAuth(self.app_key, self.app_secret, token_cache_path=self._tmpdir)
+        with patch("aiohttp.ClientSession", session_cls):
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(auth._get_access_token())
+            loop.run_until_complete(auth.get_ws_approval_key())
+
+        with open(self._cache_file(auth)) as f:
+            data = json.load(f)
+        self.assertEqual(data["access_token"], "tok")
+        self.assertEqual(data["approval_key"], "appr")
+
+    def test_different_app_keys_use_different_files(self):
+        """Distinct app_keys (and sandbox flags) must not collide on disk."""
+        a1 = KisAuth("key_one", "secret", token_cache_path=self._tmpdir)
+        a2 = KisAuth("key_two", "secret", token_cache_path=self._tmpdir)
+        a3 = KisAuth("key_one", "secret", sandbox=True, token_cache_path=self._tmpdir)
+        self.assertNotEqual(a1.token_cache_path, a2.token_cache_path)
+        self.assertNotEqual(a1.token_cache_path, a3.token_cache_path)
 
 
 if __name__ == "__main__":

@@ -116,6 +116,9 @@ class KisExchange(ExchangePyBase):
             app_key=self._app_key,
             app_secret=self._app_secret,
             sandbox=self._sandbox,
+            # token_cache_path=None -> KisAuth auto-derives hummingbot's
+            # persistent data dir so the daily token/approval key survive
+            # process/container restarts (KIS issues 1 token/app_key/day).
         )
 
     @property

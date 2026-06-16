@@ -1,4 +1,9 @@
 import asyncio
+import hashlib
+import json
+import logging
+import os
+import tempfile
 import time
 from datetime import datetime
 from typing import Dict, Optional
@@ -7,6 +12,12 @@ import aiohttp
 
 from hummingbot.core.web_assistant.auth import AuthBase
 from hummingbot.core.web_assistant.connections.data_types import RESTRequest, WSRequest
+
+_logger = logging.getLogger(__name__)
+
+# Safety margin (seconds) applied when deciding whether an on-disk cached
+# entry is still usable -- mirrors the in-memory 60s refresh buffer.
+_DISK_CACHE_MARGIN = 60
 
 # These mirror kis_constants.py but are duplicated here to avoid importing
 # the full constants module (which pulls in OrderState and heavy deps) at auth
@@ -43,7 +54,8 @@ class KisAuth(AuthBase):
 
     def __init__(self, app_key: str, app_secret: str, sandbox: bool = False,
                  initial_token: Optional[str] = None,
-                 initial_approval_key: Optional[str] = None):
+                 initial_approval_key: Optional[str] = None,
+                 token_cache_path: Optional[str] = None):
         self._app_key = app_key
         self._app_secret = app_secret
         self._sandbox = sandbox
@@ -57,6 +69,17 @@ class KisAuth(AuthBase):
         self._approval_key: Optional[str] = initial_approval_key
         self._approval_key_expires_at: float = (time.time() + 86400) if initial_approval_key else 0.0
 
+        # Disk persistence: resolve the cache file path. ``token_cache_path`` may
+        # be a directory (the daily-token cache file is derived inside it, keyed
+        # by app_key + sandbox) -- tests pass an isolated temp dir. ``None`` means
+        # auto-derive from hummingbot's persistent data directory.
+        self._token_cache_path: str = self._resolve_cache_path(token_cache_path)
+
+        # Hydrate the in-memory cache from disk so a process restart within the
+        # token's validity window reuses the daily token instead of re-issuing
+        # (KIS rate-limits issuance to 1/60s and expects daily-token reuse).
+        self._load_from_disk()
+
         # Single-flight locks: KIS issues at most one token (and one approval key)
         # per app_key per minute and expects the daily token to be reused. Without
         # these, the many authenticated requests fired concurrently at connector
@@ -65,6 +88,132 @@ class KisAuth(AuthBase):
         # concurrent callers await a single fetch and then share the cached token.
         self._token_lock = asyncio.Lock()
         self._approval_lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Disk persistence helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def token_cache_path(self) -> str:
+        """Absolute path of the on-disk token cache file for this account."""
+        return self._token_cache_path
+
+    def _cache_key(self) -> str:
+        """A short, collision-resistant key derived from app_key + sandbox flag.
+
+        The app secret is intentionally excluded from the filename; only a hash
+        of the public app_key (plus environment flag) is used so different
+        accounts / sandbox modes do not share a file.
+        """
+        raw = f"{self._app_key}|sandbox={self._sandbox}".encode("utf-8")
+        digest = hashlib.sha256(raw).hexdigest()[:16]
+        return digest
+
+    def _default_data_dir(self) -> str:
+        """Best-effort resolution of hummingbot's persistent data directory.
+
+        Order: hummingbot.data_path() (the clean, mounted ``<prefix>/data`` dir
+        in the docker deployment) -> ``<cwd>/data`` -> a temp dir.  Every step is
+        guarded so connector construction never crashes on path resolution.
+        """
+        try:
+            from hummingbot import data_path
+            return data_path()
+        except Exception:
+            pass
+        try:
+            cwd_data = os.path.join(os.getcwd(), "data")
+            os.makedirs(cwd_data, exist_ok=True)
+            return cwd_data
+        except Exception:
+            return tempfile.gettempdir()
+
+    def _resolve_cache_path(self, token_cache_path: Optional[str]) -> str:
+        """Resolve the full cache *file* path.
+
+        If ``token_cache_path`` is None, auto-derive the data dir.  If it points
+        at an existing directory (or has no file extension), treat it as a
+        directory and place the keyed cache file inside it.  Otherwise treat it
+        as an explicit file path.
+        """
+        try:
+            base = token_cache_path if token_cache_path is not None else self._default_data_dir()
+            # Treat as a directory unless it looks like an explicit .json file.
+            if os.path.isdir(base) or not base.endswith(".json"):
+                return os.path.join(base, f"kis_token_cache_{self._cache_key()}.json")
+            return base
+        except Exception:
+            # Last-resort fallback: a temp-dir file so persistence still works.
+            return os.path.join(tempfile.gettempdir(), f"kis_token_cache_{self._cache_key()}.json")
+
+    def _load_from_disk(self) -> None:
+        """Hydrate in-memory token/approval fields from the on-disk cache.
+
+        Missing file, corrupt/invalid JSON, unreadable file, or expired entries
+        are silently ignored -- the connector falls back to fetching fresh and
+        never crashes on construction.
+        """
+        try:
+            with open(self._token_cache_path, "r") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return
+            now = time.time()
+
+            # Do not overwrite an explicitly-provided initial token/key.
+            if self._access_token is None:
+                token = data.get("access_token")
+                expires_at = data.get("token_expires_at")
+                if (isinstance(token, str) and token
+                        and isinstance(expires_at, (int, float))
+                        and now < expires_at - _DISK_CACHE_MARGIN):
+                    self._access_token = token
+                    self._token_expires_at = float(expires_at)
+
+            if self._approval_key is None:
+                approval = data.get("approval_key")
+                appr_expires = data.get("approval_key_expires_at")
+                if (isinstance(approval, str) and approval
+                        and isinstance(appr_expires, (int, float))
+                        and now < appr_expires - _DISK_CACHE_MARGIN):
+                    self._approval_key = approval
+                    self._approval_key_expires_at = float(appr_expires)
+        except FileNotFoundError:
+            return
+        except Exception:
+            # Corrupt / unreadable / unexpected: ignore and fetch fresh.
+            _logger.debug("KIS token cache could not be loaded; fetching fresh.", exc_info=True)
+
+    def _persist_to_disk(self) -> None:
+        """Atomically write the current token + approval key to disk.
+
+        Best-effort: a temp file in the same directory is written then
+        ``os.replace``d into place so concurrent readers never see a partial
+        file.  Any failure (read-only FS, permissions) is swallowed -- on-disk
+        persistence is an optimization, not a correctness requirement.
+        """
+        payload = {
+            "access_token": self._access_token,
+            "token_expires_at": self._token_expires_at,
+            "approval_key": self._approval_key,
+            "approval_key_expires_at": self._approval_key_expires_at,
+        }
+        try:
+            directory = os.path.dirname(self._token_cache_path) or "."
+            os.makedirs(directory, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(prefix=".kis_token_", suffix=".tmp", dir=directory)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(payload, f)
+                os.replace(tmp_path, self._token_cache_path)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except Exception:
+            _logger.debug("KIS token cache could not be persisted.", exc_info=True)
 
     # ------------------------------------------------------------------
     # Public properties
@@ -169,6 +318,7 @@ class KisAuth(AuthBase):
 
             self._access_token = token
             self._token_expires_at = expires_at
+            self._persist_to_disk()
             return token
 
     # ------------------------------------------------------------------
@@ -212,4 +362,5 @@ class KisAuth(AuthBase):
             self._approval_key = approval_key
             # KIS approval key is valid for 1 day
             self._approval_key_expires_at = now + 86400
+            self._persist_to_disk()
             return approval_key

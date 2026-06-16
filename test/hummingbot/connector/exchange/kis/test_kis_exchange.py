@@ -419,6 +419,26 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         self.assertIsNone(auth._access_token)
         self.assertEqual(0.0, auth._token_expires_at)
 
+    def test_authenticator_wires_disk_token_cache(self):
+        # The authenticator must auto-derive a token_cache_path so the daily
+        # OAuth token / approval key survive process restarts. We point
+        # hummingbot.data_path() at an isolated temp dir to prove the wiring
+        # without touching the real data directory.
+        import os
+        import shutil
+        import tempfile
+        from unittest.mock import patch
+
+        tmp = tempfile.mkdtemp(prefix="kis_exch_cache_")
+        try:
+            with patch("hummingbot.data_path", return_value=tmp):
+                auth = self._make_exchange().authenticator
+            self.assertTrue(auth.token_cache_path.startswith(tmp))
+            self.assertTrue(auth.token_cache_path.endswith(".json"))
+            self.assertIn("kis_token_cache_", os.path.basename(auth.token_cache_path))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_constructor_accepts_kis_sandbox_kwarg(self):
         # The non-trading instantiation path (settings.
         # non_trading_connector_instance_with_default_configuration, used by the
