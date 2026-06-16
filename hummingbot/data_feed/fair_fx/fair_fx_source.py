@@ -48,6 +48,7 @@ class FairFxSource(NetworkBase):
         self._bank: Optional[Decimal] = None
         self._bank_ts: float = 0.0
         self._poll_task: Optional[asyncio.Task] = None
+        self._check_fail_logged: bool = False
 
     def _now(self) -> float:
         return time.time()
@@ -94,8 +95,16 @@ class FairFxSource(NetworkBase):
             return NetworkStatus.NOT_CONNECTED
         try:
             await self._poll_once()   # primes the bank rate too
+            self._check_fail_logged = False
             return NetworkStatus.CONNECTED
-        except Exception:
+        except Exception as e:
+            # Surface the failure once per streak: before this, a rejected Toss
+            # credential (401 invalid_client) vanished silently — start_network's
+            # _poll_loop never starts when check_network never succeeds, so its
+            # own failure log never fired. Throttle to avoid per-interval spam.
+            if not self._check_fail_logged:
+                self.logger().warning(f"FairFxSource check_network failed (FX unavailable): {e}")
+                self._check_fail_logged = True
             return NetworkStatus.NOT_CONNECTED
 
     async def start_network(self) -> None:

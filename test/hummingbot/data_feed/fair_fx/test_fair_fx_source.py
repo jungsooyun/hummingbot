@@ -86,6 +86,18 @@ class FairFxSourceTest(unittest.IsolatedAsyncioTestCase):
         src = _fresh_source(raises=True)
         self.assertEqual(await src.check_network(), NetworkStatus.NOT_CONNECTED)
 
+    async def test_check_network_failure_is_logged_once(self):
+        # Live-verify lesson: a rejected Toss credential (401 invalid_client)
+        # surfaced NO log because check_network swallowed the exception silently.
+        # The failure must be logged (so a bad cred is diagnosable), but only
+        # once per failure streak — not on every poll interval.
+        src = _fresh_source(raises=True)
+        with self.assertLogs(src.logger().name, level="WARNING") as cm:
+            self.assertEqual(await src.check_network(), NetworkStatus.NOT_CONNECTED)
+            self.assertEqual(await src.check_network(), NetworkStatus.NOT_CONNECTED)
+        fails = [m for m in cm.output if "check_network failed" in m]
+        self.assertEqual(len(fails), 1)
+
     async def test_get_instance_singleton(self):
         FairFxSource._instance = None
         self.assertIs(FairFxSource.get_instance(), FairFxSource.get_instance())
