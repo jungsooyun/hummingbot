@@ -466,6 +466,7 @@ class KisExchange(ExchangePyBase):
             "ODNO": order.exchange_order_id or "",
             "INQR_DVSN_3": "00",
             "INQR_DVSN_1": "",
+            "EXCG_ID_DVSN_CD": CONSTANTS.EXCG_ALL,  # reconcile KRX+NXT+SOR fills
             "CTX_AREA_FK100": "",
             "CTX_AREA_NK100": "",
         }

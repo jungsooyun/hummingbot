@@ -393,22 +393,14 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         )
 
     def validate_order_status_request(self, order: InFlightOrder, request_call: RequestCall):
-        # Order status is queried via GET with params
-        request_params = request_call.kwargs.get("params", {})
-        # The order detail endpoint uses query parameters; verify it was called
-        # (actual param validation depends on implementation)
-        self.assertTrue(
-            request_params is not None or request_call.kwargs.get("data") is not None,
-            "Order status request should have params or data",
-        )
+        request_params = request_call.kwargs["params"]
+        self.assertEqual("ALL", request_params["EXCG_ID_DVSN_CD"])
+        self.assertEqual(order.exchange_order_id, request_params["ODNO"])
 
     def validate_trades_request(self, order: InFlightOrder, request_call: RequestCall):
-        # Trade details endpoint validation
-        request_params = request_call.kwargs.get("params", {})
-        self.assertTrue(
-            request_params is not None or request_call.kwargs.get("data") is not None,
-            "Trades request should have params or data",
-        )
+        request_params = request_call.kwargs["params"]
+        self.assertEqual("ALL", request_params["EXCG_ID_DVSN_CD"])
+        self.assertEqual(order.exchange_order_id, request_params["ODNO"])
 
     def configure_successful_cancelation_response(
         self,
