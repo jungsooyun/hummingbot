@@ -352,6 +352,24 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
             self._make_exchange(kis_market_routing="sor", domain="sandbox")._excg_for_routing(),
         )
 
+    def test_constructor_accepts_balance_asset_limit(self):
+        # The connector factory (settings.conn_init_parameters) ALWAYS forwards
+        # balance_asset_limit (and rate_limits_share_pct for sub-domains) to every
+        # connector __init__. KIS must accept them and forward balance_asset_limit
+        # to ExchangePyBase, or live instantiation raises TypeError.
+        limit = {"kis": {"KRW": Decimal("1000")}}
+        ex = KisExchange(
+            kis_app_key="testAppKey",
+            kis_app_secret="testAppSecret",
+            kis_account_number="12345678-01",
+            trading_pairs=[self.trading_pair],
+            kis_market_routing="sor",
+            balance_asset_limit=limit,
+            rate_limits_share_pct=Decimal("50"),
+        )
+        self.assertEqual("sor", ex._market_routing)
+        self.assertEqual(limit, ex._balance_asset_limit)
+
     def validate_auth_credentials_present(self, request_call: RequestCall):
         request_headers = request_call.kwargs["headers"]
         self.assertIn("Authorization", request_headers)

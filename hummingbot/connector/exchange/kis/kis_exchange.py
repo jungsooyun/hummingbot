@@ -55,6 +55,8 @@ class KisExchange(ExchangePyBase):
         kis_account_number: str,
         trading_pairs: Optional[List[str]] = None,
         trading_required: bool = True,
+        balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+        rate_limits_share_pct: Decimal = Decimal("100"),
         kis_market_routing: str = CONSTANTS.MARKET_ROUTING_SOR,
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
     ):
@@ -88,7 +90,7 @@ class KisExchange(ExchangePyBase):
         self._cano = parts[0] if len(parts) > 1 else kis_account_number
         self._acnt_prdt_cd = parts[1] if len(parts) > 1 else "01"
 
-        super().__init__()
+        super().__init__(balance_asset_limit, rate_limits_share_pct)
         for _warning in self._routing_warnings:
             self.logger().warning(_warning)
         # Balance updates are still REST-polled; order/fill events come via WS
