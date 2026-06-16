@@ -69,8 +69,15 @@ class FairFxSource(NetworkBase):
 
     async def _poll_once(self) -> None:
         bank = await self._toss_client.fetch_exchange_rate()
+        first = self._bank is None
         self._bank = bank
         self._bank_ts = self._now()
+        if first:
+            # Activation signal: emit once when the bank rate first becomes
+            # available so operators can confirm live FX during verification.
+            # The bank value never resets to None afterwards, so this never
+            # re-logs on routine polls.
+            self.logger().info(f"FairFxSource activated: Toss bank mid={bank}")
 
     async def _poll_loop(self) -> None:
         while True:

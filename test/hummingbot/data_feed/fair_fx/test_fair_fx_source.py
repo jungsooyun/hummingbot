@@ -36,6 +36,18 @@ class FairFxSourceTest(unittest.IsolatedAsyncioTestCase):
         await src._poll_once()
         self.assertEqual(src.get_fx(), blend_fx_quote(D("1400"), *usdt))
 
+    async def test_first_poll_logs_activation_once(self):
+        # Observability lesson (JEP-148 live-verify): the first successful bank
+        # fetch must emit an INFO line so operators can confirm FX activation;
+        # subsequent polls must NOT re-log (no per-poll spam).
+        src = _fresh_source(rate=D("1400"))
+        with self.assertLogs(src.logger().name, level="INFO") as cm:
+            await src._poll_once()   # None -> value : activation, logs
+            await src._poll_once()   # value -> value : no re-log
+        activations = [m for m in cm.output if "activated" in m.lower()]
+        self.assertEqual(len(activations), 1)
+        self.assertIn("1400", activations[0])
+
     async def test_stale_bank_returns_none(self):
         src = _fresh_source()
         clock = [1000.0]
