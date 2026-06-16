@@ -313,6 +313,23 @@ class KisExchange(ExchangePyBase):
     # Trading rules
     # ------------------------------------------------------------------
 
+    async def _update_trading_rules(self):
+        # KIS exposes no trading-rules API, and its ticker endpoint returns a
+        # single quote rather than a symbol list, so a network fetch yields
+        # nothing (and would fail auth — there is no symbols payload to parse).
+        # Trading pairs are configured externally; synthesise one rule per pair.
+        # KRX trades whole shares (size increment 1) at integer-KRW prices; the
+        # price-band tick is applied per order by the strategy/config rather than
+        # via a single static increment here.
+        self._trading_rules.clear()
+        for trading_pair in self._trading_pairs:
+            self._trading_rules[trading_pair] = TradingRule(
+                trading_pair=trading_pair,
+                min_order_size=Decimal("1"),
+                min_price_increment=Decimal("1"),
+                min_base_amount_increment=Decimal("1"),
+            )
+
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
         result = []
         symbols = exchange_info_dict.get("output", {}).get("symbols", [])
@@ -622,6 +639,17 @@ class KisExchange(ExchangePyBase):
     # ------------------------------------------------------------------
     # Trading pair symbol map
     # ------------------------------------------------------------------
+
+    async def _initialize_trading_pair_symbol_map(self):
+        # KIS exposes no symbols-list API; build the map from the externally
+        # configured pairs instead of a network request. The exchange symbol is
+        # the numeric stock code, i.e. the base token of the "<code>-KRW" pair.
+        mapping = bidict()
+        for trading_pair in self._trading_pairs:
+            base, _, _quote = trading_pair.partition("-")
+            if base:
+                mapping[base] = trading_pair
+        self._set_trading_pair_symbol_map(mapping)
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
         mapping = bidict()

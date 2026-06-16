@@ -259,10 +259,13 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
 
     @property
     def expected_trading_rule(self):
+        # KIS has no trading-rules API; rules are synthesised per configured pair
+        # (whole-share size, integer-KRW price increment). See
+        # KisExchange._update_trading_rules.
         return TradingRule(
             trading_pair=self.trading_pair,
             min_order_size=Decimal("1"),
-            min_price_increment=Decimal("100"),
+            min_price_increment=Decimal("1"),
             min_base_amount_increment=Decimal("1"),
         )
 
@@ -320,6 +323,54 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         exchange._auth._access_token = "test_access_token"
         exchange._auth._token_expires_at = time.time() + 86400
         return exchange
+
+    @aioresponses()
+    async def test_all_trading_pairs_does_not_raise_exception(self, mock_api):
+        # Override the base test: KIS has no symbols-list API, so trading pairs
+        # come from configuration rather than the network. all_trading_pairs()
+        # therefore never depends on (or is broken by) a failed request — it
+        # returns the externally configured pairs and never raises.
+        self.exchange._set_trading_pair_symbol_map(None)
+
+        result: List[str] = await self.exchange.all_trading_pairs()
+
+        self.assertEqual([self.trading_pair], result)
+
+    async def test_update_trading_rules_synthesised_network_free(self):
+        # KIS has no trading-rules API: rules are synthesised for the configured
+        # pairs with no HTTP request. Regression for the live-startup hang where
+        # the ticker-based fetch was sent unauthenticated (EGW00304) and returned
+        # no symbol list, so trading rules never initialised and the connector
+        # never reached "ready".
+        exchange = KisExchange(
+            kis_app_key="testAppKey",
+            kis_app_secret="testAppSecret",
+            kis_account_number="12345678-01",
+            trading_pairs=["000660-KRW", "005930-KRW"],
+        )
+
+        await exchange._update_trading_rules()
+
+        self.assertEqual({"000660-KRW", "005930-KRW"}, set(exchange.trading_rules.keys()))
+        rule = exchange.trading_rules["000660-KRW"]
+        self.assertEqual(Decimal("1"), rule.min_order_size)
+        self.assertEqual(Decimal("1"), rule.min_price_increment)
+        self.assertEqual(Decimal("1"), rule.min_base_amount_increment)
+
+    async def test_symbol_map_built_from_configured_pairs_network_free(self):
+        # The symbol map is derived from the configured pairs (exchange symbol =
+        # the numeric stock code, the base of "<code>-KRW"), with no network call.
+        exchange = KisExchange(
+            kis_app_key="testAppKey",
+            kis_app_secret="testAppSecret",
+            kis_account_number="12345678-01",
+            trading_pairs=["000660-KRW"],
+        )
+
+        await exchange._initialize_trading_pair_symbol_map()
+
+        self.assertEqual("000660", await exchange.exchange_symbol_associated_to_pair("000660-KRW"))
+        self.assertEqual("000660-KRW", await exchange.trading_pair_associated_to_exchange_symbol("000660"))
 
     # ------------------------------------------------------------------
     # SOR/NXT routing — constructor wiring

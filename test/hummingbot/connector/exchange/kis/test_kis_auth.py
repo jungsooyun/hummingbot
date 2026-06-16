@@ -222,6 +222,45 @@ class TestKisAuth(unittest.TestCase):
         self.assertEqual(token2, "cached_token_value")
         self.assertEqual(len(captured["calls"]), 1, "Should only make one HTTP call")
 
+    def test_get_access_token_single_flight_under_concurrency(self):
+        """Concurrent callers must share a single token fetch (single-flight),
+        not each issue their own. KIS rate-limits token issuance to 1 call/60s
+        and expects the daily token to be reused, so a startup burst of
+        authenticated requests must collapse to ONE /oauth2/tokenP call."""
+        future_expiry = (datetime.now() + timedelta(hours=23)).strftime("%Y-%m-%d %H:%M:%S")
+        token_response = {
+            "access_token": "shared_token",
+            "access_token_token_expired": future_expiry,
+            "token_type": "Bearer",
+            "expires_in": 86400,
+        }
+
+        def slow_response(url, json=None, **kw):
+            resp = MagicMock()
+            resp.status = 200
+
+            async def _json():
+                # Yield control so every concurrent caller reaches the lock before
+                # the first fetch completes and caches the token.
+                await asyncio.sleep(0.02)
+                return token_response
+
+            resp.json = _json
+            return resp
+
+        session_cls, captured = _make_mock_session(slow_response)
+
+        async def _run():
+            return await asyncio.gather(*[self.auth._get_access_token() for _ in range(8)])
+
+        with patch("aiohttp.ClientSession", session_cls):
+            loop = asyncio.get_event_loop()
+            tokens = loop.run_until_complete(_run())
+
+        self.assertEqual(tokens, ["shared_token"] * 8)
+        self.assertEqual(len(captured["calls"]), 1,
+                         "single-flight: 8 concurrent callers must trigger only one token fetch")
+
     # ------------------------------------------------------------------
     # Token refresh on expiry
     # ------------------------------------------------------------------

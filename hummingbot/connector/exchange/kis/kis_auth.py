@@ -1,3 +1,4 @@
+import asyncio
 import time
 from datetime import datetime
 from typing import Dict, Optional
@@ -55,6 +56,15 @@ class KisAuth(AuthBase):
         # WS approval key cache
         self._approval_key: Optional[str] = initial_approval_key
         self._approval_key_expires_at: float = (time.time() + 86400) if initial_approval_key else 0.0
+
+        # Single-flight locks: KIS issues at most one token (and one approval key)
+        # per app_key per minute and expects the daily token to be reused. Without
+        # these, the many authenticated requests fired concurrently at connector
+        # startup each trigger their own token fetch, get serialised behind the
+        # 1-call/60s rate limit, and stall the connector for minutes. The lock makes
+        # concurrent callers await a single fetch and then share the cached token.
+        self._token_lock = asyncio.Lock()
+        self._approval_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Public properties
@@ -121,37 +131,45 @@ class KisAuth(AuthBase):
         if self._access_token and now < self._token_expires_at - 60:
             return self._access_token
 
-        base_url = _REST_SANDBOX_URL if self._sandbox else _REST_URL
-        url = f"{base_url}/{_TOKEN_PATH}"
+        async with self._token_lock:
+            # Re-check inside the lock: a concurrent caller may have fetched while
+            # we were waiting, in which case we reuse the now-cached daily token
+            # instead of issuing another one.
+            now = time.time()
+            if self._access_token and now < self._token_expires_at - 60:
+                return self._access_token
 
-        body = {
-            "grant_type": "client_credentials",
-            "appkey": self._app_key,
-            "appsecret": self._app_secret,
-        }
+            base_url = _REST_SANDBOX_URL if self._sandbox else _REST_URL
+            url = f"{base_url}/{_TOKEN_PATH}"
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=body) as response:
-                payload = await response.json()
+            body = {
+                "grant_type": "client_credentials",
+                "appkey": self._app_key,
+                "appsecret": self._app_secret,
+            }
 
-        token = payload.get("access_token")
-        if not token:
-            raise RuntimeError(f"Failed to get KIS access token: {payload}")
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=body) as response:
+                    payload = await response.json()
 
-        # Parse expiry from response, fallback to 23 hours from now
-        expires_at_raw = payload.get("access_token_token_expired")
-        expires_at = now + 23 * 3600  # fallback
-        if isinstance(expires_at_raw, str):
-            try:
-                expires_at = datetime.strptime(
-                    expires_at_raw, "%Y-%m-%d %H:%M:%S"
-                ).timestamp()
-            except ValueError:
-                pass  # keep fallback
+            token = payload.get("access_token")
+            if not token:
+                raise RuntimeError(f"Failed to get KIS access token: {payload}")
 
-        self._access_token = token
-        self._token_expires_at = expires_at
-        return token
+            # Parse expiry from response, fallback to 23 hours from now
+            expires_at_raw = payload.get("access_token_token_expired")
+            expires_at = now + 23 * 3600  # fallback
+            if isinstance(expires_at_raw, str):
+                try:
+                    expires_at = datetime.strptime(
+                        expires_at_raw, "%Y-%m-%d %H:%M:%S"
+                    ).timestamp()
+                except ValueError:
+                    pass  # keep fallback
+
+            self._access_token = token
+            self._token_expires_at = expires_at
+            return token
 
     # ------------------------------------------------------------------
     # WebSocket approval key
@@ -168,24 +186,30 @@ class KisAuth(AuthBase):
         if self._approval_key and now < self._approval_key_expires_at - 60:
             return self._approval_key
 
-        base_url = _REST_SANDBOX_URL if self._sandbox else _REST_URL
-        url = f"{base_url}/{_WS_APPROVAL_PATH}"
+        async with self._approval_lock:
+            # Re-check inside the lock (single-flight, see _get_access_token).
+            now = time.time()
+            if self._approval_key and now < self._approval_key_expires_at - 60:
+                return self._approval_key
 
-        body = {
-            "grant_type": "client_credentials",
-            "appkey": self._app_key,
-            "secretkey": self._app_secret,
-        }
+            base_url = _REST_SANDBOX_URL if self._sandbox else _REST_URL
+            url = f"{base_url}/{_WS_APPROVAL_PATH}"
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=body) as response:
-                payload = await response.json()
+            body = {
+                "grant_type": "client_credentials",
+                "appkey": self._app_key,
+                "secretkey": self._app_secret,
+            }
 
-        approval_key = payload.get("approval_key")
-        if not approval_key:
-            raise RuntimeError(f"Failed to get KIS WS approval key: {payload}")
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=body) as response:
+                    payload = await response.json()
 
-        self._approval_key = approval_key
-        # KIS approval key is valid for 1 day
-        self._approval_key_expires_at = now + 86400
-        return approval_key
+            approval_key = payload.get("approval_key")
+            if not approval_key:
+                raise RuntimeError(f"Failed to get KIS WS approval key: {payload}")
+
+            self._approval_key = approval_key
+            # KIS approval key is valid for 1 day
+            self._approval_key_expires_at = now + 86400
+            return approval_key
