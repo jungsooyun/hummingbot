@@ -14,7 +14,7 @@ from hummingbot.core.event.events import (
     SellOrderCreatedEvent,
 )
 from hummingbot.logger import HummingbotLogger
-from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
+from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
 from hummingbot.strategy_v2.executors.ladder_maker_executor.data_types import LadderMakerExecutorConfig
 from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import (
@@ -52,7 +52,7 @@ class LadderMakerExecutor(ExecutorBase):
 
     def __init__(
         self,
-        strategy: ScriptStrategyBase,
+        strategy: StrategyV2Base,
         config: LadderMakerExecutorConfig,
         update_interval: float = 1.0,
         max_retries: int = 10,

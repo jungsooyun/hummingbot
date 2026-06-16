@@ -16,7 +16,7 @@ from hummingbot.core.event.events import (
     SellOrderCreatedEvent,
 )
 from hummingbot.logger import HummingbotLogger
-from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
+from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
 from hummingbot.strategy_v2.executors.inventory_rebalance_executor.data_types import InventoryRebalanceExecutorConfig
 from hummingbot.strategy_v2.models.base import RunnableStatus
@@ -34,7 +34,7 @@ class InventoryRebalanceExecutor(ExecutorBase):
 
     def __init__(
         self,
-        strategy: ScriptStrategyBase,
+        strategy: StrategyV2Base,
         config: InventoryRebalanceExecutorConfig,
         update_interval: float = 1.0,
         max_retries: int = 10,
