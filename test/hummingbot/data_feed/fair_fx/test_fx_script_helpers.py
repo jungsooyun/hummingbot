@@ -2,9 +2,22 @@ import unittest
 from decimal import Decimal
 
 from hummingbot.core.data_type.common import PriceType
-from hummingbot.data_feed.fair_fx.fx_script_helpers import discover_fx_market, make_usdt_getter
+from hummingbot.data_feed.fair_fx.fx_script_helpers import (
+    decrypt_client_secret,
+    discover_fx_market,
+    make_usdt_getter,
+)
 
 D = Decimal
+
+
+class FakeSecretsManager:
+    """Mimics ETHKeyFileSecretManger: decrypt_secret_value raises on plaintext."""
+
+    def decrypt_secret_value(self, attr, value):
+        if not value.startswith("enc:"):
+            raise ValueError("not an encrypted keystore")
+        return value[len("enc:"):]
 
 
 class FakeConnector:
@@ -57,6 +70,24 @@ class FxScriptHelpersTest(unittest.TestCase):
     def test_discover_default_when_absent(self):
         cfgs = [FakeCfg(), FakeCfg()]
         self.assertEqual(discover_fx_market(cfgs), ("upbit", "USDT-KRW"))
+
+    # Lesson: client-config is_secure fields (toss_fx) are NOT decrypted at load
+    # (unlike connector configs), so get_secret_value() returns the encrypted
+    # keystore. decrypt_client_secret peels it at point of use.
+    def test_decrypt_client_secret_decrypts_keystore(self):
+        sm = FakeSecretsManager()
+        self.assertEqual(decrypt_client_secret(sm, "toss_client_id", "enc:abc123"), "abc123")
+
+    def test_decrypt_client_secret_plaintext_passthrough(self):
+        # Already-plaintext (e.g., tests / non-secure path) -> returned unchanged.
+        sm = FakeSecretsManager()
+        self.assertEqual(decrypt_client_secret(sm, "toss_client_id", "abc123"), "abc123")
+
+    def test_decrypt_client_secret_empty(self):
+        self.assertEqual(decrypt_client_secret(FakeSecretsManager(), "toss_client_id", ""), "")
+
+    def test_decrypt_client_secret_no_manager(self):
+        self.assertEqual(decrypt_client_secret(None, "toss_client_id", "enc:abc"), "enc:abc")
 
 
 if __name__ == "__main__":

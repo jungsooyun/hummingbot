@@ -1,11 +1,12 @@
 import os
 from typing import Dict
 
+from hummingbot.client.config.security import Security
 from hummingbot.client.hummingbot_application import HummingbotApplication
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.clock import Clock
 from hummingbot.data_feed.fair_fx.fair_fx_source import FairFxSource
-from hummingbot.data_feed.fair_fx.fx_script_helpers import discover_fx_market, make_usdt_getter
+from hummingbot.data_feed.fair_fx.fx_script_helpers import decrypt_client_secret, discover_fx_market, make_usdt_getter
 from hummingbot.data_feed.fair_fx.toss_fx_client import TossFxClient
 from scripts.v2_with_controllers import V2WithControllers, V2WithControllersConfig
 
@@ -33,8 +34,9 @@ class V2Hip3KisFx(V2WithControllers):
 
     def _build_fx_source_deps(self):
         cfg = HummingbotApplication.main_application().client_config_map
-        client_id = cfg.toss_fx.toss_client_id.get_secret_value()
-        client_secret = cfg.toss_fx.toss_client_secret.get_secret_value()
+        sm = Security.secrets_manager
+        client_id = decrypt_client_secret(sm, "toss_client_id", cfg.toss_fx.toss_client_id.get_secret_value())
+        client_secret = decrypt_client_secret(sm, "toss_client_secret", cfg.toss_fx.toss_client_secret.get_secret_value())
         toss_client = TossFxClient(client_id, client_secret)
         controller_configs = [c.config for c in self.controllers.values()]
         fx_connector, fx_trading_pair = discover_fx_market(controller_configs)

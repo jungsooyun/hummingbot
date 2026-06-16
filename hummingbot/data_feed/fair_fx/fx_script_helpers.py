@@ -14,6 +14,24 @@ from hummingbot.core.data_type.common import PriceType
 UsdtQuote = Tuple[Optional[Decimal], Optional[Decimal]]
 
 
+def decrypt_client_secret(secrets_manager, attr: str, raw: str) -> str:
+    """Decrypt a client-config ``is_secure`` value at point of use.
+
+    The hummingbot client config map (``conf_client.yml``) is loaded BEFORE login
+    and — unlike connector configs (``load_connector_config_map_from_file`` calls
+    ``decrypt_all_secure_data``) — its ``is_secure`` fields are never decrypted, so
+    ``SecretStr.get_secret_value()`` hands back the encrypted keystore. Peel one
+    layer here. Returns ``raw`` unchanged when it is empty, when no secrets
+    manager is available, or when it is already plaintext (``decrypt_secret_value``
+    raises on a non-keystore value — e.g. in tests)."""
+    if not raw or secrets_manager is None:
+        return raw
+    try:
+        return secrets_manager.decrypt_secret_value(attr, raw)
+    except Exception:
+        return raw
+
+
 def _clean(value) -> Optional[Decimal]:
     if value is None:
         return None
