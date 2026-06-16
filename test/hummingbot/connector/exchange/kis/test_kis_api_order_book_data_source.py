@@ -1049,6 +1049,63 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(trade_queue.empty())
 
     # ------------------------------------------------------------------
+    # Test: SOR/NXT routing-aware subscription + dispatch
+    # ------------------------------------------------------------------
+
+    def _make_ds(self, market_routing):
+        return KisAPIOrderBookDataSource(
+            trading_pairs=[self.trading_pair],
+            connector=self.connector,
+            api_factory=self.connector._web_assistants_factory,
+            auth=self.mock_auth,
+            domain=CONSTANTS.DEFAULT_DOMAIN,
+            market_routing=market_routing,
+        )
+
+    def _ws_orderbook_payload(self) -> str:
+        """Caret body of an orderbook message (without the 0|TR_ID|TR_KEY| prefix)."""
+        return self._ws_orderbook_raw().split("|", 3)[3]
+
+    async def test_subscribe_uses_unified_tr_ids_under_sor(self):
+        ds = self._make_ds("sor")
+        ws = AsyncMock()
+        with patch.object(self.connector, "exchange_symbol_associated_to_pair",
+                          new_callable=AsyncMock, return_value="005930"):
+            await ds._subscribe_ws_channels(ws, "approval")
+        sent = [c[0][0]["body"]["input"]["tr_id"] for c in ws.send_json.call_args_list]
+        self.assertEqual(["H0UNASP0", "H0UNCNT0"], sent)
+
+    async def test_subscribe_uses_nxt_tr_ids_under_nxt(self):
+        ds = self._make_ds("nxt")
+        ws = AsyncMock()
+        with patch.object(self.connector, "exchange_symbol_associated_to_pair",
+                          new_callable=AsyncMock, return_value="005930"):
+            await ds._subscribe_ws_channels(ws, "approval")
+        sent = [c[0][0]["body"]["input"]["tr_id"] for c in ws.send_json.call_args_list]
+        self.assertEqual(["H0NXASP0", "H0NXCNT0"], sent)
+
+    async def test_handle_data_message_unified_orderbook_dispatched(self):
+        ds = self._make_ds("sor")
+        raw = "0|H0UNASP0|005930|" + self._ws_orderbook_payload()
+        with patch.object(ds, "_process_orderbook_data", new_callable=AsyncMock) as m:
+            await ds._handle_data_message(raw)
+            m.assert_awaited_once()
+
+    async def test_handle_data_message_krx_ignored_under_sor(self):
+        ds = self._make_ds("sor")
+        raw = "0|H0STASP0|005930|" + self._ws_orderbook_payload()
+        with patch.object(ds, "_process_orderbook_data", new_callable=AsyncMock) as m:
+            await ds._handle_data_message(raw)
+            m.assert_not_awaited()
+
+    async def test_handle_data_message_nxt_orderbook_dispatched(self):
+        ds = self._make_ds("nxt")
+        raw = "0|H0NXASP0|005930|" + self._ws_orderbook_payload()
+        with patch.object(ds, "_process_orderbook_data", new_callable=AsyncMock) as m:
+            await ds._handle_data_message(raw)
+            m.assert_awaited_once()
+
+    # ------------------------------------------------------------------
     # Test: _resolve_trading_pair
     # ------------------------------------------------------------------
 

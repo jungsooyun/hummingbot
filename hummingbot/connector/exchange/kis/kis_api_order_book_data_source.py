@@ -114,19 +114,19 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 trading_pair=trading_pair
             )
 
-            # Subscribe to orderbook (H0STASP0)
+            # Subscribe to orderbook (KRX H0STASP0 / NXT H0NXASP0 / unified H0UNASP0)
             ob_msg = self._build_subscription_message(
                 approval_key=approval_key,
-                tr_id=CONSTANTS.WS_DOMESTIC_STOCK_ORDERBOOK_TR_ID,
+                tr_id=self._ob_tr_id,
                 tr_key=symbol,
                 tr_type="1",
             )
             await ws.send_json(ob_msg)
 
-            # Subscribe to trades (H0STCNT0)
+            # Subscribe to trades (KRX H0STCNT0 / NXT H0NXCNT0 / unified H0UNCNT0)
             trade_msg = self._build_subscription_message(
                 approval_key=approval_key,
-                tr_id=CONSTANTS.WS_DOMESTIC_STOCK_TRADE_TR_ID,
+                tr_id=self._trade_tr_id,
                 tr_key=symbol,
                 tr_type="1",
             )
@@ -154,11 +154,11 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         tr_key = parts[2]
         data_str = parts[3]
 
-        if tr_id == CONSTANTS.WS_DOMESTIC_STOCK_ORDERBOOK_TR_ID:
+        if tr_id == self._ob_tr_id:
             parsed = self._parse_caret_fields(data_str, CONSTANTS.WS_ORDERBOOK_COLUMNS)
             if parsed:
                 await self._process_orderbook_data(tr_key, parsed)
-        elif tr_id == CONSTANTS.WS_DOMESTIC_STOCK_TRADE_TR_ID:
+        elif tr_id == self._trade_tr_id:
             parsed = self._parse_caret_fields(data_str, CONSTANTS.WS_TRADE_COLUMNS)
             if parsed:
                 await self._process_trade_data(tr_key, parsed)
