@@ -159,6 +159,68 @@ def build_ladder_targets(
     return targets
 
 
+@dataclass(frozen=True)
+class RestingOrder:
+    """Snapshot of one live maker order, for the partial-reprice diff."""
+
+    order_id: str
+    price: Decimal
+    size: Decimal
+
+
+@dataclass(frozen=True)
+class LadderDiff:
+    """Result of diffing live maker orders against this tick's targets.
+
+    ``to_cancel`` holds the order ids to cancel; ``to_place`` holds the targets
+    with no acceptable live match. Orders that match a target within the reprice
+    threshold (same size, price drift < threshold) are left untouched.
+    """
+
+    to_cancel: List[str]
+    to_place: List[RungTarget]
+
+
+def diff_ladder_targets(
+    current: List[RestingOrder],
+    targets: List[RungTarget],
+    tick: Decimal,
+    reprice_threshold_ticks: Decimal,
+) -> LadderDiff:
+    """Partial reprice: cancel/replace only the rungs that actually changed.
+
+    A live order *matches* a target when it has the SAME size and its price is
+    within ``reprice_threshold_ticks * tick`` of the target price (strictly less
+    than the threshold — at/over the threshold is a reprice, mirroring the
+    executor's ``min_reprice_delta_ticks`` guard). Matching is greedy per target,
+    preferring the closest price then the lowest order id, so the result is
+    deterministic.
+
+    Unmatched targets are placed; unmatched live orders are cancelled. With no
+    live orders this places everything; with empty targets it cancels everything.
+    """
+    threshold = reprice_threshold_ticks * tick
+    unmatched = list(current)
+    to_place: List[RungTarget] = []
+    matched_ids: set[str] = set()
+
+    for target in targets:
+        candidates = [
+            o
+            for o in unmatched
+            if o.size == target.size and abs(o.price - target.price) < threshold
+        ]
+        if not candidates:
+            to_place.append(target)
+            continue
+        best = min(candidates, key=lambda o: (abs(o.price - target.price), o.order_id))
+        matched_ids.add(best.order_id)
+        unmatched = [o for o in unmatched if o.order_id != best.order_id]
+
+    to_cancel = [o.order_id for o in current if o.order_id not in matched_ids]
+    return LadderDiff(to_cancel=to_cancel, to_place=to_place)
+
+
 def compute_hedge_order(
     fill_qty: Decimal,
     share_per_unit: Decimal,
