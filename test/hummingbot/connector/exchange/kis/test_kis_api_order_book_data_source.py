@@ -698,6 +698,27 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("000660", msg["body"]["input"]["tr_key"])
 
     # ------------------------------------------------------------------
+    # Test: WebSocket endpoint URL (nautilus-proven, no /tryitout path)
+    # ------------------------------------------------------------------
+
+    def test_ws_url_has_no_tryitout_path(self):
+        """The live KIS realtime WS endpoint is the bare host:port with no path.
+
+        The ``/tryitout`` suffix is the testbed web-form path and triggers a
+        ServerDisconnectedError during the handshake. The nautilus_trader
+        live-tested adapter connects to ``ws://ops.koreainvestment.com:21000``.
+        """
+        prod_url = web_utils.ws_url("")
+        sandbox_url = web_utils.ws_url("sandbox")
+
+        self.assertNotIn("/tryitout", prod_url)
+        self.assertNotIn("/tryitout", sandbox_url)
+        self.assertEqual("ws://ops.koreainvestment.com:21000", prod_url)
+        self.assertEqual("ws://ops.koreainvestment.com:31000", sandbox_url)
+        self.assertEqual("ws://ops.koreainvestment.com:21000", CONSTANTS.WS_URL)
+        self.assertEqual("ws://ops.koreainvestment.com:31000", CONSTANTS.WS_SANDBOX_URL)
+
+    # ------------------------------------------------------------------
     # Test: _parse_caret_fields
     # ------------------------------------------------------------------
 

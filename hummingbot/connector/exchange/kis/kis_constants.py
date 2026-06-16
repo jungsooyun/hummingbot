@@ -10,8 +10,12 @@ REST_URL = "https://openapi.koreainvestment.com:9443"
 REST_SANDBOX_URL = "https://openapivts.koreainvestment.com:29443"
 
 # Base URLs — WebSocket
-WS_URL = "ws://ops.koreainvestment.com:21000/tryitout"
-WS_SANDBOX_URL = "ws://ops.koreainvestment.com:31000/tryitout"
+# NOTE: The realtime endpoint is the bare host:port with NO path. The
+# ``/tryitout`` suffix is the KIS testbed web-form path and causes a
+# ServerDisconnectedError during the WS handshake. The nautilus_trader
+# live-tested KIS adapter connects to ``ws://ops.koreainvestment.com:21000``.
+WS_URL = "ws://ops.koreainvestment.com:21000"
+WS_SANDBOX_URL = "ws://ops.koreainvestment.com:31000"
 
 DEFAULT_DOMAIN = ""
 MAX_ORDER_ID_LEN = 32

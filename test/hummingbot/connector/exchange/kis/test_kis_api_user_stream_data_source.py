@@ -434,6 +434,50 @@ class KisAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(call_args["body"]["input"]["tr_key"], "005930")
 
     # ------------------------------------------------------------------ #
+    # Test: WebSocket endpoint URL (nautilus-proven, no /tryitout path)
+    # ------------------------------------------------------------------ #
+
+    def test_ws_url_constants_have_no_tryitout_path(self):
+        """KIS realtime WS endpoint is the bare host:port with no path.
+
+        ``/tryitout`` is the testbed web-form path and causes a
+        ServerDisconnectedError during the handshake. The nautilus_trader
+        live-tested adapter uses ``ws://ops.koreainvestment.com:21000``.
+        """
+        self.assertNotIn("/tryitout", CONSTANTS.WS_URL)
+        self.assertNotIn("/tryitout", CONSTANTS.WS_SANDBOX_URL)
+        self.assertEqual("ws://ops.koreainvestment.com:21000", CONSTANTS.WS_URL)
+        self.assertEqual("ws://ops.koreainvestment.com:31000", CONSTANTS.WS_SANDBOX_URL)
+
+    # ------------------------------------------------------------------ #
+    # Test: AES-256-CBC round-trip decryption (nautilus parity)
+    # ------------------------------------------------------------------ #
+
+    def test_aes_cbc_decrypt_round_trip(self):
+        """_aes_cbc_decrypt should recover plaintext from a real KIS-style
+        AES-256-CBC + base64 payload (32-byte key, 16-byte IV, PKCS7 pad).
+
+        This mirrors the nautilus_trader decrypt_private_execution_payload
+        contract (AES.new(key, MODE_CBC, iv) -> unpad(b64decode(ct))).
+        """
+        from base64 import b64encode
+
+        from Crypto.Cipher import AES
+        from Crypto.Util.Padding import pad
+
+        key = "abcdefghijklmnopqrstuvwxyz123456"  # 32 bytes
+        iv = "1234567890123456"  # 16 bytes
+        plaintext = "005930^2^100^67800^093001"
+
+        cipher = AES.new(key.encode("utf-8"), AES.MODE_CBC, iv.encode("utf-8"))
+        cipher_text_b64 = b64encode(
+            cipher.encrypt(pad(plaintext.encode("utf-8"), AES.block_size))
+        ).decode("utf-8")
+
+        recovered = _aes_cbc_decrypt(key, iv, cipher_text_b64)
+        self.assertEqual(plaintext, recovered)
+
+    # ------------------------------------------------------------------ #
     # Test: _subscribe_exec_notifications — multiple trading pairs
     # ------------------------------------------------------------------ #
 
