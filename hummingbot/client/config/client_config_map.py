@@ -745,6 +745,37 @@ RATE_SOURCE_MODES = {
 }
 
 
+class TossFxConfigMap(BaseClientModel):
+    """Toss Open API client-credentials for the live FairFxSource (JEP-148).
+
+    Stored encrypted under CONFIG_PASSWORD via the standard ``is_secure`` config
+    path (mirrors the CoinCap ``api_key`` precedent) — NEVER in ``.env`` and NOT
+    via the ``connect`` connector flow (which validates balances). ``FairFxSource``
+    reads these through the global client config (``.get_secret_value()``).
+    """
+    toss_client_id: SecretStr = Field(
+        default=SecretStr(""),
+        description="Toss Open API client_id for the live FX bank-rate source (optional; FX degrades if unset).",
+        json_schema_extra={
+            "prompt": lambda cm: "Toss Open API client_id (for live FX bank rate)",
+            "is_secure": True,
+            "is_connect_key": False,
+            "prompt_on_new": False,
+        },
+    )
+    toss_client_secret: SecretStr = Field(
+        default=SecretStr(""),
+        description="Toss Open API client_secret for the live FX bank-rate source.",
+        json_schema_extra={
+            "prompt": lambda cm: "Toss Open API client_secret (for live FX bank rate)",
+            "is_secure": True,
+            "is_connect_key": False,
+            "prompt_on_new": False,
+        },
+    )
+    model_config = ConfigDict(title="toss_fx")
+
+
 class ClientConfigMap(BaseClientModel):
     instance_id: str = Field(
         default=generate_client_id(),
@@ -871,6 +902,10 @@ class ClientConfigMap(BaseClientModel):
         )},
     )
     market_data_collection: MarketDataCollectionConfigMap = Field(default=MarketDataCollectionConfigMap())
+    toss_fx: TossFxConfigMap = Field(
+        default=TossFxConfigMap(),
+        description="Toss Open API credentials for the live USD/KRW FairFxSource (JEP-148).",
+    )
     model_config = ConfigDict(title="client_config_map")
 
     @field_validator("kill_switch_mode", mode="before")
