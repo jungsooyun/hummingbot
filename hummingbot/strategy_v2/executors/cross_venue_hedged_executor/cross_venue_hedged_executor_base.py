@@ -1,0 +1,420 @@
+"""Shared base for cross-venue *hedged* executors (JEP-143).
+
+Two executors in this tree implement the same finite-state machine:
+
+  * ``LadderMakerExecutor`` — post-only maker ladder on a perp (Hyperliquid HIP-3),
+    each fill hedged on KIS spot.
+  * ``XEMMExecutor`` — upstream-style cross-exchange market making: a maker quote on
+    venue A, hedged with a taker order on venue B.
+
+Both share roughly the same bookkeeping machine — *maker fill on venue A -> hedge on
+venue B* — with ~90% duplicated accounting. This module factors that shared machine
+into ``CrossVenueHedgedExecutorBase`` so a future rewire (JEP-147) can let both
+executors inherit it without re-deriving inventory / PnL / fee / retry plumbing.
+
+Design note — what is SHARED vs what is a HOOK
+==============================================
+
+SHARED (lives here, identical behavior for every subclass):
+
+  * Connector + pair holding for the maker leg and the hedge leg
+    (``maker_connector`` / ``maker_trading_pair`` / ``hedge_connector`` /
+    ``hedge_trading_pair``), plus ``entry_side`` / ``hedge_side`` derivation.
+  * Order books: ``maker_orders`` / ``hedge_orders`` dicts of ``TrackedOrder``.
+  * Fill accounting: ``_maker_executed_base`` / ``_maker_executed_quote`` /
+    ``_hedge_executed_base`` / ``_hedge_executed_quote`` and the fee accumulators
+    ``_maker_fees_quote`` / ``_hedge_fees_quote``.
+  * Hedge queue: ``_pending_hedge_base`` with single-in-flight double-hedge
+    prevention (``_hedge_in_flight``) — a maker fill enqueues base to hedge, and at
+    most one hedge order is live at a time.
+  * Inventory accounting: ``_unhedged_base()`` (always >= 0) and
+    ``_unhedged_base_signed()`` (long positive / short negative).
+  * PnL / fees: ``get_net_pnl_quote()`` (matched-quantity maker-vs-hedge spread minus
+    fees), ``get_net_pnl_pct()``, ``get_cum_fees_quote()``.
+  * ``max_retries`` -> ``CloseType.FAILED`` handling on repeated hedge failures.
+  * Order-event plumbing: ``process_order_created_event`` /
+    ``process_order_filled_event`` / ``process_order_completed_event`` /
+    ``process_order_canceled_event`` / ``process_order_failed_event`` updating the
+    accounting above.
+  * Open-order helpers: ``_open_maker_orders`` / ``_open_hedge_orders`` /
+    ``_has_open_orders`` / ``_update_tracked``.
+  * ``get_custom_info()`` base fields and a ``validate_sufficient_balance`` skeleton
+    that defers the candidate construction to a hook.
+
+HOOK (abstract / overridable — the per-strategy difference):
+
+  * ``_compute_targets()`` — derive the maker order(s) to quote this tick.
+  * ``_should_reprice(targets)`` — reprice guard policy.
+  * ``_place_targets(targets)`` — translate targets into ``place_order`` calls.
+  * ``_gates_open()`` — pre-quote kill-switch / data-readiness gate.
+  * ``_size_hedge(pending_base)`` — convert pending base into a concrete hedge
+    (side / price / amount), or ``None`` to skip this tick.
+  * ``_maker_balance_candidate()`` — the ``OrderCandidate`` used by the shared
+    ``validate_sufficient_balance`` skeleton.
+  * ``_pnl_gross_quote(matched, maker_avg, hedge_avg)`` — sign convention for gross
+    PnL (perp-maker vs spot-hedge differs from buy-maker vs sell-taker).
+
+This class is ABSTRACT. It is intentionally NOT registered in
+``executor_orchestrator._executor_mapping`` — only concrete executor types
+(``ladder_maker_executor`` / ``xemm_executor``) belong there. The rewire that makes
+``LadderMakerExecutor`` / ``XEMMExecutor`` inherit from this base is JEP-147; this
+file is additive scaffolding only.
+"""
+
+import logging
+from abc import abstractmethod
+from decimal import Decimal
+from typing import Dict, List, Optional, Union
+
+from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.order_candidate import OrderCandidate
+from hummingbot.core.event.events import (
+    BuyOrderCompletedEvent,
+    BuyOrderCreatedEvent,
+    MarketOrderFailureEvent,
+    OrderCancelledEvent,
+    OrderFilledEvent,
+    SellOrderCompletedEvent,
+    SellOrderCreatedEvent,
+)
+from hummingbot.logger import HummingbotLogger
+from hummingbot.strategy.strategy_v2_base import StrategyV2Base
+from hummingbot.strategy_v2.executors.data_types import ConnectorPair, ExecutorConfigBase
+from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
+from hummingbot.strategy_v2.models.base import RunnableStatus
+from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
+
+ZERO = Decimal("0")
+
+
+class CrossVenueHedgedExecutorBase(ExecutorBase):
+    """Shared machine for *maker fill on venue A -> hedge on venue B* executors.
+
+    Subclasses supply the per-strategy pricing / sizing / reprice policy via the
+    abstract hooks below; the inventory, hedge-queue, fee, PnL and retry plumbing
+    is implemented once here. See the module docstring for the full shared-vs-hook
+    breakdown and the JEP-147 rewire plan.
+    """
+
+    _logger = None
+
+    @classmethod
+    def logger(cls) -> HummingbotLogger:
+        if cls._logger is None:
+            cls._logger = logging.getLogger(__name__)
+        return cls._logger
+
+    def __init__(
+        self,
+        strategy: StrategyV2Base,
+        config: ExecutorConfigBase,
+        maker_market: ConnectorPair,
+        hedge_market: ConnectorPair,
+        entry_side: TradeType,
+        connectors: Optional[List[str]] = None,
+        update_interval: float = 1.0,
+        max_retries: int = 10,
+    ):
+        """
+        :param maker_market: connector+pair of the maker (passive) leg.
+        :param hedge_market: connector+pair of the hedge (aggressive) leg.
+        :param entry_side: side of the maker leg; the hedge leg trades the opposite side.
+        :param connectors: extra connectors to subscribe (e.g. an FX feed); maker and
+            hedge connectors are always included.
+        """
+        self.config = config
+        self.maker_connector = maker_market.connector_name
+        self.maker_trading_pair = maker_market.trading_pair
+        self.hedge_connector = hedge_market.connector_name
+        self.hedge_trading_pair = hedge_market.trading_pair
+        self.entry_side = entry_side
+        self.hedge_side = TradeType.BUY if entry_side == TradeType.SELL else TradeType.SELL
+
+        # Order books keyed by client order id.
+        self.maker_orders: Dict[str, TrackedOrder] = {}
+        self.hedge_orders: Dict[str, TrackedOrder] = {}
+
+        # Fill accounting.
+        self._maker_executed_base = ZERO
+        self._maker_executed_quote = ZERO
+        self._hedge_executed_base = ZERO
+        self._hedge_executed_quote = ZERO
+        self._maker_fees_quote = ZERO
+        self._hedge_fees_quote = ZERO
+
+        # Hedge queue: base awaiting a hedge order. Single-in-flight prevents double
+        # hedging the same fill.
+        self._pending_hedge_base = ZERO
+
+        self._current_retries = 0
+        self._max_retries = max_retries
+
+        subscribed = [self.maker_connector, self.hedge_connector]
+        for extra in connectors or []:
+            if extra and extra not in subscribed:
+                subscribed.append(extra)
+
+        super().__init__(
+            strategy=strategy,
+            connectors=subscribed,
+            config=config,
+            update_interval=update_interval,
+        )
+
+    # ============================================================ abstract hooks
+
+    @abstractmethod
+    def _gates_open(self) -> bool:
+        """Return ``True`` when it is safe to quote (kill-switch off, data ready)."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def _compute_targets(self) -> List:
+        """Compute the maker order target(s) to quote this tick.
+
+        Returns a strategy-defined list (e.g. ladder rungs, or a single maker quote).
+        Returned objects are only consumed by ``_should_reprice`` / ``_place_targets``,
+        which the same subclass implements, so their shape is private to the subclass.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def _should_reprice(self, targets: List) -> bool:
+        """Reprice guard: return ``True`` to cancel-and-replace maker orders."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def _place_targets(self, targets: List) -> None:
+        """Translate ``targets`` into ``place_order`` calls + ``maker_orders`` entries."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def _size_hedge(self, pending_base: Decimal) -> Optional[Dict]:
+        """Convert pending base into a concrete hedge order spec, or ``None`` to skip.
+
+        Expected return shape (consumed by :meth:`_process_hedges`)::
+
+            {"amount": Decimal, "price": Decimal, "order_type": OrderType,
+             "metadata": Optional[Dict]}
+
+        ``amount`` must already be quantized; return ``None`` (or amount <= 0) to skip
+        hedging this tick (e.g. missing book, sub-minimum size).
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def _maker_balance_candidate(self) -> Optional[OrderCandidate]:
+        """Return the maker ``OrderCandidate`` for ``validate_sufficient_balance``.
+
+        Return ``None`` to skip the balance check this tick (e.g. no price yet).
+        """
+        raise NotImplementedError
+
+    def _pnl_gross_quote(self, matched: Decimal, maker_avg: Decimal, hedge_avg: Decimal) -> Decimal:
+        """Gross PnL on ``matched`` base, before fees.
+
+        Default convention matches both current executors: when the maker leg SELLs
+        (and hedge BUYs) profit is ``(maker_avg - hedge_avg) * matched``; otherwise the
+        signs flip. Subclasses may override for venue-specific sign conventions.
+        """
+        if self.entry_side == TradeType.SELL:
+            return (maker_avg - hedge_avg) * matched
+        return (hedge_avg - maker_avg) * matched
+
+    # ============================================================ lifecycle
+
+    async def control_task(self):
+        if self.status == RunnableStatus.RUNNING:
+            if not self._gates_open():
+                self._cancel_all_maker()
+                self._process_hedges()
+                return
+            self._reconcile_maker()
+            self._process_hedges()
+        elif self.status == RunnableStatus.SHUTTING_DOWN:
+            await self._control_shutdown()
+
+    def early_stop(self, keep_position: bool = False):
+        if keep_position:
+            self.close_type = CloseType.POSITION_HOLD
+            self.stop()
+            return
+        self.close_type = CloseType.EARLY_STOP
+        self._status = RunnableStatus.SHUTTING_DOWN
+
+    async def _control_shutdown(self):
+        self._cancel_all_maker()
+        # Best-effort: hedge any remaining unhedged fills before terminating.
+        self._process_hedges()
+        if not self._has_open_orders() and self._unhedged_base() <= ZERO:
+            self.stop()
+
+    # ============================================================ maker reconcile
+
+    def _reconcile_maker(self) -> None:
+        targets = self._compute_targets()
+        if not self._should_reprice(targets):
+            return
+        self._cancel_all_maker()
+        self._place_targets(targets)
+
+    def _cancel_all_maker(self) -> None:
+        for order in self._open_maker_orders():
+            self._strategy.cancel(self.maker_connector, self.maker_trading_pair, order.order_id)
+
+    # ============================================================ hedge queue
+
+    def _hedge_in_flight(self) -> bool:
+        """At most one hedge order may be live at a time (double-hedge prevention)."""
+        return any(o.order is not None and o.order.is_open for o in self.hedge_orders.values())
+
+    def _process_hedges(self) -> None:
+        if self._pending_hedge_base <= ZERO:
+            return
+        if self._hedge_in_flight():
+            return
+        spec = self._size_hedge(self._pending_hedge_base)
+        if spec is None:
+            return
+        amount = spec.get("amount", ZERO)
+        if amount is None or amount <= ZERO:
+            return
+        order_id = self.place_order(
+            connector_name=self.hedge_connector,
+            trading_pair=self.hedge_trading_pair,
+            order_type=spec["order_type"],
+            side=self.hedge_side,
+            amount=amount,
+            price=spec.get("price", Decimal("NaN")),
+            metadata=spec.get("metadata") or {"order_role": "hedge"},
+        )
+        self.hedge_orders[order_id] = TrackedOrder(order_id=order_id)
+        # Clear the queue: this fill is now represented by a live hedge order.
+        self._pending_hedge_base = ZERO
+
+    # ============================================================ inventory helpers
+
+    def _unhedged_base(self) -> Decimal:
+        """Absolute unhedged base (>= 0): maker fills not yet matched by hedge fills."""
+        return max(ZERO, self._maker_executed_base - self._hedge_executed_base)
+
+    def _unhedged_base_signed(self) -> Decimal:
+        """Signed net inventory: positive long, negative short (drives skew / gate)."""
+        unhedged = self._unhedged_base()
+        return unhedged if self.entry_side == TradeType.BUY else -unhedged
+
+    def _open_maker_orders(self) -> List[TrackedOrder]:
+        return [o for o in self.maker_orders.values() if o.order is not None and o.order.is_open]
+
+    def _open_hedge_orders(self) -> List[TrackedOrder]:
+        return [o for o in self.hedge_orders.values() if o.order is not None and o.order.is_open]
+
+    def _has_open_orders(self) -> bool:
+        return any(
+            o.order is not None and o.order.is_open
+            for o in list(self.maker_orders.values()) + list(self.hedge_orders.values())
+        )
+
+    # ============================================================ events
+
+    def _update_tracked(self, connector_name: str, order_id: str) -> None:
+        for book in (self.maker_orders, self.hedge_orders):
+            tracked = book.get(order_id)
+            if tracked is not None:
+                in_flight = self.get_in_flight_order(connector_name, order_id)
+                if in_flight is not None:
+                    tracked.order = in_flight
+
+    def process_order_created_event(
+        self, _, market, event: Union[BuyOrderCreatedEvent, SellOrderCreatedEvent]
+    ):
+        if event.order_id in self.maker_orders:
+            self._update_tracked(self.maker_connector, event.order_id)
+        elif event.order_id in self.hedge_orders:
+            self._update_tracked(self.hedge_connector, event.order_id)
+
+    def process_order_filled_event(self, _, market, event: OrderFilledEvent):
+        if event.order_id in self.maker_orders:
+            self._update_tracked(self.maker_connector, event.order_id)
+            self._maker_executed_base += Decimal(event.amount)
+            self._maker_executed_quote += Decimal(event.amount) * Decimal(event.price)
+            self._pending_hedge_base += Decimal(event.amount)
+        elif event.order_id in self.hedge_orders:
+            self._update_tracked(self.hedge_connector, event.order_id)
+            self._hedge_executed_base += Decimal(event.amount)
+            self._hedge_executed_quote += Decimal(event.amount) * Decimal(event.price)
+
+    def process_order_completed_event(
+        self, _, market, event: Union[BuyOrderCompletedEvent, SellOrderCompletedEvent]
+    ):
+        if event.order_id in self.maker_orders:
+            self._update_tracked(self.maker_connector, event.order_id)
+            self._maker_fees_quote += self.maker_orders[event.order_id].cum_fees_quote
+        elif event.order_id in self.hedge_orders:
+            self._update_tracked(self.hedge_connector, event.order_id)
+            self._hedge_fees_quote += self.hedge_orders[event.order_id].cum_fees_quote
+
+    def process_order_canceled_event(self, _, market, event: OrderCancelledEvent):
+        self.maker_orders.pop(event.order_id, None)
+
+    def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
+        if event.order_id in self.maker_orders:
+            self.maker_orders.pop(event.order_id, None)
+        elif event.order_id in self.hedge_orders:
+            self.hedge_orders.pop(event.order_id, None)
+            self._current_retries += 1
+            self.evaluate_max_retries()
+
+    # ============================================================ balance / pnl
+
+    async def validate_sufficient_balance(self):
+        candidate = self._maker_balance_candidate()
+        if candidate is None:
+            return
+        adjusted = self.adjust_order_candidates(self.maker_connector, [candidate])[0]
+        if adjusted.amount == ZERO:
+            self.close_type = CloseType.INSUFFICIENT_BALANCE
+            self.stop()
+
+    def get_net_pnl_quote(self) -> Decimal:
+        matched = min(self._maker_executed_base, self._hedge_executed_base)
+        if matched <= ZERO:
+            return ZERO
+        maker_avg = (
+            self._maker_executed_quote / self._maker_executed_base
+            if self._maker_executed_base > ZERO
+            else ZERO
+        )
+        hedge_avg = (
+            self._hedge_executed_quote / self._hedge_executed_base
+            if self._hedge_executed_base > ZERO
+            else ZERO
+        )
+        if maker_avg <= ZERO or hedge_avg <= ZERO:
+            return ZERO
+        gross = self._pnl_gross_quote(matched, maker_avg, hedge_avg)
+        return gross - self.get_cum_fees_quote()
+
+    def get_net_pnl_pct(self) -> Decimal:
+        if self._maker_executed_quote <= ZERO:
+            return ZERO
+        return self.get_net_pnl_quote() / self._maker_executed_quote
+
+    def get_cum_fees_quote(self) -> Decimal:
+        return self._maker_fees_quote + self._hedge_fees_quote
+
+    def get_custom_info(self) -> Dict:
+        return {
+            "side": self.entry_side,
+            "execution_purpose": self.get_execution_purpose(),
+            "maker_connector": self.maker_connector,
+            "maker_trading_pair": self.maker_trading_pair,
+            "hedge_connector": self.hedge_connector,
+            "hedge_trading_pair": self.hedge_trading_pair,
+            "maker_executed_base": self._maker_executed_base,
+            "hedge_executed_base": self._hedge_executed_base,
+            "unhedged_base": self._unhedged_base(),
+            "pending_hedge_base": self._pending_hedge_base,
+            "open_maker_orders": len(self._open_maker_orders()),
+            "open_hedge_orders": len(self._open_hedge_orders()),
+        }
