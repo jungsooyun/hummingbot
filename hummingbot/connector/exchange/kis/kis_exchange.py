@@ -286,10 +286,11 @@ class KisExchange(ExchangePyBase):
             "ORD_QTY": str(int(tracked_order.amount)),
             "ORD_UNPR": "0",
             "QTY_ALL_ORD_YN": "Y",
+            "EXCG_ID_DVSN_CD": self._excg_for_routing(),
         }
 
         result = await self._api_post(
-            path_url=CONSTANTS.DOMESTIC_STOCK_ORDER_PATH,
+            path_url=CONSTANTS.DOMESTIC_STOCK_CANCEL_PATH,
             data=body,
             is_auth_required=True,
             headers={"tr_id": tr_id},

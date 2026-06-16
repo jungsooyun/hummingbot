@@ -226,6 +226,7 @@ RATE_LIMITS = [
     RateLimit(limit_id=OVERSEAS_OPTIONS_TICKER_PATH, limit=20, time_interval=1),
     RateLimit(limit_id=OVERSEAS_OPTIONS_ORDERBOOK_PATH, limit=20, time_interval=1),
     RateLimit(limit_id=DOMESTIC_STOCK_ORDER_PATH, limit=5, time_interval=1),
+    RateLimit(limit_id=DOMESTIC_STOCK_CANCEL_PATH, limit=5, time_interval=1),
     RateLimit(limit_id=DOMESTIC_STOCK_BALANCE_PATH, limit=10, time_interval=1),
     RateLimit(limit_id=DOMESTIC_STOCK_ORDER_DETAIL_PATH, limit=10, time_interval=1),
     # WebSocket

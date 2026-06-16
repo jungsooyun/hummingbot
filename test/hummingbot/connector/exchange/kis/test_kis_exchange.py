@@ -386,6 +386,11 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
     def validate_order_cancelation_request(self, order: InFlightOrder, request_call: RequestCall):
         request_data = json.loads(request_call.kwargs["data"])
         self.assertEqual(order.exchange_order_id, request_data["ORGN_ODNO"])
+        self.assertEqual("SOR", request_data["EXCG_ID_DVSN_CD"])
+        self.assertEqual(
+            CONSTANTS.DOMESTIC_STOCK_CANCEL_TR_ID,
+            request_call.kwargs["headers"]["tr_id"],
+        )
 
     def validate_order_status_request(self, order: InFlightOrder, request_call: RequestCall):
         # Order status is queried via GET with params
@@ -411,7 +416,7 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         mock_api: aioresponses,
         callback: Optional[Callable] = lambda *args, **kwargs: None,
     ) -> str:
-        url = web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_PATH)
+        url = web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_CANCEL_PATH)
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
         response = self._order_cancelation_request_successful_mock_response(order=order)
         mock_api.post(regex_url, body=json.dumps(response), callback=callback)
@@ -423,7 +428,7 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         mock_api: aioresponses,
         callback: Optional[Callable] = lambda *args, **kwargs: None,
     ) -> str:
-        url = web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_PATH)
+        url = web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_CANCEL_PATH)
         regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
         mock_api.post(regex_url, status=400, callback=callback)
         return url
