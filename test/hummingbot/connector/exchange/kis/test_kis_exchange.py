@@ -352,6 +352,54 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
             self._make_exchange(kis_market_routing="sor", domain="sandbox")._excg_for_routing(),
         )
 
+    def test_constructor_accepts_kis_sandbox_kwarg(self):
+        # The non-trading instantiation path (settings.
+        # non_trading_connector_instance_with_default_configuration, used by the
+        # trading-pair fetcher) forwards EVERY config-map field as a kwarg,
+        # including kis_sandbox (is_connect_key=False). The constructor must
+        # accept it or trading-pair fetching raises TypeError.
+        ex = KisExchange(
+            kis_app_key="testAppKey",
+            kis_app_secret="testAppSecret",
+            kis_account_number="12345678-01",
+            trading_pairs=[self.trading_pair],
+            kis_sandbox="false",
+            kis_market_routing="sor",
+        )
+        self.assertFalse(ex._sandbox)
+        self.assertEqual("sor", ex._market_routing)
+
+    def test_kis_sandbox_field_enables_sandbox(self):
+        # kis_sandbox="true" must activate sandbox (config field is wired) and,
+        # because sandbox does not support sor/nxt, fall back to krx routing.
+        ex = KisExchange(
+            kis_app_key="testAppKey",
+            kis_app_secret="testAppSecret",
+            kis_account_number="12345678-01",
+            trading_pairs=[self.trading_pair],
+            kis_sandbox="true",
+            kis_market_routing="sor",
+        )
+        self.assertTrue(ex._sandbox)
+        self.assertEqual("krx", ex._market_routing)
+
+    def test_full_config_map_kwargs_bind_to_constructor(self):
+        # Guard against future config-map fields that have no constructor param:
+        # simulate the non-trading factory call shape and assert it binds.
+        import inspect
+        factory_kwargs = dict(
+            kis_app_key="k",
+            kis_app_secret="s",
+            kis_account_number="12345678-01",
+            kis_sandbox="false",
+            kis_market_routing="sor",
+            trading_pairs=[self.trading_pair],
+            trading_required=False,
+            balance_asset_limit={},
+        )
+        # Raises TypeError if any kwarg has no matching parameter.
+        inspect.signature(KisExchange.__init__).bind(object(), **factory_kwargs)
+
     def test_constructor_accepts_balance_asset_limit(self):
         # The connector factory (settings.conn_init_parameters) ALWAYS forwards
         # balance_asset_limit (and rate_limits_share_pct for sub-domains) to every

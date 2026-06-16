@@ -57,6 +57,7 @@ class KisExchange(ExchangePyBase):
         trading_required: bool = True,
         balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
         rate_limits_share_pct: Decimal = Decimal("100"),
+        kis_sandbox: str = "false",
         kis_market_routing: str = CONSTANTS.MARKET_ROUTING_SOR,
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
     ):
@@ -66,7 +67,12 @@ class KisExchange(ExchangePyBase):
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs or []
         self._domain = domain
-        self._sandbox = domain == "sandbox"
+        # Sandbox is driven by the kis_sandbox config field; domain == "sandbox"
+        # is kept as an override for back-compat (tests / direct construction).
+        # The factory's non_trading instantiation path forwards EVERY config-map
+        # field (including kis_sandbox) as a kwarg, so the constructor MUST accept
+        # it or trading-pair fetching raises TypeError.
+        self._sandbox = str(kis_sandbox).strip().lower() == "true" or domain == "sandbox"
 
         # Resolve order routing BEFORE super().__init__() — ExchangePyBase.__init__
         # constructs the order book data source, which needs self._market_routing.
