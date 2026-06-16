@@ -45,7 +45,12 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
 
     @property
     def network_status_url(self):
-        return web_utils.public_rest_url(CONSTANTS.CHECK_NETWORK_PATH_URL)
+        # The health probe uses the authenticated balance inquiry (NOT oauth2/tokenP,
+        # which is POST-only and hangs on GET -> see _make_network_check_request).
+        # Regex (path + optional query) so the framework mock matches the request's
+        # account/TR query string.
+        base = web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_BALANCE_PATH)
+        return re.compile(f"^{re.escape(base)}.*")
 
     @property
     def trading_rules_url(self):
@@ -129,12 +134,14 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
 
     @property
     def network_status_request_successful_mock_response(self):
-        # Using token endpoint response as network ping
+        # Balance inquiry success shape — the network probe is an authenticated
+        # balance GET (24/7, reuses the cached OAuth token), not a tokenP GET.
         return {
-            "access_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9",
-            "access_token_token_expired": "2026-03-01 12:30:45",
-            "token_type": "Bearer",
-            "expires_in": 86400,
+            "rt_cd": "0",
+            "msg_cd": "MCA00000",
+            "msg1": "정상처리 되었습니다.",
+            "output1": [],
+            "output2": [],
         }
 
     @property
@@ -438,6 +445,39 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
             self.assertIn("kis_token_cache_", os.path.basename(auth.token_cache_path))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_network_check_path_is_not_token_endpoint(self):
+        # Lesson (live RCA): the base health probe does an unauthenticated GET on
+        # ``check_network_request_path``. KIS pointed it at ``oauth2/tokenP`` — a
+        # POST-only token-issue endpoint that does NOT answer GET. Live, the GET
+        # hangs until timeout every cycle, check_network swallows the exception
+        # and returns NOT_CONNECTED, so the connector NEVER becomes ready (silent:
+        # nothing in errors.log). The probe must target the balance endpoint.
+        ex = self._make_exchange()
+        self.assertEqual(CONSTANTS.DOMESTIC_STOCK_BALANCE_PATH, ex.check_network_request_path)
+        self.assertNotEqual(CONSTANTS.TOKEN_PATH_URL, ex.check_network_request_path)
+
+    @aioresponses()
+    async def test_network_check_uses_authenticated_balance_request(self, mock_api):
+        # The network probe must hit the authenticated balance inquiry (works 24/7,
+        # reuses the cached OAuth token) — never the token endpoint.
+        balance_url = web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_BALANCE_PATH)
+        token_url = web_utils.public_rest_url(CONSTANTS.TOKEN_PATH_URL)
+        mock_api.get(
+            re.compile(f"^{re.escape(balance_url)}.*"),
+            body=json.dumps(self.network_status_request_successful_mock_response),
+        )
+
+        await self.exchange._make_network_check_request()
+
+        balance_reqs = self._all_executed_requests(mock_api, balance_url)
+        self.assertEqual(1, len(balance_reqs))
+        # No request ever went to the token endpoint.
+        self.assertEqual(0, len(self._all_executed_requests(mock_api, token_url)))
+        # Authenticated, with the balance TR_ID header.
+        request_headers = balance_reqs[0].kwargs["headers"]
+        self.assertTrue(request_headers["Authorization"].startswith("Bearer "))
+        self.assertEqual(CONSTANTS.DOMESTIC_STOCK_BALANCE_TR_ID, request_headers["tr_id"])
 
     def test_constructor_accepts_kis_sandbox_kwarg(self):
         # The non-trading instantiation path (settings.

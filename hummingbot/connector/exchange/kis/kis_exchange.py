@@ -151,7 +151,25 @@ class KisExchange(ExchangePyBase):
 
     @property
     def check_network_request_path(self):
-        return CONSTANTS.CHECK_NETWORK_PATH_URL
+        # NOT oauth2/tokenP: that endpoint is POST-only (token issuance) and does
+        # not answer GET, so the base health probe hangs until timeout every cycle,
+        # check_network swallows the error -> NOT_CONNECTED forever -> the connector
+        # never becomes ready (silent, nothing in errors.log). Probe the balance
+        # endpoint instead (authenticated GET, available 24/7, reuses cached token).
+        # The actual request is issued by _make_network_check_request (auth + params).
+        return CONSTANTS.DOMESTIC_STOCK_BALANCE_PATH
+
+    async def _make_network_check_request(self):
+        # Override the base (unauthenticated, param-less GET on the path above):
+        # KIS requires auth + account params + a TR_ID header. A successful balance
+        # inquiry proves network + auth + account are all healthy.
+        tr_id, params = self._balance_request_args()
+        await self._api_get(
+            path_url=CONSTANTS.DOMESTIC_STOCK_BALANCE_PATH,
+            params=params,
+            is_auth_required=True,
+            headers={"tr_id": tr_id},
+        )
 
     @property
     def trading_pairs(self):
@@ -365,14 +383,14 @@ class KisExchange(ExchangePyBase):
     # Balances
     # ------------------------------------------------------------------
 
-    async def _update_balances(self):
-        local_asset_names = set(self._account_balances.keys())
-        remote_asset_names = set()
+    def _balance_request_args(self) -> Tuple[str, Dict[str, str]]:
+        """TR_ID + query params for the domestic-stock balance inquiry.
 
+        Shared by ``_update_balances`` and the ``_make_network_check_request``
+        health probe so the two never drift."""
         tr_id = CONSTANTS.DOMESTIC_STOCK_BALANCE_TR_ID
         if self._sandbox:
             tr_id = self._sandbox_tr_id(tr_id)
-
         params = {
             "CANO": self._cano,
             "ACNT_PRDT_CD": self._acnt_prdt_cd,
@@ -386,6 +404,13 @@ class KisExchange(ExchangePyBase):
             "CTX_AREA_FK100": "",
             "CTX_AREA_NK100": "",
         }
+        return tr_id, params
+
+    async def _update_balances(self):
+        local_asset_names = set(self._account_balances.keys())
+        remote_asset_names = set()
+
+        tr_id, params = self._balance_request_args()
 
         result = await self._api_get(
             path_url=CONSTANTS.DOMESTIC_STOCK_BALANCE_PATH,
