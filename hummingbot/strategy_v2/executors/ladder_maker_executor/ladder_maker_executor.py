@@ -118,13 +118,20 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
     # ------------------------------------------------------------------ fair price
 
     def _get_fx(self):
-        if self.config.fx_connector and self.config.fx_trading_pair:
-            conn = self.connectors.get(self.config.fx_connector)
-            if conn is not None:
-                bid = conn.get_price_by_type(self.config.fx_trading_pair, PriceType.BestBid)
-                ask = conn.get_price_by_type(self.config.fx_trading_pair, PriceType.BestAsk)
-                if bid and bid > ZERO and ask and ask > ZERO:
-                    return Decimal(str(bid)), Decimal(str(ask))
+        """Live blended USD/KRW from the process-wide FairFxSource (JEP-148).
+
+        Preserves the ``(Optional[Decimal], Optional[Decimal])`` contract that
+        ``_compute_fair`` unpacks: the singleton's ``None`` (stale/never-fetched
+        bank) maps to ``(None, None)`` so the fair gate closes. ``fx_connector`` /
+        ``fx_trading_pair`` still register the USDT-KRW market for subscription
+        (the source reads it via the script's getter). ``static_fx_rate`` remains a
+        guarded offline/test fallback ONLY — never the live path.
+        """
+        from hummingbot.data_feed.fair_fx.fair_fx_source import FairFxSource
+
+        quote = FairFxSource.get_instance().get_fx()
+        if quote is not None:
+            return quote
         if self.config.static_fx_rate and self.config.static_fx_rate > ZERO:
             rate = self.config.static_fx_rate
             return rate, rate
