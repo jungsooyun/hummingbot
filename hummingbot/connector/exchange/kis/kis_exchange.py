@@ -279,6 +279,7 @@ class KisExchange(ExchangePyBase):
         body = {
             "CANO": self._cano,
             "ACNT_PRDT_CD": self._acnt_prdt_cd,
+            "KRX_FWDG_ORD_ORGNO": "",  # KIS looks up the original forwarding org when blank
             "PDNO": symbol,
             "ORGN_ODNO": tracked_order.exchange_order_id,
             "ORD_DVSN": "00",

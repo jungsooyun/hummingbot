@@ -1093,10 +1093,14 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
     async def test_handle_data_message_krx_ignored_under_sor(self):
         ds = self._make_ds("sor")
+        ds.logger().setLevel(1)
+        ds.logger().addHandler(self)
         raw = "0|H0STASP0|005930|" + self._ws_orderbook_payload()
         with patch.object(ds, "_process_orderbook_data", new_callable=AsyncMock) as m:
             await ds._handle_data_message(raw)
             m.assert_not_awaited()
+        # Channel drift (KRX TR_ID under SOR) must be surfaced, not silently dropped
+        self.assertTrue(self._is_logged_partial("WARNING", "Dropped KIS market-data TR_ID"))
 
     async def test_handle_data_message_nxt_orderbook_dispatched(self):
         ds = self._make_ds("nxt")

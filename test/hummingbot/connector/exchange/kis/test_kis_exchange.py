@@ -387,6 +387,7 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         request_data = json.loads(request_call.kwargs["data"])
         self.assertEqual(order.exchange_order_id, request_data["ORGN_ODNO"])
         self.assertEqual("SOR", request_data["EXCG_ID_DVSN_CD"])
+        self.assertIn("KRX_FWDG_ORD_ORGNO", request_data)
         self.assertEqual(
             CONSTANTS.DOMESTIC_STOCK_CANCEL_TR_ID,
             request_call.kwargs["headers"]["tr_id"],

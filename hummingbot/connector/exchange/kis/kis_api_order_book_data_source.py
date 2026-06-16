@@ -60,6 +60,11 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._market_routing = market_routing
         self._ob_tr_id = CONSTANTS.WS_ORDERBOOK_TR_ID_BY_ROUTING[market_routing]
         self._trade_tr_id = CONSTANTS.WS_TRADE_TR_ID_BY_ROUTING[market_routing]
+        # All market-data TR_IDs across routing modes — used to detect channel drift
+        self._known_market_tr_ids = (
+            set(CONSTANTS.WS_ORDERBOOK_TR_ID_BY_ROUTING.values())
+            | set(CONSTANTS.WS_TRADE_TR_ID_BY_ROUTING.values())
+        )
 
     # ------------------------------------------------------------------
     # Public interface
@@ -162,6 +167,14 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
             parsed = self._parse_caret_fields(data_str, CONSTANTS.WS_TRADE_COLUMNS)
             if parsed:
                 await self._process_trade_data(tr_key, parsed)
+        elif tr_id in self._known_market_tr_ids:
+            # A market-data channel for a different routing mode than configured —
+            # subscription/dispatch drift. Surface it instead of dropping silently.
+            self.logger().warning(
+                f"Dropped KIS market-data TR_ID '{tr_id}' not matching active "
+                f"'{self._market_routing}' routing (orderbook={self._ob_tr_id}, "
+                f"trade={self._trade_tr_id})."
+            )
 
     async def _handle_control_message(self, ws: aiohttp.ClientWebSocketResponse, raw: str):
         """Handle JSON control messages (PINGPONG, subscription responses)."""
