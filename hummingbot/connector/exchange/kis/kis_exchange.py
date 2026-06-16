@@ -249,6 +249,7 @@ class KisExchange(ExchangePyBase):
             "ORD_DVSN": ord_dvsn,
             "ORD_QTY": str(int(amount)),
             "ORD_UNPR": str(int(price)),
+            "EXCG_ID_DVSN_CD": self._excg_for_routing(),
         }
 
         if self._sandbox:

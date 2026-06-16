@@ -373,6 +373,15 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         )
         self.assertEqual(str(int(order.amount)), request_data["ORD_QTY"])
         self.assertEqual(str(int(order.price)), request_data["ORD_UNPR"])
+        # SOR/NXT routing: default routing is "sor" (create_exchange_instance)
+        self.assertEqual("SOR", request_data["EXCG_ID_DVSN_CD"])
+        tr_id = request_call.kwargs["headers"]["tr_id"]
+        expected_tr_id = (
+            CONSTANTS.DOMESTIC_STOCK_ORDER_BUY_TR_ID
+            if order.trade_type == TradeType.BUY
+            else CONSTANTS.DOMESTIC_STOCK_ORDER_SELL_TR_ID
+        )
+        self.assertEqual(expected_tr_id, tr_id)
 
     def validate_order_cancelation_request(self, order: InFlightOrder, request_call: RequestCall):
         request_data = json.loads(request_call.kwargs["data"])

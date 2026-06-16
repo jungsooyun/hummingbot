@@ -67,9 +67,11 @@ OVERSEAS_OPTIONS_ORDERBOOK_PATH = "uapi/overseas-futureoption/v1/quotations/opt-
 # Domestic Stock Trading (국내 주식 주문)
 # --------------------------------------------------------------------------- #
 DOMESTIC_STOCK_ORDER_PATH = "uapi/domestic-stock/v1/trading/order-cash"
-DOMESTIC_STOCK_ORDER_BUY_TR_ID = "TTTC0802U"
-DOMESTIC_STOCK_ORDER_SELL_TR_ID = "TTTC0801U"
-DOMESTIC_STOCK_CANCEL_TR_ID = "TTTC0803U"
+DOMESTIC_STOCK_CANCEL_PATH = "uapi/domestic-stock/v1/trading/order-rvsecncl"
+# Unified order TR_IDs (KRX/NXT/SOR via EXCG_ID_DVSN_CD body param)
+DOMESTIC_STOCK_ORDER_BUY_TR_ID = "TTTC0012U"
+DOMESTIC_STOCK_ORDER_SELL_TR_ID = "TTTC0011U"
+DOMESTIC_STOCK_CANCEL_TR_ID = "TTTC0013U"
 DOMESTIC_STOCK_BALANCE_PATH = "uapi/domestic-stock/v1/trading/inquire-balance"
 DOMESTIC_STOCK_BALANCE_TR_ID = "TTTC8434R"
 DOMESTIC_STOCK_ORDER_DETAIL_PATH = "uapi/domestic-stock/v1/trading/inquire-daily-ccld"
