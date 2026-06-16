@@ -1,21 +1,35 @@
+"""Ladder maker executor, rewired onto the shared cross-venue hedged machine (JEP-147).
+
+``LadderMakerExecutor`` now inherits ``CrossVenueHedgedExecutorBase`` (JEP-143):
+all inventory / hedge-queue / fill-accounting / PnL / fee / retry / event plumbing
+lives in the base, identical to ``XEMMExecutor``. This subclass supplies only the
+ladder-specific policy via the base's abstract hooks:
+
+  * fair-price derivation (KIS spot KRW->USD via side-aware FX) + inventory skew,
+  * ladder target construction + reprice guard,
+  * marketable-limit hedge sizing on KIS spot,
+  * the pre-quote gate.
+
+Pure pricing math stays in ``ladder_policy`` (unit-tested without the runtime).
+
+Gate wiring (JEP-147): the kill-switch now flows through a composable ``GateChain``
+(JEP-142). The chain is the extension seam JEP-133 fills with the staleness /
+trading-hours / order-cap gates (those need feed-age + session inputs that are not
+plumbed yet); for now the chain holds ``KillSwitchGate`` and the fair-price
+readiness check is kept as an explicit data gate to preserve current behavior.
+"""
 import logging
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate
-from hummingbot.core.event.events import (
-    BuyOrderCompletedEvent,
-    BuyOrderCreatedEvent,
-    MarketOrderFailureEvent,
-    OrderCancelledEvent,
-    OrderFilledEvent,
-    SellOrderCompletedEvent,
-    SellOrderCreatedEvent,
-)
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
-from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
+from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.cross_venue_hedged_executor_base import (
+    CrossVenueHedgedExecutorBase,
+)
 from hummingbot.strategy_v2.executors.ladder_maker_executor.data_types import LadderMakerExecutorConfig
 from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import (
     RungSpec,
@@ -25,21 +39,20 @@ from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import
     compute_fair_price,
     compute_hedge_order,
 )
-from hummingbot.strategy_v2.models.base import RunnableStatus
-from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
+from hummingbot.strategy_v2.gates.gate_chain import GateChain, GateContext, KillSwitchGate
+from hummingbot.strategy_v2.models.executors import TrackedOrder
 
 ZERO = Decimal("0")
+_KST = timezone(timedelta(hours=9))
 
 
-class LadderMakerExecutor(ExecutorBase):
+class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
     """Ladder market-making on a perp (maker, post-only) hedged on KIS spot.
 
     Each tick: derive a conservative fair price from the KIS spot orderbook (KRW->USD
     via side-aware FX), apply inventory skew, build a simultaneous-maker ladder, and
     keep the perp quotes in sync (subject to reprice guards). When a perp maker fills,
-    enqueue a marketable-limit hedge on KIS spot.
-
-    Pure pricing math lives in ``ladder_policy`` (unit-tested without the runtime).
+    the base enqueues a marketable-limit hedge on KIS spot sized by ``_size_hedge``.
     """
 
     _logger = None
@@ -57,81 +70,52 @@ class LadderMakerExecutor(ExecutorBase):
         update_interval: float = 1.0,
         max_retries: int = 10,
     ):
-        self.config = config
-        self.maker_connector = config.maker_market.connector_name
-        self.maker_trading_pair = config.maker_market.trading_pair
-        self.hedge_connector = config.hedge_market.connector_name
-        self.hedge_trading_pair = config.hedge_market.trading_pair
-        self.entry_side = config.entry_side
-        self.hedge_side = TradeType.BUY if config.entry_side == TradeType.SELL else TradeType.SELL
-
-        self.maker_orders: Dict[str, TrackedOrder] = {}
-        self.hedge_orders: Dict[str, TrackedOrder] = {}
-
-        self._maker_executed_base = ZERO
-        self._maker_executed_quote = ZERO
-        self._hedge_executed_base = ZERO
-        self._hedge_executed_quote = ZERO
-        self._pending_hedge_base = ZERO
-        self._maker_fees_quote = ZERO
-        self._hedge_fees_quote = ZERO
-
         self._last_reprice_ts = 0.0
-        self._current_retries = 0
-        self._max_retries = max_retries
-
-        connectors = [self.maker_connector, self.hedge_connector]
-        if config.fx_connector and config.fx_connector not in connectors:
-            connectors.append(config.fx_connector)
-
+        # Kill-switch flows through the composable chain; JEP-133 appends the
+        # staleness / trading-hours / order-cap gates to this same chain.
+        self._gate_chain = GateChain([KillSwitchGate()])
         super().__init__(
             strategy=strategy,
-            connectors=connectors,
             config=config,
+            maker_market=config.maker_market,
+            hedge_market=config.hedge_market,
+            entry_side=config.entry_side,
+            connectors=[config.fx_connector] if config.fx_connector else None,
             update_interval=update_interval,
+            max_retries=max_retries,
         )
-
-    # ------------------------------------------------------------------ lifecycle
-
-    async def control_task(self):
-        if self.status == RunnableStatus.RUNNING:
-            if not self._gates_open():
-                self._cancel_all_maker()
-                self._process_hedges()
-                return
-            self._reconcile_ladder()
-            self._process_hedges()
-        elif self.status == RunnableStatus.SHUTTING_DOWN:
-            await self._control_shutdown()
-
-    def early_stop(self, keep_position: bool = False):
-        if keep_position:
-            self.close_type = CloseType.POSITION_HOLD
-            self.stop()
-            return
-        self.close_type = CloseType.EARLY_STOP
-        self._status = RunnableStatus.SHUTTING_DOWN
-
-    async def _control_shutdown(self):
-        self._cancel_all_maker()
-        # Best-effort: hedge any remaining unhedged fills before terminating
-        self._process_hedges()
-        if not self._has_open_orders() and self._unhedged_base() <= ZERO:
-            self.stop()
 
     # ------------------------------------------------------------------ gates
 
-    def _gates_open(self) -> bool:
-        if self.config.kill_switch:
-            return False
-        if self._compute_fair(self._policy_side()) is None:
-            return False
-        return True
-
-    # ------------------------------------------------------------------ fair price
-
     def _policy_side(self) -> Side:
         return Side.BUY if self.entry_side == TradeType.BUY else Side.SELL
+
+    def _pending_maker_notional(self) -> Decimal:
+        total = ZERO
+        for o in self._open_maker_orders():
+            order = o.order
+            if order is not None and order.price is not None and order.amount is not None:
+                total += Decimal(order.price) * Decimal(order.amount)
+        return total
+
+    def _gates_open(self) -> bool:
+        ctx = GateContext(
+            now_kst=datetime.fromtimestamp(self._strategy.current_timestamp, tz=_KST),
+            kis_age_s=0.0,  # feed-age gates land in JEP-133
+            hl_age_s=0.0,
+            fx_age_s=0.0,
+            inventory=self._unhedged_base_signed(),
+            open_order_count=len(self._open_maker_orders()),
+            pending_notional=self._pending_maker_notional(),
+            kill_switch=bool(self.config.kill_switch),
+        )
+        if not self._gate_chain.evaluate(ctx).open:
+            return False
+        # Data-readiness gate: a fair price must be computable. Promoting this to a
+        # StalenessGate with real KIS/FX ages is JEP-133.
+        return self._compute_fair(self._policy_side()) is not None
+
+    # ------------------------------------------------------------------ fair price
 
     def _get_fx(self):
         if self.config.fx_connector and self.config.fx_trading_pair:
@@ -165,18 +149,18 @@ class LadderMakerExecutor(ExecutorBase):
             self.config.inventory_skew_bps_per_unit,
         )
 
-    # ------------------------------------------------------------------ ladder reconcile
+    # ------------------------------------------------------------------ ladder hooks
 
-    def _reconcile_ladder(self):
+    def _compute_targets(self) -> List:
         side = self._policy_side()
         fair = self._compute_fair(side)
         if fair is None:
-            return
+            return []
         rungs = [
             RungSpec(edge_bps=r.edge_bps, size=r.size, min_edge_bps=r.min_edge_bps, enabled=r.enabled)
             for r in self.config.rungs
         ]
-        targets = build_ladder_targets(
+        return build_ladder_targets(
             fair=fair,
             rungs=rungs,
             total_size_cap=self.config.total_size_cap,
@@ -186,12 +170,6 @@ class LadderMakerExecutor(ExecutorBase):
             inventory=self._unhedged_base_signed(),
             max_inventory=self.config.max_inventory,
         )
-        if not self._should_reprice(targets):
-            return
-        self._cancel_all_maker()
-        for target in targets:
-            self._place_maker(target.price, target.size, target.edge_bps)
-        self._last_reprice_ts = self._strategy.current_timestamp
 
     def _should_reprice(self, targets: List) -> bool:
         open_makers = self._open_maker_orders()
@@ -200,7 +178,7 @@ class LadderMakerExecutor(ExecutorBase):
         elapsed = self._strategy.current_timestamp - self._last_reprice_ts
         if elapsed < self.config.min_reprice_interval_s:
             return False
-        # Reprice only if the best target moved beyond the tick threshold
+        # Reprice only if the best target moved beyond the tick threshold.
         target_prices = sorted(t.price for t in targets)
         current_prices = sorted(o.order.price for o in open_makers if o.order is not None)
         if not current_prices or not target_prices:
@@ -208,7 +186,12 @@ class LadderMakerExecutor(ExecutorBase):
         delta = abs(target_prices[0] - current_prices[0])
         return delta >= self.config.min_reprice_delta_ticks * self.config.maker_tick
 
-    def _place_maker(self, price: Decimal, amount: Decimal, edge_bps: Decimal):
+    def _place_targets(self, targets: List) -> None:
+        for target in targets:
+            self._place_maker(target.price, target.size, target.edge_bps)
+        self._last_reprice_ts = self._strategy.current_timestamp
+
+    def _place_maker(self, price: Decimal, amount: Decimal, edge_bps: Decimal) -> None:
         connector = self.connectors[self.maker_connector]
         order_id = self.place_order(
             connector_name=self.maker_connector,
@@ -222,24 +205,15 @@ class LadderMakerExecutor(ExecutorBase):
         )
         self.maker_orders[order_id] = TrackedOrder(order_id=order_id)
 
-    def _cancel_all_maker(self):
-        for order in self._open_maker_orders():
-            self._strategy.cancel(self.maker_connector, self.maker_trading_pair, order.order_id)
+    # ------------------------------------------------------------------ hedge hook
 
-    # ------------------------------------------------------------------ hedge
-
-    def _process_hedges(self):
-        if self._pending_hedge_base <= ZERO:
-            return
-        # Keep at most one in-flight hedge order to avoid double-hedging
-        if any(o.order is not None and o.order.is_open for o in self.hedge_orders.values()):
-            return
+    def _size_hedge(self, pending_base: Decimal) -> Optional[Dict]:
         kis = self.connectors[self.hedge_connector]
         best_ask = kis.get_price_by_type(self.hedge_trading_pair, PriceType.BestAsk)
         if not best_ask or best_ask <= ZERO:
-            return
+            return None
         hedge = compute_hedge_order(
-            fill_qty=self._pending_hedge_base,
+            fill_qty=pending_base,
             share_per_unit=self.config.share_per_unit,
             kis_best_ask=Decimal(str(best_ask)),
             max_slippage_bps=self.config.hedge_max_slippage_bps,
@@ -247,96 +221,26 @@ class LadderMakerExecutor(ExecutorBase):
         )
         amount = kis.quantize_order_amount(self.hedge_trading_pair, hedge.size)
         if amount <= ZERO:
-            return
-        price = Decimal("NaN") if self.config.hedge_order_type == OrderType.MARKET else \
-            kis.quantize_order_price(self.hedge_trading_pair, hedge.price)
-        order_id = self.place_order(
-            connector_name=self.hedge_connector,
-            trading_pair=self.hedge_trading_pair,
-            order_type=self.config.hedge_order_type,
-            side=self.hedge_side,
-            amount=amount,
-            price=price,
-            metadata={"order_role": "hedge"},
+            return None
+        price = (
+            Decimal("NaN")
+            if self.config.hedge_order_type == OrderType.MARKET
+            else kis.quantize_order_price(self.hedge_trading_pair, hedge.price)
         )
-        self.hedge_orders[order_id] = TrackedOrder(order_id=order_id)
-        self._pending_hedge_base = ZERO
+        return {
+            "amount": amount,
+            "price": price,
+            "order_type": self.config.hedge_order_type,
+            "metadata": {"order_role": "hedge"},
+        }
 
-    # ------------------------------------------------------------------ inventory helpers
+    # ------------------------------------------------------------------ balance hook
 
-    def _unhedged_base(self) -> Decimal:
-        return max(ZERO, self._maker_executed_base - self._hedge_executed_base)
-
-    def _unhedged_base_signed(self) -> Decimal:
-        """Signed net inventory: positive long, negative short (drives skew/gate)."""
-        unhedged = self._unhedged_base()
-        return unhedged if self.entry_side == TradeType.BUY else -unhedged
-
-    def _open_maker_orders(self) -> List[TrackedOrder]:
-        return [o for o in self.maker_orders.values() if o.order is not None and o.order.is_open]
-
-    def _has_open_orders(self) -> bool:
-        return any(o.order is not None and o.order.is_open for o in
-                   list(self.maker_orders.values()) + list(self.hedge_orders.values()))
-
-    # ------------------------------------------------------------------ events
-
-    def _update_tracked(self, connector_name: str, order_id: str):
-        for book in (self.maker_orders, self.hedge_orders):
-            tracked = book.get(order_id)
-            if tracked is not None:
-                in_flight = self.get_in_flight_order(connector_name, order_id)
-                if in_flight is not None:
-                    tracked.order = in_flight
-
-    def process_order_created_event(self, _, market, event: Union[BuyOrderCreatedEvent, SellOrderCreatedEvent]):
-        if event.order_id in self.maker_orders:
-            self._update_tracked(self.maker_connector, event.order_id)
-        elif event.order_id in self.hedge_orders:
-            self._update_tracked(self.hedge_connector, event.order_id)
-
-    def process_order_filled_event(self, _, market, event: OrderFilledEvent):
-        if event.order_id in self.maker_orders:
-            self._update_tracked(self.maker_connector, event.order_id)
-            self._maker_executed_base += Decimal(event.amount)
-            self._maker_executed_quote += Decimal(event.amount) * Decimal(event.price)
-            self._pending_hedge_base += Decimal(event.amount)
-        elif event.order_id in self.hedge_orders:
-            self._update_tracked(self.hedge_connector, event.order_id)
-            self._hedge_executed_base += Decimal(event.amount)
-            self._hedge_executed_quote += Decimal(event.amount) * Decimal(event.price)
-
-    def process_order_completed_event(self, _, market, event: Union[BuyOrderCompletedEvent, SellOrderCompletedEvent]):
-        if event.order_id in self.maker_orders:
-            self._update_tracked(self.maker_connector, event.order_id)
-            tracked = self.maker_orders[event.order_id]
-            self._maker_fees_quote += tracked.cum_fees_quote
-        elif event.order_id in self.hedge_orders:
-            self._update_tracked(self.hedge_connector, event.order_id)
-            tracked = self.hedge_orders[event.order_id]
-            self._hedge_fees_quote += tracked.cum_fees_quote
-
-    def process_order_canceled_event(self, _, market, event: OrderCancelledEvent):
-        self.maker_orders.pop(event.order_id, None)
-
-    def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
-        if event.order_id in self.maker_orders:
-            self.maker_orders.pop(event.order_id, None)
-        elif event.order_id in self.hedge_orders:
-            self.hedge_orders.pop(event.order_id, None)
-            self._current_retries += 1
-            if self._current_retries > self._max_retries:
-                self.close_type = CloseType.FAILED
-                self.stop()
-
-    # ------------------------------------------------------------------ balance / pnl
-
-    async def validate_sufficient_balance(self):
-        side = self._policy_side()
-        fair = self._compute_fair(side)
+    def _maker_balance_candidate(self) -> Optional[OrderCandidate]:
+        fair = self._compute_fair(self._policy_side())
         if fair is None:
-            return
-        candidate = OrderCandidate(
+            return None
+        return OrderCandidate(
             trading_pair=self.maker_trading_pair,
             is_maker=True,
             order_type=OrderType.LIMIT_MAKER,
@@ -344,43 +248,3 @@ class LadderMakerExecutor(ExecutorBase):
             amount=self.config.total_size_cap,
             price=fair,
         )
-        adjusted = self.adjust_order_candidates(self.maker_connector, [candidate])[0]
-        if adjusted.amount == ZERO:
-            self.close_type = CloseType.INSUFFICIENT_BALANCE
-            self.stop()
-
-    def get_net_pnl_quote(self) -> Decimal:
-        matched = min(self._maker_executed_base, self._hedge_executed_base)
-        if matched <= ZERO:
-            return ZERO
-        maker_avg = self._maker_executed_quote / self._maker_executed_base if self._maker_executed_base > ZERO else ZERO
-        hedge_avg = self._hedge_executed_quote / self._hedge_executed_base if self._hedge_executed_base > ZERO else ZERO
-        if maker_avg <= ZERO or hedge_avg <= ZERO:
-            return ZERO
-        # entry SELL on perp, hedge BUY on spot: profit = (sell - buy) * qty
-        if self.entry_side == TradeType.SELL:
-            gross = (maker_avg - hedge_avg) * matched
-        else:
-            gross = (hedge_avg - maker_avg) * matched
-        return gross - self.get_cum_fees_quote()
-
-    def get_net_pnl_pct(self) -> Decimal:
-        if self._maker_executed_quote <= ZERO:
-            return ZERO
-        return self.get_net_pnl_quote() / self._maker_executed_quote
-
-    def get_cum_fees_quote(self) -> Decimal:
-        return self._maker_fees_quote + self._hedge_fees_quote
-
-    def get_custom_info(self) -> Dict:
-        return {
-            "side": self.entry_side,
-            "execution_purpose": self.config.execution_purpose,
-            "maker_connector": self.maker_connector,
-            "hedge_connector": self.hedge_connector,
-            "maker_executed_base": self._maker_executed_base,
-            "hedge_executed_base": self._hedge_executed_base,
-            "unhedged_base": self._unhedged_base(),
-            "pending_hedge_base": self._pending_hedge_base,
-            "open_maker_orders": len(self._open_maker_orders()),
-        }
