@@ -183,6 +183,17 @@ class KisExchange(ExchangePyBase):
     def is_trading_required(self) -> bool:
         return self._trading_required
 
+    def _is_user_stream_initialized(self) -> bool:
+        # KIS catches order fills via REST order-status polling
+        # (ExchangePyBase._update_order_status). Its real-time exec-notification
+        # WebSocket (ops.koreainvestment.com:21000) is environment-gated and
+        # frequently unavailable (real-time WS cap / entitlement), so it must NOT
+        # gate connector readiness -- otherwise the connector never becomes ready
+        # and cannot trade despite working REST order/balance polling. The user
+        # stream WS, when it connects, still delivers faster notifications; this
+        # only decouples *readiness* from it.
+        return True
+
     def supported_order_types(self) -> List[OrderType]:
         return [OrderType.LIMIT, OrderType.MARKET]
 

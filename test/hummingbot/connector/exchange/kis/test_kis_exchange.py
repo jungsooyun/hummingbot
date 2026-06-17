@@ -479,6 +479,29 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         self.assertTrue(request_headers["Authorization"].startswith("Bearer "))
         self.assertEqual(CONSTANTS.DOMESTIC_STOCK_BALANCE_TR_ID, request_headers["tr_id"])
 
+    def _expected_initial_status_dict(self) -> dict:
+        # KIS decouples readiness from the exec-notification WebSocket (fills are
+        # caught via REST order polling), so user_stream_initialized is always True.
+        return {
+            "symbols_mapping_initialized": False,
+            "order_books_initialized": False,
+            "account_balance": False,
+            "trading_rule_initialized": False,
+            "user_stream_initialized": True,
+        }
+
+    def test_user_stream_does_not_gate_readiness(self):
+        # KIS's real-time exec-notification WebSocket (ops.koreainvestment.com:21000)
+        # is environment-gated and frequently unavailable (e.g. real-time WS cap /
+        # entitlement). Fills are caught via REST order-status polling
+        # (ExchangePyBase._update_order_status), so the user stream must NOT gate
+        # readiness -- otherwise the connector never becomes ready and cannot trade
+        # even though REST order/balance polling works fine.
+        ex = self._make_exchange()
+        self.assertTrue(ex.is_trading_required)
+        self.assertEqual(0, ex._user_stream_tracker.data_source.last_recv_time)
+        self.assertTrue(ex._is_user_stream_initialized())
+
     def test_constructor_accepts_kis_sandbox_kwarg(self):
         # The non-trading instantiation path (settings.
         # non_trading_connector_instance_with_default_configuration, used by the
