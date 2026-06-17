@@ -66,6 +66,7 @@ class KisAPIUserStreamDataSource(UserStreamTrackerDataSource):
         connector: "KisExchange",
         api_factory: WebAssistantsFactory,
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
+        ws_enabled: bool = True,
     ):
         super().__init__()
         self._auth = auth
@@ -73,6 +74,7 @@ class KisAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._connector = connector
         self._api_factory = api_factory
         self._domain = domain
+        self._ws_enabled = ws_enabled
 
         # AES decryption state (per TR_ID)
         self._encryption_keys: Dict[str, Dict[str, str]] = {}
@@ -84,6 +86,15 @@ class KisAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
     async def listen_for_user_stream(self, output: asyncio.Queue):
         """Connect to KIS WebSocket and stream execution notifications."""
+        if not self._ws_enabled:
+            # REST-only mode: never touch the WS edge. Fills are caught via REST
+            # order-status polling (readiness is decoupled from the user stream).
+            self.logger().info(
+                "KIS execution-notice WebSocket disabled (kis_ws_enabled=false); "
+                "fills tracked via REST order-status polling."
+            )
+            while True:
+                await self._sleep(3600)
         while True:
             try:
                 approval_key = await self._auth.get_ws_approval_key()

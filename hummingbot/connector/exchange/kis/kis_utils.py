@@ -105,6 +105,27 @@ class KisConfigMap(BaseConnectorConfigMap):
             "is_updatable": True,
         },
     )
+    # When "false", the realtime WebSocket data sources never connect (no
+    # ops.koreainvestment.com:21000 traffic); the order book is served purely by
+    # REST snapshot polling and fills by REST order-status polling. Use this when
+    # the live WS edge refuses connections (env-gated / rate-limit blocked) so the
+    # bot stops hammering it. Default "true" preserves WS behavior.
+    kis_ws_enabled: str = Field(
+        default="true",
+        json_schema_extra={
+            "prompt": lambda cm: "Use realtime WebSocket? (true/false) — false = REST-only market data",
+            "is_secure": False,
+            # MUST be a connect key: only is_connect_key fields are forwarded to the
+            # trading-connector constructor (api_keys_from_connector_config_map filters
+            # on is_connect_key). is_connect_key=False -> the kwarg never reaches
+            # KisExchange and kis_ws_enabled silently defaults to "true". This mirrors
+            # kis_market_routing, an operational (non-credential) field forwarded the
+            # same way. prompt_on_new=False keeps it out of the interactive connect flow.
+            "is_connect_key": True,
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
     model_config = ConfigDict(title="kis")
 
 

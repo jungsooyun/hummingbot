@@ -56,6 +56,7 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         auth: "KisAuth",
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
         market_routing: str = CONSTANTS.MARKET_ROUTING_KRX,
+        ws_enabled: bool = True,
     ):
         super().__init__(trading_pairs)
         self._connector = connector
@@ -63,6 +64,7 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._auth = auth
         self._domain = domain
         self._market_routing = market_routing
+        self._ws_enabled = ws_enabled
         self._ob_tr_id = CONSTANTS.WS_ORDERBOOK_TR_ID_BY_ROUTING[market_routing]
         self._trade_tr_id = CONSTANTS.WS_TRADE_TR_ID_BY_ROUTING[market_routing]
         # All market-data TR_IDs across routing modes — used to detect channel drift
@@ -94,6 +96,15 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         - Data messages: pipe-delimited text with caret-separated fields
         - Control messages: JSON (subscription responses, PINGPONG)
         """
+        if not self._ws_enabled:
+            # REST-only mode: never touch the WS edge. The order book is kept fresh
+            # by the base REST snapshot poll (FULL_ORDER_BOOK_RESET_DELTA_SECONDS).
+            self.logger().info(
+                "KIS realtime orderbook WebSocket disabled (kis_ws_enabled=false); "
+                "serving order book via REST snapshot polling only."
+            )
+            while True:
+                await self._sleep(3600)
         while True:
             try:
                 approval_key = await self._auth.get_ws_approval_key()

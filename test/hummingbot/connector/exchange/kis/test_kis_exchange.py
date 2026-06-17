@@ -383,15 +383,27 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
     # SOR/NXT routing — constructor wiring
     # ------------------------------------------------------------------
 
-    def _make_exchange(self, kis_market_routing="sor", domain=CONSTANTS.DEFAULT_DOMAIN):
+    def _make_exchange(self, kis_market_routing="sor", domain=CONSTANTS.DEFAULT_DOMAIN, kis_ws_enabled="true"):
         return KisExchange(
             kis_app_key="testAppKey",
             kis_app_secret="testAppSecret",
             kis_account_number="12345678-01",
             trading_pairs=[self.trading_pair],
             kis_market_routing=kis_market_routing,
+            kis_ws_enabled=kis_ws_enabled,
             domain=domain,
         )
+
+    def test_ws_enabled_default_true(self):
+        self.assertTrue(self._make_exchange()._ws_enabled)
+
+    def test_ws_enabled_false_disables(self):
+        # "false" (any case) disables; the order book data source receives the flag
+        # so it never connects to the WS edge (REST-only).
+        ex = self._make_exchange(kis_ws_enabled="False")
+        self.assertFalse(ex._ws_enabled)
+        self.assertFalse(ex._create_order_book_data_source()._ws_enabled)
+        self.assertFalse(ex._create_user_stream_data_source()._ws_enabled)
 
     def test_market_routing_default_is_sor(self):
         self.assertEqual("sor", self._make_exchange()._market_routing)

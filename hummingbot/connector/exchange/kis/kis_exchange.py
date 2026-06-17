@@ -59,6 +59,7 @@ class KisExchange(ExchangePyBase):
         rate_limits_share_pct: Decimal = Decimal("100"),
         kis_sandbox: str = "false",
         kis_market_routing: str = CONSTANTS.MARKET_ROUTING_SOR,
+        kis_ws_enabled: str = "true",
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
     ):
         self._app_key = kis_app_key
@@ -73,6 +74,10 @@ class KisExchange(ExchangePyBase):
         # field (including kis_sandbox) as a kwarg, so the constructor MUST accept
         # it or trading-pair fetching raises TypeError.
         self._sandbox = str(kis_sandbox).strip().lower() == "true" or domain == "sandbox"
+        # Realtime WS toggle: "false" -> data sources never connect to the WS edge
+        # (REST-only market data + fills). Default enabled. The factory forwards
+        # every config-map field as a kwarg, so the constructor MUST accept it.
+        self._ws_enabled = str(kis_ws_enabled).strip().lower() != "false"
 
         # Resolve order routing BEFORE super().__init__() — ExchangePyBase.__init__
         # constructs the order book data source, which needs self._market_routing.
@@ -238,6 +243,7 @@ class KisExchange(ExchangePyBase):
             auth=self._auth,
             domain=self._domain,
             market_routing=self._market_routing,
+            ws_enabled=self._ws_enabled,
         )
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
@@ -247,6 +253,7 @@ class KisExchange(ExchangePyBase):
             connector=self,
             api_factory=self._web_assistants_factory,
             domain=self._domain,
+            ws_enabled=self._ws_enabled,
         )
 
     # ------------------------------------------------------------------

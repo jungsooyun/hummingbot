@@ -164,6 +164,19 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
             self.data_source.FULL_ORDER_BOOK_RESET_DELTA_SECONDS,
         )
 
+    async def test_ws_disabled_never_connects(self):
+        # kis_ws_enabled=false -> listen_for_subscriptions must NOT touch the WS
+        # edge (no approval-key fetch, no ws_connect): the bot stops hammering
+        # ops.koreainvestment.com:21000. The order book is served by REST polling.
+        self.data_source._ws_enabled = False
+        self.data_source._auth.get_ws_approval_key = AsyncMock()
+        with patch.object(self.data_source, "_sleep", new_callable=AsyncMock) as sleep_mock:
+            sleep_mock.side_effect = asyncio.CancelledError
+            with self.assertRaises(asyncio.CancelledError):
+                await self.data_source.listen_for_subscriptions()
+        self.data_source._auth.get_ws_approval_key.assert_not_called()
+        sleep_mock.assert_awaited_once()
+
     def _is_logged_partial(self, log_level: str, message_fragment: str) -> bool:
         """Check if any log record at the given level contains the fragment."""
         return any(

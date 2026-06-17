@@ -122,6 +122,18 @@ class KisAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertIsInstance(recv_time, (int, float))
         self.assertEqual(recv_time, 0)
 
+    async def test_ws_disabled_never_connects(self):
+        # kis_ws_enabled=false -> listen_for_user_stream must NOT touch the WS edge
+        # (no approval-key fetch): fills are caught via REST order-status polling.
+        self.data_source._ws_enabled = False
+        self.data_source._auth.get_ws_approval_key = AsyncMock()
+        with patch.object(self.data_source, "_sleep", new_callable=AsyncMock) as sleep_mock:
+            sleep_mock.side_effect = asyncio.CancelledError
+            with self.assertRaises(asyncio.CancelledError):
+                await self.data_source.listen_for_user_stream(asyncio.Queue())
+        self.data_source._auth.get_ws_approval_key.assert_not_called()
+        sleep_mock.assert_awaited_once()
+
     # ------------------------------------------------------------------ #
     # Test: _connected_websocket_assistant returns None
     # ------------------------------------------------------------------ #
