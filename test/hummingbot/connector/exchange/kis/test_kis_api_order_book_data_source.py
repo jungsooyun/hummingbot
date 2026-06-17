@@ -146,6 +146,24 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
             for record in self.log_records
         )
 
+    def test_rest_snapshot_poll_interval_is_fast(self):
+        # KIS realtime WS is environment-gated and frequently unavailable; when the
+        # WS push is down, the ONLY thing that refreshes the spot order book is the
+        # base-class REST fallback in listen_for_order_book_snapshots, which fires
+        # after FULL_ORDER_BOOK_RESET_DELTA_SECONDS of WS silence. The upstream
+        # default is 3600s (1 hour) -> the maker would quote off an hour-stale spot.
+        # KIS must override it to a fast cadence so REST keeps the book fresh.
+        self.assertLessEqual(
+            self.data_source.FULL_ORDER_BOOK_RESET_DELTA_SECONDS,
+            CONSTANTS.REST_ORDER_BOOK_POLL_INTERVAL,
+            "KIS order book REST fallback must poll fast (WS is unreliable), "
+            "not inherit the 1-hour upstream default.",
+        )
+        self.assertEqual(
+            CONSTANTS.REST_ORDER_BOOK_POLL_INTERVAL,
+            self.data_source.FULL_ORDER_BOOK_RESET_DELTA_SECONDS,
+        )
+
     def _is_logged_partial(self, log_level: str, message_fragment: str) -> bool:
         """Check if any log record at the given level contains the fragment."""
         return any(

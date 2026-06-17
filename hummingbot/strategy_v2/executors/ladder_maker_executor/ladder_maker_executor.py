@@ -46,6 +46,24 @@ ZERO = Decimal("0")
 _KST = timezone(timedelta(hours=9))
 
 
+def _fmt_num(x) -> Optional[str]:
+    """Format a price/size for observe output: trim binary-float noise to 4dp.
+
+    Decimals built from floats (e.g. fair = spot * fx) carry long tails like
+    ``1690.40000000000009``; quantizing to 4 decimals keeps logs and status
+    readable. ``None`` (missing spot/fx) renders as ``--`` so a closed fair gate
+    is obvious rather than crashing the formatter.
+    """
+    if x is None:
+        return "--"
+    d = x if isinstance(x, Decimal) else Decimal(str(x))
+    # Fixed-point (never scientific, so 100 stays "100" not "1E+2"), trailing zeros trimmed.
+    s = format(d.quantize(Decimal("0.0001")), "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
+
+
 class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
     """Ladder market-making on a perp (maker, post-only) hedged on KIS spot.
 
@@ -56,6 +74,11 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
     """
 
     _logger = None
+
+    # In observe mode the executor reprices every tick (nothing is tracked, so the
+    # reprice guard never holds), which would emit a quote log several times a second.
+    # Throttle the human-facing OBSERVE summary to one line per this interval.
+    _OBSERVE_LOG_INTERVAL_S = 5.0
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -71,6 +94,8 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         max_retries: int = 10,
     ):
         self._last_reprice_ts = 0.0
+        self._last_observe_log_ts = 0.0
+        self._last_observe: Optional[Dict] = None
         # Kill-switch flows through the composable chain; JEP-133 appends the
         # staleness / trading-hours / order-cap gates to this same chain.
         self._gate_chain = GateChain([KillSwitchGate()])
@@ -194,6 +219,17 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         return delta >= self.config.min_reprice_delta_ticks * self.config.maker_tick
 
     def _place_targets(self, targets: List) -> None:
+        if self.config.observe:
+            # Capture the full intended ladder (fair + spot + fx + rungs) for both the
+            # throttled human log and get_custom_info (status/dashboard), then emit one
+            # summary line per _OBSERVE_LOG_INTERVAL_S instead of one log per rung per
+            # tick. Observe reprices every tick (nothing tracked), so unthrottled this
+            # would flood several lines/second.
+            self._last_observe = self._build_observe(targets)
+            now = self._strategy.current_timestamp
+            if now - self._last_observe_log_ts >= self._OBSERVE_LOG_INTERVAL_S:
+                self._last_observe_log_ts = now
+                self.logger().info(self._format_observe_line(self._last_observe))
         for target in targets:
             self._place_maker(target.price, target.size, target.edge_bps)
         self._last_reprice_ts = self._strategy.current_timestamp
@@ -203,13 +239,9 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         q_amount = connector.quantize_order_amount(self.maker_trading_pair, amount)
         q_price = connector.quantize_order_price(self.maker_trading_pair, price)
         if self.config.observe:
-            # No-submit: log the intended maker quote and skip placement. Nothing is
-            # tracked, so _open_maker_orders stays empty (cancel path no-ops) and no
-            # fills occur (so the hedge path never fires). Zero real orders.
-            self.logger().info(
-                f"[OBSERVE] maker {self.entry_side.name} {q_amount} "
-                f"{self.maker_trading_pair} @ {q_price} (edge={edge_bps}bps) — no submit"
-            )
+            # No-submit: nothing is tracked, so _open_maker_orders stays empty (cancel
+            # path no-ops) and no fills occur (so the hedge path never fires). Zero real
+            # orders. The intended quote is surfaced by the _place_targets summary line.
             return
         order_id = self.place_order(
             connector_name=self.maker_connector,
@@ -222,6 +254,56 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             metadata={"order_role": "maker", "edge_bps": str(edge_bps)},
         )
         self.maker_orders[order_id] = TrackedOrder(order_id=order_id)
+
+    # ------------------------------------------------------------------ observe
+
+    def _build_observe(self, targets: List) -> Dict:
+        """Snapshot the inputs and intended ladder for observe-mode visibility.
+
+        Surfaces the spot bid/ask the fair is derived from (so a frozen book is
+        visible at a glance — KIS WS is unreliable and the book is REST-refreshed),
+        the FX leg, the resulting fair, and each quantized rung price.
+        """
+        kis = self.connectors[self.hedge_connector]
+        bid = kis.get_price_by_type(self.hedge_trading_pair, PriceType.BestBid)
+        ask = kis.get_price_by_type(self.hedge_trading_pair, PriceType.BestAsk)
+        fx_bid, fx_ask = self._get_fx()
+        fair = self._compute_fair(self._policy_side())
+        conn = self.connectors[self.maker_connector]
+        rungs = [
+            {
+                "edge_bps": _fmt_num(t.edge_bps),
+                "price": _fmt_num(conn.quantize_order_price(self.maker_trading_pair, t.price)),
+                "size": _fmt_num(t.size),
+            }
+            for t in targets
+        ]
+        return {
+            "side": self.entry_side.name,
+            "fair": _fmt_num(fair),
+            "spot_pair": self.hedge_trading_pair,
+            "spot_bid": _fmt_num(bid),
+            "spot_ask": _fmt_num(ask),
+            "fx_bid": _fmt_num(fx_bid),
+            "fx_ask": _fmt_num(fx_ask),
+            "rungs": rungs,
+        }
+
+    @staticmethod
+    def _format_observe_line(obs: Dict) -> str:
+        rungs = " ".join(f"{r['price']}@{r['edge_bps']}bps" for r in obs["rungs"])
+        return (
+            f"[OBSERVE] {obs['side']} fair={obs['fair']} "
+            f"spot[{obs['spot_pair']}] bid/ask={obs['spot_bid']}/{obs['spot_ask']} "
+            f"fx={obs['fx_bid']}/{obs['fx_ask']} -> rungs: {rungs} -- no submit"
+        )
+
+    def get_custom_info(self) -> Dict:
+        info = super().get_custom_info()
+        info["observe"] = bool(self.config.observe)
+        if self._last_observe is not None:
+            info["last_quote"] = self._last_observe
+        return info
 
     # ------------------------------------------------------------------ hedge hook
 

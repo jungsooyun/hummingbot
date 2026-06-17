@@ -35,6 +35,15 @@ DOMESTIC_STOCK_TICKER_PATH = "uapi/domestic-stock/v1/quotations/inquire-price-2"
 DOMESTIC_STOCK_ORDERBOOK_TR_ID = "FHKST01010200"
 DOMESTIC_STOCK_ORDERBOOK_PATH = "uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
 
+# Order-book REST fallback cadence. The KIS realtime WS (ops.koreainvestment.com)
+# is environment-gated and frequently unavailable; when the WS push is down the
+# base OrderBookTrackerDataSource only re-fetches a REST snapshot after
+# FULL_ORDER_BOOK_RESET_DELTA_SECONDS of WS silence (upstream default: 3600s = 1h).
+# KIS overrides that to this fast cadence so the spot book a maker quotes off
+# never goes more than a few seconds stale even with the WS down (matches the
+# documented "REST polling, 5s interval" design and the stratops REST client).
+REST_ORDER_BOOK_POLL_INTERVAL = 5.0
+
 # --------------------------------------------------------------------------- #
 # Domestic Futures / Options (국내 선물옵션)
 # --------------------------------------------------------------------------- #

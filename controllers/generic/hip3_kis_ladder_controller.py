@@ -149,10 +149,29 @@ class Hip3KisLadderController(ControllerBase):
 
     def to_format_status(self) -> List[str]:
         active = self.filter_executors(self.executors_info, filter_func=lambda e: not e.is_done)
-        return [
+        lines = [
             f"  Active ladder executors: {len(active)}",
             f"  Maker(perp): {self.config.maker_connector} {self.config.maker_trading_pair}",
             f"  Hedge(spot): {self.config.hedge_connector} {self.config.hedge_trading_pair}",
             f"  entry_side: {self.config.entry_side.name}  rungs: {len(self.config.rungs)}",
-            f"  kill_switch: {self.config.kill_switch}",
+            f"  kill_switch: {self.config.kill_switch}  observe: {self.config.observe}",
         ]
+        # Surface each active executor's last intended quote (fair + spot + fx +
+        # rungs) so the fair price and virtual ladder are visible in `status` and
+        # on the dashboard, not only by grepping the executor log. Populated in
+        # observe mode via the executor's get_custom_info["last_quote"].
+        for executor in active:
+            quote = (getattr(executor, "custom_info", None) or {}).get("last_quote")
+            if not quote:
+                continue
+            lines.append(
+                f"    fair={quote.get('fair')}  "
+                f"spot[{quote.get('spot_pair')}] bid/ask={quote.get('spot_bid')}/{quote.get('spot_ask')}  "
+                f"fx={quote.get('fx_bid')}/{quote.get('fx_ask')}"
+            )
+            rungs = "  ".join(
+                f"{r['price']}@{r['edge_bps']}bps" for r in quote.get("rungs", [])
+            )
+            if rungs:
+                lines.append(f"    rungs: {rungs}")
+        return lines

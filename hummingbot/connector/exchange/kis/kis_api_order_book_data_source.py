@@ -43,6 +43,11 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     _logger: Optional[HummingbotLogger] = None
 
+    # KIS realtime WS is unreliable in many environments; when it is down, this is
+    # the only thing that keeps the spot order book fresh. Override the 1-hour
+    # upstream default so the base REST fallback re-snapshots every few seconds.
+    FULL_ORDER_BOOK_RESET_DELTA_SECONDS = CONSTANTS.REST_ORDER_BOOK_POLL_INTERVAL
+
     def __init__(
         self,
         trading_pairs: List[str],
