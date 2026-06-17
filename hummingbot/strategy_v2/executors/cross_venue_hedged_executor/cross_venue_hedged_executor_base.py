@@ -273,7 +273,68 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         """
         return any(o.order is None or o.order.is_open for o in self.hedge_orders.values())
 
+    def _reconcile_stuck_hedges(self) -> None:
+        """Resolve hedge orders stuck with ``order is None`` (lost-lifecycle-event guard).
+
+        Runs every tick. ``_hedge_in_flight`` counts an ``order is None`` hedge as
+        in-flight (the ~1-tick just-placed window before its created event). If that
+        created/failed/canceled event is ever LOST, the order would stay ``None``
+        forever and freeze ALL hedging. Here we consult the connector's order tracker
+        — ``get_in_flight_order`` reads ``active_orders + cached_orders`` (a 30s TTL
+        cache that retains the terminal state and ``executed_amount_base``), the
+        synchronous source of truth after ``place_order``:
+
+          * live (``is_open``)  -> adopt the connector's ``InFlightOrder``. The freeze
+            clears immediately and subsequent fills flow through the normal event path.
+          * terminal            -> the order is done; no further events will arrive.
+            Because it was never adopted (``order is None`` ⟺ no created/fill event was
+            ever processed ⟺ nothing was counted for it), its connector-recorded
+            ``executed_amount_base`` is exactly the fill we missed — credit it once
+            (so an already-filled hedge is NOT re-submitted = no double hedge), then
+            drop it. Any unfilled remainder stays in ``_pending_hedge_base`` and
+            re-hedges next tick.
+          * unknown (``None``)  -> no connector record at all (never-tracked, or terminal
+            >30s ago with the event lost and no tick reconciled in time). Drop it
+            WITHOUT synthesizing a fill (conservative: never over-hedge); the pending
+            base re-hedges. Logged because it should not happen in normal operation.
+
+        This is the principled successor to the reverted tick-watchdog (f85b628d8):
+        the watchdog reaped on an elapsed-time *guess* and could orphan a slow-but-real
+        order; this reaps only on the connector's *recorded* state, so "never-created"
+        is proven rather than guessed and a filled order is never re-hedged.
+        """
+        for order_id, tracked in list(self.hedge_orders.items()):
+            if tracked.order is not None:
+                continue
+            in_flight = self.get_in_flight_order(self.hedge_connector, order_id)
+            if in_flight is None:
+                self.logger().warning(
+                    "Hedge order %s has no connector record and never received a "
+                    "lifecycle event; clearing it so hedging can resume "
+                    "(pending_hedge_base=%s).",
+                    order_id,
+                    self._pending_hedge_base,
+                )
+                self.hedge_orders.pop(order_id, None)
+                continue
+            if in_flight.is_open:
+                tracked.order = in_flight  # adopt: clears the order-None freeze
+                continue
+            # Terminal, but its events were lost. order was None => 0 counted for it,
+            # so the connector's executed amount is exactly the fill we missed.
+            executed = in_flight.executed_amount_base or ZERO
+            if executed > ZERO:
+                price = in_flight.average_executed_price or in_flight.price
+                self._hedge_executed_base += executed
+                self._hedge_executed_quote += executed * price
+                self._hedge_fees_quote += in_flight.cumulative_fee_paid(in_flight.quote_asset)
+                self._pending_hedge_base -= executed
+                if self._pending_hedge_base < ZERO:
+                    self._pending_hedge_base = ZERO
+            self.hedge_orders.pop(order_id, None)
+
     def _process_hedges(self) -> None:
+        self._reconcile_stuck_hedges()
         if self._pending_hedge_base <= ZERO:
             return
         if self._hedge_in_flight():

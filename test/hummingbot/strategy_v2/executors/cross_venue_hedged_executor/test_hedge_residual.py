@@ -26,6 +26,27 @@ class _Inner:
         self.is_open = True
 
 
+class _Cx:
+    """Fake connector InFlightOrder: the synchronous source of truth ``fetch_order`` reads.
+
+    Models a tracker entry (active or 30s-cached). ``is_open`` flips False on a terminal
+    transition; ``executed_amount_base`` carries how much actually filled — the field the
+    executor must trust to avoid double-hedging a fill whose event was lost.
+    """
+
+    def __init__(self, amount):
+        self.amount = Decimal(str(amount))
+        self.is_open = True
+        self.executed_amount_base = Decimal("0")
+        self.average_executed_price = Decimal("1")
+        self.price = Decimal("1")
+        self.base_asset = "X"
+        self.quote_asset = "KRW"
+
+    def cumulative_fee_paid(self, token, exchange=None):
+        return Decimal("0")
+
+
 class _Tracked:
     def __init__(self, order_id):
         self.order_id = order_id
@@ -56,9 +77,15 @@ class _Harness(CrossVenueHedgedExecutorBase):
         self.entry_side = TradeType.SELL
         self.hedge_side = TradeType.BUY
         self.placed = []
+        # The connector's order tracker (active + 30s cache) — the source of truth that
+        # _reconcile_stuck_hedges consults via get_in_flight_order.
+        self.connector_orders = {}
 
     def _update_tracked(self, *_):
         pass
+
+    def get_in_flight_order(self, connector_name, order_id):
+        return self.connector_orders.get(order_id)
 
     def evaluate_max_retries(self):
         pass
@@ -88,6 +115,9 @@ class _Harness(CrossVenueHedgedExecutorBase):
     def place_order(self, **kw):
         oid = f"h{len(self.placed)}"
         self.placed.append((oid, kw["amount"]))
+        # Production: the connector synchronously starts tracking the order (PENDING_CREATE)
+        # inside buy()/sell() before place_order returns, so it is immediately fetchable.
+        self.connector_orders[oid] = _Cx(kw["amount"])
         return oid
 
 
@@ -193,3 +223,84 @@ def test_hedge_cancel_keeps_pending_and_pops_order():
     assert h._pending_hedge_base == Decimal("1.7")  # not stranded
     h._process_hedges()
     assert h.placed[-1] == ("h1", Decimal("1"))  # re-hedge
+
+
+# ----------------------------------------------------------------- never-event reconcile
+# A hedge order whose created/filled/canceled event is LOST would otherwise stay
+# order-None forever and freeze ALL hedging (_hedge_in_flight). _process_hedges
+# reconciles such orders against the connector's order tracker (active + 30s cache =
+# synchronous source of truth) every tick: heal-if-live, credit+drop-if-terminal,
+# clear-if-unknown. This eliminates the freeze without the time-based watchdog's
+# double-hedge risk (which guessed; the connector record proves the fill state).
+
+
+def test_stuck_none_hedge_healed_when_connector_live():
+    # created event lost, but the order is genuinely live on the connector ->
+    # adopt it (freeze clears) without re-hedging.
+    h = _Harness()
+    _maker_fill(h, "m0", "2.0")
+    h._process_hedges()  # place h0(2); created event "lost"
+    assert h.placed == [("h0", Decimal("2"))]
+    assert h.hedge_orders["h0"].order is None
+    h._process_hedges()  # reconcile -> heal
+    assert h.hedge_orders["h0"].order is not None  # adopted from connector
+    assert h.hedge_orders["h0"].order.is_open
+    assert h.placed == [("h0", Decimal("2"))]  # NOT double-hedged
+
+
+def test_stuck_none_hedge_terminal_filled_credits_without_double_hedge():
+    # the order filled on the exchange but ALL its events were lost: reconciliation
+    # must credit the fill from the connector record, never re-hedge it.
+    h = _Harness()
+    _maker_fill(h, "m0", "2.0")
+    h._process_hedges()  # place h0(2); order None
+    cx = h.connector_orders["h0"]
+    cx.executed_amount_base = Decimal("2")  # exchange filled it...
+    cx.is_open = False  # ...terminal
+    h._process_hedges()  # reconcile: credit + drop
+    assert "h0" not in h.hedge_orders
+    assert h._hedge_executed_base == Decimal("2")
+    assert h._pending_hedge_base == Decimal("0")
+    assert h.placed == [("h0", Decimal("2"))]  # no re-hedge of filled base
+
+
+def test_stuck_none_hedge_terminal_partial_credits_and_rehedges_remainder():
+    # terminal after a PARTIAL fill, events lost: credit the part that filled, the
+    # unfilled remainder stays pending and re-hedges (no strand, no double hedge).
+    h = _Harness()
+    _maker_fill(h, "m0", "2.0")
+    h._process_hedges()  # place h0(2); order None
+    cx = h.connector_orders["h0"]
+    cx.executed_amount_base = Decimal("1")  # only 1 of 2 filled
+    cx.is_open = False  # terminal
+    h._process_hedges()  # reconcile: credit 1, drop, re-hedge remaining 1
+    assert h._hedge_executed_base == Decimal("1")
+    assert h._pending_hedge_base == Decimal("1")
+    assert h.placed[-1] == ("h1", Decimal("1"))
+
+
+def test_stuck_none_hedge_terminal_unfilled_rehedges():
+    # terminal with zero fill (canceled/failed) and events lost: drop without credit,
+    # pending re-hedges.
+    h = _Harness()
+    _maker_fill(h, "m0", "2.0")
+    h._process_hedges()  # place h0(2); order None
+    cx = h.connector_orders["h0"]
+    cx.executed_amount_base = Decimal("0")
+    cx.is_open = False  # terminal, nothing filled
+    h._process_hedges()  # reconcile drops h0, re-hedges
+    assert h._hedge_executed_base == Decimal("0")
+    assert h._pending_hedge_base == Decimal("2")
+    assert h.placed[-1] == ("h1", Decimal("2"))
+
+
+def test_stuck_none_hedge_unknown_to_connector_is_cleared():
+    # connector has no record at all (never-tracked / cache expired): clear without
+    # synthesizing a fill (never over-hedge); pending re-hedges.
+    h = _Harness()
+    _maker_fill(h, "m0", "2.0")
+    h._process_hedges()  # place h0(2); order None
+    del h.connector_orders["h0"]  # connector lost all record
+    h._process_hedges()  # reconcile clears h0, re-hedges
+    assert h._hedge_executed_base == Decimal("0")  # no synthesized fill
+    assert h.placed[-1] == ("h1", Decimal("2"))
