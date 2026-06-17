@@ -6,6 +6,7 @@ from typing import Any, Callable, List, Optional, Tuple
 
 from aioresponses import aioresponses
 from aioresponses.core import RequestCall
+from bidict import bidict
 
 from hummingbot.connector.exchange.kis import kis_constants as CONSTANTS, kis_web_utils as web_utils
 from hummingbot.connector.exchange.kis.kis_exchange import KisExchange
@@ -40,7 +41,10 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
     @property
     def latest_prices_url(self):
         url = web_utils.public_rest_url(path_url=CONSTANTS.DOMESTIC_STOCK_TICKER_PATH)
-        url = f"{url}?FID_COND_MRKT_DIV_CODE=J&FID_INPUT_ISCD={self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)}"
+        # create_exchange_instance() uses the default 'sor' routing -> unified 'UN' market-div code
+        # (routing-aware ticker; hardcoded 'J' froze the last price after the KRX close — JEP-148).
+        mrkt_div = CONSTANTS.REST_QUOTE_MRKT_DIV_BY_ROUTING[CONSTANTS.MARKET_ROUTING_SOR]
+        url = f"{url}?FID_COND_MRKT_DIV_CODE={mrkt_div}&FID_INPUT_ISCD={self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)}"
         return url
 
     @property
@@ -393,6 +397,33 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
             kis_ws_enabled=kis_ws_enabled,
             domain=domain,
         )
+
+    @aioresponses()
+    async def test_get_last_traded_price_market_div_code_follows_routing(self, mock_api):
+        """The last-traded-price (ticker) REST call must derive FID_COND_MRKT_DIV_CODE
+        from kis_market_routing (J:KRX / NX:NXT / UN:통합), exactly like the orderbook
+        snapshot. Hardcoding 'J' froze the last price after the KRX regular close
+        (15:30 KST) while the NXT after-market kept trading (JEP-148)."""
+        expected = {
+            CONSTANTS.MARKET_ROUTING_KRX: "J",
+            CONSTANTS.MARKET_ROUTING_NXT: "NX",
+            CONSTANTS.MARKET_ROUTING_SOR: "UN",
+        }
+        symbol = self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)
+        regex_url = re.compile(
+            f"{web_utils.public_rest_url(path_url=CONSTANTS.DOMESTIC_STOCK_TICKER_PATH)}.*"
+        )
+        for routing, code in expected.items():
+            with self.subTest(routing=routing):
+                mock_api.requests.clear()
+                ex = self._make_exchange(kis_market_routing=routing)
+                ex._auth._access_token = "test_access_token"
+                ex._auth._token_expires_at = time.time() + 86400
+                ex._set_trading_pair_symbol_map(bidict({symbol: self.trading_pair}))
+                mock_api.get(regex_url, body=json.dumps(self.latest_prices_request_mock_response))
+                await ex._get_last_traded_price(self.trading_pair)
+                sent = next(calls[-1] for calls in mock_api.requests.values() if calls)
+                self.assertEqual(code, sent.kwargs["params"]["FID_COND_MRKT_DIV_CODE"])
 
     def test_ws_enabled_default_true(self):
         self.assertTrue(self._make_exchange()._ws_enabled)

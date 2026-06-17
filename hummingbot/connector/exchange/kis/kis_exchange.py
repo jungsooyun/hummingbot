@@ -731,7 +731,10 @@ class KisExchange(ExchangePyBase):
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
 
         params = {
-            "FID_COND_MRKT_DIV_CODE": "J",
+            # Routing-aware (J:KRX / NX:NXT / UN:통합), same as the orderbook REST snapshot.
+            # Hardcoding 'J' froze the last price after the KRX close (15:30 KST) while NXT
+            # after-market kept trading (JEP-148).
+            "FID_COND_MRKT_DIV_CODE": CONSTANTS.REST_QUOTE_MRKT_DIV_BY_ROUTING[self._market_routing],
             "FID_INPUT_ISCD": symbol,
         }
 

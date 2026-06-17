@@ -68,7 +68,7 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._ob_tr_id = CONSTANTS.WS_ORDERBOOK_TR_ID_BY_ROUTING[market_routing]
         self._trade_tr_id = CONSTANTS.WS_TRADE_TR_ID_BY_ROUTING[market_routing]
         # REST snapshot market-division code, routing-aware like the WS TR_IDs above.
-        self._rest_ob_mrkt_div = CONSTANTS.REST_ORDERBOOK_MRKT_DIV_BY_ROUTING[market_routing]
+        self._rest_ob_mrkt_div = CONSTANTS.REST_QUOTE_MRKT_DIV_BY_ROUTING[market_routing]
         # All market-data TR_IDs across routing modes — used to detect channel drift
         self._known_market_tr_ids = (
             set(CONSTANTS.WS_ORDERBOOK_TR_ID_BY_ROUTING.values())
