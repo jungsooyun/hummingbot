@@ -425,6 +425,31 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                 sent = next(calls[-1] for calls in mock_api.requests.values() if calls)
                 self.assertEqual(code, sent.kwargs["params"]["FID_COND_MRKT_DIV_CODE"])
 
+    @aioresponses()
+    async def test_get_last_traded_price_fails_closed_on_error_or_zero(self, mock_api):
+        """KIS returns HTTP 200 with rt_cd != '0' on logical errors, and a 0/empty price
+        during venue closure or a rejected market-div code. _get_last_traded_price must
+        raise (fail closed), not silently publish 0.0 into PriceType.LastTrade."""
+        symbol = self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)
+        regex_url = re.compile(
+            f"{web_utils.public_rest_url(path_url=CONSTANTS.DOMESTIC_STOCK_TICKER_PATH)}.*"
+        )
+        ex = self._make_exchange()
+        ex._auth._access_token = "test_access_token"
+        ex._auth._token_expires_at = time.time() + 86400
+        ex._set_trading_pair_symbol_map(bidict({symbol: self.trading_pair}))
+
+        # rt_cd != "0" (logical error) -> raise
+        mock_api.get(regex_url, body=json.dumps({"rt_cd": "1", "msg1": "no data", "output": {}}))
+        with self.assertRaises(IOError):
+            await ex._get_last_traded_price(self.trading_pair)
+
+        # rt_cd "0" but zero price (venue closed) -> raise
+        mock_api.requests.clear()
+        mock_api.get(regex_url, body=json.dumps({"rt_cd": "0", "msg1": "ok", "output": {"stck_prpr": "0"}}))
+        with self.assertRaises(IOError):
+            await ex._get_last_traded_price(self.trading_pair)
+
     def test_ws_enabled_default_true(self):
         self.assertTrue(self._make_exchange()._ws_enabled)
 

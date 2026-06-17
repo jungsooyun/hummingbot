@@ -743,9 +743,21 @@ class KisExchange(ExchangePyBase):
             params=params,
         )
 
-        output = result.get("output", {})
-        price_str = output.get("stck_prpr", "0")
-        return float(price_str)
+        # Fail closed: KIS returns HTTP 200 with rt_cd != "0" on logical errors, and an
+        # empty/0 price during venue closure or a rejected market-div code. Returning 0.0
+        # (the old default) silently poisons PriceType.LastTrade (fail-open) — raise instead.
+        if result.get("rt_cd") != "0":
+            raise IOError(
+                f"KIS last-price request failed for {trading_pair}: "
+                f"rt_cd={result.get('rt_cd')} msg={result.get('msg1')}"
+            )
+        price_str = (result.get("output") or {}).get("stck_prpr")
+        price = float(price_str) if price_str else 0.0
+        if price <= 0:
+            raise IOError(
+                f"KIS last-price returned no/zero price for {trading_pair}: {result.get('output')}"
+            )
+        return price
 
     # ------------------------------------------------------------------
     # Helpers
