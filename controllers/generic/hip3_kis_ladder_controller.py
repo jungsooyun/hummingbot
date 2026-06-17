@@ -82,6 +82,8 @@ class Hip3KisLadderControllerConfig(ControllerConfigBase):
 
     # Safety
     kill_switch: bool = Field(default=False, json_schema_extra={"is_updatable": True})
+    # No-submit verification: executor computes fair + logs intended quotes, no orders.
+    observe: bool = Field(default=False, json_schema_extra={"is_updatable": True})
 
     # One executor per controller (single-direction ladder per symbol)
     max_executors: int = Field(default=1, json_schema_extra={"is_updatable": True})
@@ -104,7 +106,7 @@ class Hip3KisLadderController(ControllerBase):
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
         actions: List[ExecutorAction] = []
-        active = self.filter_executors(self.executors_info, lambda e: not e.is_done)
+        active = self.filter_executors(self.executors_info, filter_func=lambda e: not e.is_done)
         if len(active) >= self.config.max_executors:
             return actions
 
@@ -138,6 +140,7 @@ class Hip3KisLadderController(ControllerBase):
                 min_reprice_delta_ticks=self.config.min_reprice_delta_ticks,
                 leverage=self.config.leverage,
                 kill_switch=self.config.kill_switch,
+                observe=self.config.observe,
                 controller_id=self.config.id,
             ),
             controller_id=self.config.id,
@@ -145,7 +148,7 @@ class Hip3KisLadderController(ControllerBase):
         return actions
 
     def to_format_status(self) -> List[str]:
-        active = self.filter_executors(self.executors_info, lambda e: not e.is_done)
+        active = self.filter_executors(self.executors_info, filter_func=lambda e: not e.is_done)
         return [
             f"  Active ladder executors: {len(active)}",
             f"  Maker(perp): {self.config.maker_connector} {self.config.maker_trading_pair}",

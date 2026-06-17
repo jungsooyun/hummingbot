@@ -200,14 +200,25 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
 
     def _place_maker(self, price: Decimal, amount: Decimal, edge_bps: Decimal) -> None:
         connector = self.connectors[self.maker_connector]
+        q_amount = connector.quantize_order_amount(self.maker_trading_pair, amount)
+        q_price = connector.quantize_order_price(self.maker_trading_pair, price)
+        if self.config.observe:
+            # No-submit: log the intended maker quote and skip placement. Nothing is
+            # tracked, so _open_maker_orders stays empty (cancel path no-ops) and no
+            # fills occur (so the hedge path never fires). Zero real orders.
+            self.logger().info(
+                f"[OBSERVE] maker {self.entry_side.name} {q_amount} "
+                f"{self.maker_trading_pair} @ {q_price} (edge={edge_bps}bps) — no submit"
+            )
+            return
         order_id = self.place_order(
             connector_name=self.maker_connector,
             trading_pair=self.maker_trading_pair,
             order_type=OrderType.LIMIT_MAKER,
             side=self.entry_side,
-            amount=connector.quantize_order_amount(self.maker_trading_pair, amount),
+            amount=q_amount,
             position_action=PositionAction.OPEN,
-            price=connector.quantize_order_price(self.maker_trading_pair, price),
+            price=q_price,
             metadata={"order_role": "maker", "edge_bps": str(edge_bps)},
         )
         self.maker_orders[order_id] = TrackedOrder(order_id=order_id)

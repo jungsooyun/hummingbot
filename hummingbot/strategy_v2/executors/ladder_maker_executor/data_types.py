@@ -59,6 +59,10 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
 
     # Safety
     kill_switch: bool = False
+    # Observe / no-submit: compute fair + targets and LOG the intended maker quotes
+    # but never call place_order (no real orders, so no fills and no hedges). For
+    # safe live verification of the full decision path before enabling submission.
+    observe: bool = False
 
     # Display / bookkeeping
     execution_purpose: str = Field(default="ladder_market_making")
