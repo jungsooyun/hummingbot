@@ -24,7 +24,7 @@ from decimal import Decimal
 from typing import Dict, List, Optional
 
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
-from hummingbot.core.data_type.order_candidate import OrderCandidate
+from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.cross_venue_hedged_executor_base import (
@@ -247,11 +247,16 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         fair = self._compute_fair(self._policy_side())
         if fair is None:
             return None
-        return OrderCandidate(
+        # The maker leg is a perpetual (orders placed with PositionAction.OPEN), so
+        # the balance candidate must be a PerpetualOrderCandidate -- the perp budget
+        # checker reads .position_close/.leverage, which a plain OrderCandidate lacks
+        # (AttributeError in validate_sufficient_balance -> executor never quotes).
+        return PerpetualOrderCandidate(
             trading_pair=self.maker_trading_pair,
             is_maker=True,
             order_type=OrderType.LIMIT_MAKER,
             order_side=self.entry_side,
             amount=self.config.total_size_cap,
             price=fair,
+            leverage=Decimal(str(self.config.leverage)),
         )
