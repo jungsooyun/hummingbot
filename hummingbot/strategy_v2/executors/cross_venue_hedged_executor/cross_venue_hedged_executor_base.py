@@ -289,8 +289,9 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             metadata=spec.get("metadata") or {"order_role": "hedge"},
         )
         self.hedge_orders[order_id] = TrackedOrder(order_id=order_id)
-        # Clear the queue: this fill is now represented by a live hedge order.
-        self._pending_hedge_base = ZERO
+        # Do NOT zero pending here: single-in-flight prevents double placement, and
+        # pending now decrements on hedge FILL events so any unfilled/failed base is
+        # re-hedged next tick (no strand on partial fill or order failure).
 
     # ============================================================ inventory helpers
 
@@ -343,6 +344,12 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self._update_tracked(self.hedge_connector, event.order_id)
             self._hedge_executed_base += Decimal(event.amount)
             self._hedge_executed_quote += Decimal(event.amount) * Decimal(event.price)
+            # Decrement the hedge queue by what ACTUALLY hedged (fill), not what was
+            # placed, so a partial-fill-then-fail re-hedges the remainder instead of
+            # stranding it. pending then tracks the fill-truth unhedged need.
+            self._pending_hedge_base -= Decimal(event.amount)
+            if self._pending_hedge_base < ZERO:
+                self._pending_hedge_base = ZERO
 
     def process_order_completed_event(
         self, _, market, event: Union[BuyOrderCompletedEvent, SellOrderCompletedEvent]
