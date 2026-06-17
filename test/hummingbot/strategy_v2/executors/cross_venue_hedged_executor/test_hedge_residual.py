@@ -19,6 +19,7 @@ from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.cross_venue_hedged_executor_base import (
     CrossVenueHedgedExecutorBase,
 )
+from hummingbot.strategy_v2.models.base import RunnableStatus
 
 
 class _Inner:
@@ -76,6 +77,7 @@ class _Harness(CrossVenueHedgedExecutorBase):
         self._pending_hedge_base = Decimal("0")
         self._current_retries = 0
         self._max_retries = 3
+        self._status = RunnableStatus.RUNNING
         self.maker_connector = "hl"
         self.maker_trading_pair = "X-USD"
         self.hedge_connector = "kis"
@@ -93,8 +95,9 @@ class _Harness(CrossVenueHedgedExecutorBase):
     def get_in_flight_order(self, connector_name, order_id):
         return self.connector_orders.get(order_id)
 
-    def evaluate_max_retries(self):
-        pass
+    def evaluate_max_retries(self):  # faithful: stop() -> TERMINATED when exceeded
+        if self._current_retries > self._max_retries:
+            self._status = RunnableStatus.TERMINATED
 
     # unused abstract hooks (needed only to make the ABC concrete)
     def _gates_open(self):
@@ -350,6 +353,22 @@ def test_unknown_to_connector_is_left_not_reaped_no_double_hedge():
     assert h._hedge_executed_base == Decimal("0")
     assert h.placed == [("h0", Decimal("2"))]  # NO second hedge (h0 not reaped)
     assert "h0" in h.hedge_orders and h.hedge_orders["h0"].order is None  # left in-flight
+
+
+def test_no_hedge_placed_after_reconcile_terminates_executor():
+    # FINDING #1 (round 2): a reconcile that trips max_retries -> stop() must NOT let the
+    # same _process_hedges call place another hedge afterwards (orphan order after stop).
+    h = _Harness()
+    h._max_retries = 0  # the next retry terminates the executor
+    _maker_fill(h, "m0", "2.0")
+    h._process_hedges()  # place h0(2); order None
+    cx = h.connector_orders["h0"]
+    cx.executed_amount_base = Decimal("0")
+    cx.is_open = False  # terminal unfilled -> reconcile increments retry -> terminate
+    h._process_hedges()  # MUST stop before placing
+    assert h.status == RunnableStatus.TERMINATED
+    assert h._current_retries == 1
+    assert h.placed == [("h0", Decimal("2"))]  # NO hedge placed after stop
 
 
 def test_terminal_filled_nan_price_does_not_poison_quote():

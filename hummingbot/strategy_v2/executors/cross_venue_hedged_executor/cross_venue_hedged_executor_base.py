@@ -352,6 +352,11 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
 
     def _process_hedges(self) -> None:
         self._reconcile_stuck_hedges()
+        if self.status == RunnableStatus.TERMINATED:
+            # _reconcile_stuck_hedges may trip evaluate_max_retries() -> stop() (e.g. a
+            # terminal stuck hedge exceeding max_retries). Never place a hedge after the
+            # executor has been terminated, including during _control_shutdown.
+            return
         if self._pending_hedge_base <= ZERO:
             return
         if self._hedge_in_flight():
