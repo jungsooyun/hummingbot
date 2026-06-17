@@ -102,6 +102,10 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
             trading_pairs=[self.trading_pair],
             trading_required=False,
         )
+        # Seed the connector OAuth token so authenticated market-data requests
+        # (e.g. the REST orderbook snapshot) don't hit the unmocked tokenP endpoint.
+        self.connector._auth._access_token = "test_token"
+        self.connector._auth._token_expires_at = time.time() + 86400
 
         self.mock_auth = KisAuth(
             app_key="test_app_key",
@@ -420,6 +424,30 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertIn("output1", result)
         self.assertEqual("72100", result["output1"]["askp1"])
         self.assertEqual("500", result["output1"]["askp_rsqn1"])
+
+    @aioresponses()
+    def test_request_order_book_snapshot_is_authenticated(self, mock_api):
+        """Regression: the REST snapshot must carry KIS auth (Bearer token +
+        appkey/appsecret) and the orderbook TR_ID header. Without them KIS returns
+        HTTP 500 EGW00304 ("고객식별키 ... appSecret 유효하지 않습니다") and the
+        000660 order book never initializes -> KIS stays not-ready.
+
+        (The connector OAuth token is seeded in asyncSetUp.)"""
+        mock_response = self._order_book_snapshot_response()
+        regex_url = re.compile(
+            f"{CONSTANTS.REST_URL}/{CONSTANTS.DOMESTIC_STOCK_ORDERBOOK_PATH}"
+        )
+        mock_api.get(regex_url, body=json.dumps(mock_response))
+
+        self.local_event_loop.run_until_complete(
+            self.data_source._request_order_book_snapshot(self.trading_pair)
+        )
+
+        sent = next(calls[0] for calls in mock_api.requests.values() if calls)
+        headers = sent.kwargs["headers"]
+        self.assertTrue(headers["Authorization"].startswith("Bearer "))
+        self.assertEqual("test_app_key", headers["appkey"])
+        self.assertEqual(CONSTANTS.DOMESTIC_STOCK_ORDERBOOK_TR_ID, headers["tr_id"])
 
     # ------------------------------------------------------------------
     # Test: _connected_websocket_assistant raises NotImplementedError

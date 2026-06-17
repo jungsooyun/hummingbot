@@ -320,12 +320,17 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
             "FID_INPUT_ISCD": symbol,
         }
         rest_assistant = await self._api_factory.get_rest_assistant()
+        # KIS market-data REST endpoints require auth (Bearer token + appkey/
+        # appsecret) AND a per-API ``tr_id`` header. Omitting them returns HTTP 500
+        # EGW00304 ("appSecret invalid") and the order book never bootstraps.
         return await rest_assistant.execute_request(
             url=web_utils.public_rest_url(
                 path_url=CONSTANTS.DOMESTIC_STOCK_ORDERBOOK_PATH
             ),
             params=params,
             method=RESTMethod.GET,
+            is_auth_required=True,
+            headers={"tr_id": CONSTANTS.DOMESTIC_STOCK_ORDERBOOK_TR_ID},
             throttler_limit_id=CONSTANTS.DOMESTIC_STOCK_ORDERBOOK_TR_ID,
         )
 
