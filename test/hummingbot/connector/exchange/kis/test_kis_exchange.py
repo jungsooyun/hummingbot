@@ -547,6 +547,374 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         self.assertTrue(request_headers["Authorization"].startswith("Bearer "))
         self.assertEqual(CONSTANTS.DOMESTIC_STOCK_BALANCE_TR_ID, request_headers["tr_id"])
 
+    # ------------------------------------------------------------------
+    # JEP-153: readiness ready==True integration + "no-raise" crash guards.
+    #
+    # The live session had a cascade where every unit test was green (mocks
+    # returned only rt_cd:"0" success) yet the connector never reached
+    # ready==True:
+    #   - check_network did GET on POST-only oauth2/tokenP -> NOT_CONNECTED,
+    #   - REST snapshot was unauthenticated -> EGW00304,
+    #   - _update_time_synchronizer hit an absent web_utils.get_current_server_time
+    #     -> AttributeError crashed the status loop,
+    #   - the exec-notification WS gated readiness.
+    # These tests drive the actual connector entry points end-to-end so the
+    # 5 status_dict items all flip True (and never raise).
+    # ------------------------------------------------------------------
+
+    def _configure_orderbook_snapshot_response(self, mock_api: aioresponses):
+        """Mock the authenticated KIS REST orderbook snapshot (used to bootstrap
+        order_books_initialized via the order-book tracker)."""
+        url = web_utils.public_rest_url(path_url=CONSTANTS.DOMESTIC_STOCK_ORDERBOOK_PATH)
+        regex_url = re.compile(f"^{re.escape(url)}.*")
+        snapshot = {
+            "rt_cd": "0",
+            "msg_cd": "MCA00000",
+            "msg1": "정상처리 되었습니다.",
+            "output1": {
+                "askp1": "72100", "askp_rsqn1": "500",
+                "askp2": "72200", "askp_rsqn2": "300",
+                "bidp1": "71900", "bidp_rsqn1": "400",
+                "bidp2": "71800", "bidp_rsqn2": "200",
+            },
+        }
+        mock_api.get(regex_url, body=json.dumps(snapshot))
+        return url
+
+    @aioresponses()
+    async def test_connector_reaches_ready_true_integration(self, mock_api):
+        # Integration: drive every readiness source the live boot exercises and
+        # assert all 5 status_dict items become True -> exchange.ready == True.
+        # WS is disabled so order books bootstrap purely off the authenticated
+        # REST snapshot (the exact path that returned EGW00304 unauthenticated).
+        exchange = self._make_exchange(kis_ws_enabled="false")
+        exchange._auth._access_token = "test_access_token"
+        exchange._auth._token_expires_at = time.time() + 86400
+
+        # 1. symbols_mapping_initialized — built from configured pairs (no network).
+        await exchange._initialize_trading_pair_symbol_map()
+        # 2. trading_rule_initialized — synthesised per pair (no network).
+        await exchange._update_trading_rules()
+        # 3. account_balance — authenticated balance inquiry.
+        mock_api.get(
+            re.compile(f"^{re.escape(self.balance_url)}.*"),
+            body=json.dumps(self.balance_request_mock_response_for_base_and_quote),
+        )
+        await exchange._update_balances()
+        # 4. order_books_initialized — authenticated REST snapshot bootstraps the tracker.
+        self._configure_orderbook_snapshot_response(mock_api)
+        await exchange.order_book_tracker._init_order_books()
+        # 5. user_stream_initialized — decoupled from the WS (always True).
+
+        status = exchange.status_dict
+        self.assertTrue(status["symbols_mapping_initialized"], status)
+        self.assertTrue(status["trading_rule_initialized"], status)
+        self.assertTrue(status["account_balance"], status)
+        self.assertTrue(status["order_books_initialized"], status)
+        self.assertTrue(status["user_stream_initialized"], status)
+        self.assertTrue(exchange.ready, status)
+
+    @aioresponses()
+    async def test_time_sync_update_does_not_raise(self, mock_api):
+        # Guards the AttributeError crash: the base _update_time_synchronizer calls
+        # web_utils.get_current_server_time(), absent on KIS -> it would crash the
+        # status-polling loop and flap to NOT_CONNECTED. The override must be a
+        # silent no-op end-to-end (both signatures).
+        await self.exchange._update_time_synchronizer()
+        await self.exchange._update_time_synchronizer(pass_on_non_cancelled_error=True)
+
+    @aioresponses()
+    async def test_check_network_balance_probe_does_not_raise(self, mock_api):
+        # Guards the permanent-NOT_CONNECTED crash class: the health probe must run
+        # end-to-end (authenticated balance GET) without raising. If it were aimed
+        # at POST-only oauth2/tokenP, a GET hangs/times out every cycle.
+        mock_api.get(
+            re.compile(f"^{re.escape(self.balance_url)}.*"),
+            body=json.dumps(self.network_status_request_successful_mock_response),
+        )
+        await self.exchange._make_network_check_request()
+
+    @aioresponses()
+    async def test_update_balances_does_not_raise(self, mock_api):
+        # Guards the account-update crash class: _update_balances must complete
+        # end-to-end and populate balances without raising.
+        mock_api.get(
+            re.compile(f"^{re.escape(self.balance_url)}.*"),
+            body=json.dumps(self.balance_request_mock_response_for_base_and_quote),
+        )
+        await self.exchange._update_balances()
+        self.assertGreater(len(self.exchange._account_balances), 0)
+
+    @aioresponses()
+    async def test_update_trading_rules_does_not_raise(self, mock_api):
+        # Guards trading-rule init: rules are synthesised network-free and must
+        # populate without raising (no unauthenticated ticker fetch -> EGW00304).
+        await self.exchange._update_trading_rules()
+        self.assertGreater(len(self.exchange._trading_rules), 0)
+
+    def test_user_stream_init_does_not_raise_and_is_true(self):
+        # Guards the WS-gates-readiness crash class: readiness must not depend on
+        # the exec-notification WS connecting. _is_user_stream_initialized must
+        # return True without raising even with no WS data received.
+        self.assertTrue(self.exchange._is_user_stream_initialized())
+
+    # ------------------------------------------------------------------
+    # JEP-154: request-auth assertions for every is_auth_required KIS REST call
+    # + rejection-response fixtures and their handling.
+    #
+    # The live session passed unit tests while the connector was firing
+    # unauthenticated / mis-routed requests (EGW00304) because the mocks only
+    # ever returned rt_cd:"0". These assert that the ACTUALLY-SENT request
+    # carried Authorization: Bearer <token> + appkey + the correct tr_id, and
+    # that KIS rejection payloads are surfaced (raise / re-auth) not swallowed.
+    # ------------------------------------------------------------------
+
+    def _assert_request_authenticated(self, request_call: RequestCall, expected_tr_id: str):
+        """Reusable: every is_auth_required=True KIS REST call must carry the
+        Bearer token, appkey, appsecret, and the per-API tr_id header.
+        Modeled on test_request_order_book_snapshot_is_authenticated."""
+        headers = request_call.kwargs["headers"]
+        self.assertIn("Authorization", headers)
+        self.assertTrue(
+            headers["Authorization"].startswith("Bearer "),
+            f"Authorization must be 'Bearer <token>', got {headers.get('Authorization')!r}",
+        )
+        self.assertEqual("test_access_token", headers["Authorization"].split(" ", 1)[1])
+        self.assertIn("appkey", headers)
+        self.assertEqual("testAppKey", headers["appkey"])
+        self.assertIn("appsecret", headers)
+        self.assertEqual("testAppSecret", headers["appsecret"])
+        self.assertEqual(expected_tr_id, headers["tr_id"])
+
+    def _track_order(self, exchange) -> InFlightOrder:
+        exchange.start_tracking_order(
+            order_id="HBOT-test-1",
+            exchange_order_id=str(self.expected_exchange_order_id),
+            trading_pair=self.trading_pair,
+            trade_type=TradeType.BUY,
+            price=Decimal("72000"),
+            amount=Decimal("10"),
+            order_type=OrderType.LIMIT,
+        )
+        return exchange.in_flight_orders["HBOT-test-1"]
+
+    @aioresponses()
+    async def test_place_order_request_is_authenticated(self, mock_api):
+        url = web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_PATH)
+        mock_api.post(
+            re.compile(f"^{re.escape(url)}.*"),
+            body=json.dumps(self.order_creation_request_successful_mock_response),
+        )
+        await self.exchange._place_order(
+            order_id="HBOT-1",
+            trading_pair=self.trading_pair,
+            amount=Decimal("10"),
+            trade_type=TradeType.BUY,
+            order_type=OrderType.LIMIT,
+            price=Decimal("72000"),
+        )
+        req = self._all_executed_requests(mock_api, url)[0]
+        self._assert_request_authenticated(req, CONSTANTS.DOMESTIC_STOCK_ORDER_BUY_TR_ID)
+
+    @aioresponses()
+    async def test_place_order_sell_request_is_authenticated(self, mock_api):
+        # SELL routes to a different tr_id (TTTC0011U) than BUY (TTTC0012U);
+        # lock the SELL branch so tr_id routing regressions go red too.
+        url = web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_PATH)
+        mock_api.post(
+            re.compile(f"^{re.escape(url)}.*"),
+            body=json.dumps(self.order_creation_request_successful_mock_response),
+        )
+        await self.exchange._place_order(
+            order_id="HBOT-2",
+            trading_pair=self.trading_pair,
+            amount=Decimal("10"),
+            trade_type=TradeType.SELL,
+            order_type=OrderType.LIMIT,
+            price=Decimal("72000"),
+        )
+        req = self._all_executed_requests(mock_api, url)[0]
+        self._assert_request_authenticated(req, CONSTANTS.DOMESTIC_STOCK_ORDER_SELL_TR_ID)
+
+    @aioresponses()
+    async def test_cancel_order_request_is_authenticated(self, mock_api):
+        order = self._track_order(self.exchange)
+        url = web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_CANCEL_PATH)
+        mock_api.post(
+            re.compile(f"^{re.escape(url)}.*"),
+            body=json.dumps(self._order_cancelation_request_successful_mock_response(order)),
+        )
+        await self.exchange._place_cancel("HBOT-test-1", order)
+        req = self._all_executed_requests(mock_api, url)[0]
+        self._assert_request_authenticated(req, CONSTANTS.DOMESTIC_STOCK_CANCEL_TR_ID)
+
+    @aioresponses()
+    async def test_balance_request_is_authenticated(self, mock_api):
+        url = self.balance_url
+        mock_api.get(
+            re.compile(f"^{re.escape(url)}.*"),
+            body=json.dumps(self.balance_request_mock_response_for_base_and_quote),
+        )
+        await self.exchange._update_balances()
+        req = self._all_executed_requests(mock_api, url)[0]
+        self._assert_request_authenticated(req, CONSTANTS.DOMESTIC_STOCK_BALANCE_TR_ID)
+
+    @aioresponses()
+    async def test_daily_ccld_fill_query_request_is_authenticated(self, mock_api):
+        order = self._track_order(self.exchange)
+        url = web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH)
+        mock_api.get(
+            re.compile(f"^{re.escape(url)}.*"),
+            body=json.dumps(self._order_fills_request_full_fill_mock_response(order)),
+        )
+        await self.exchange._all_trade_updates_for_order(order)
+        req = self._all_executed_requests(mock_api, url)[0]
+        self._assert_request_authenticated(req, CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_TR_ID)
+
+    @aioresponses()
+    async def test_order_book_snapshot_request_is_authenticated(self, mock_api):
+        url = web_utils.public_rest_url(path_url=CONSTANTS.DOMESTIC_STOCK_ORDERBOOK_PATH)
+        self._configure_orderbook_snapshot_response(mock_api)
+        ds = self.exchange._create_order_book_data_source()
+        await ds._request_order_book_snapshot(self.trading_pair)
+        req = self._all_executed_requests(mock_api, url)[0]
+        self._assert_request_authenticated(req, CONSTANTS.DOMESTIC_STOCK_ORDERBOOK_TR_ID)
+
+    # --- Rejection fixtures ---
+
+    @staticmethod
+    def _rejection_response(rt_cd: str, msg_cd: str, msg1: str) -> dict:
+        return {"rt_cd": rt_cd, "msg_cd": msg_cd, "msg1": msg1, "output": {}}
+
+    @aioresponses()
+    async def test_place_order_rt_cd_one_raises(self, mock_api):
+        # rt_cd:"1" generic failure on order placement must raise (ValueError),
+        # never silently treated as success.
+        url = web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_PATH)
+        mock_api.post(
+            re.compile(f"^{re.escape(url)}.*"),
+            body=json.dumps(self._rejection_response("1", "APBK0919", "주문수량 초과")),
+        )
+        with self.assertRaises(ValueError):
+            await self.exchange._place_order(
+                order_id="HBOT-1",
+                trading_pair=self.trading_pair,
+                amount=Decimal("10"),
+                trade_type=TradeType.BUY,
+                order_type=OrderType.LIMIT,
+                price=Decimal("72000"),
+            )
+
+    @aioresponses()
+    async def test_cancel_rt_cd_one_raises(self, mock_api):
+        # rt_cd:"1" on cancel must raise, not report success.
+        order = self._track_order(self.exchange)
+        url = web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_CANCEL_PATH)
+        mock_api.post(
+            re.compile(f"^{re.escape(url)}.*"),
+            body=json.dumps(self._rejection_response("1", "APBK1234", "취소 불가")),
+        )
+        with self.assertRaises(ValueError):
+            await self.exchange._place_cancel("HBOT-test-1", order)
+
+    @aioresponses()
+    async def test_egw00304_app_secret_invalid_raises_on_balance(self, mock_api):
+        # EGW00304 ("appSecret 유효하지 않습니다") is returned by KIS as HTTP 500.
+        # The web assistant turns HTTP>=400 into IOError -> the balance probe / poll
+        # must surface it (so check_network reports NOT_CONNECTED), not swallow it.
+        url = self.balance_url
+        mock_api.get(
+            re.compile(f"^{re.escape(url)}.*"),
+            status=500,
+            body=json.dumps(self._rejection_response("1", "EGW00304", "고객식별키(appSecret)가 유효하지 않습니다")),
+        )
+        with self.assertRaises(IOError):
+            await self.exchange._update_balances()
+
+    @aioresponses()
+    async def test_egw00304_app_secret_invalid_raises_on_order_book_snapshot(self, mock_api):
+        # Same EGW00304 on the REST orderbook snapshot: the order book must fail to
+        # bootstrap (raise) rather than silently initialise empty -> stays not-ready.
+        url = web_utils.public_rest_url(path_url=CONSTANTS.DOMESTIC_STOCK_ORDERBOOK_PATH)
+        mock_api.get(
+            re.compile(f"^{re.escape(url)}.*"),
+            status=500,
+            body=json.dumps(self._rejection_response("1", "EGW00304", "appSecret invalid")),
+        )
+        ds = self.exchange._create_order_book_data_source()
+        with self.assertRaises(IOError):
+            await ds._request_order_book_snapshot(self.trading_pair)
+
+    def _isolated_auth(self):
+        # KisAuth pointed at an isolated temp cache dir so token fetch/persist
+        # never reads or writes the real hummingbot data directory (which would
+        # poison other tests' on-disk token hydration).
+        import shutil
+        import tempfile
+        from hummingbot.connector.exchange.kis.kis_auth import KisAuth
+        tmp = tempfile.mkdtemp(prefix="kis_exch_reauth_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        return KisAuth(app_key="testAppKey", app_secret="testAppSecret", token_cache_path=tmp)
+
+    async def test_egw00123_token_expired_triggers_reauth_fetch(self):
+        # EGW00123/EGW00121 = expired/invalid token. KIS auth refreshes by EXPIRY
+        # (no error-driven re-auth path), so a token whose expiry has passed must
+        # cause _get_access_token to FETCH A NEW ONE rather than reuse the stale
+        # placeholder (the live EGW00121 loop was a never-expiring placeholder token).
+        from unittest.mock import patch as _patch
+        from datetime import datetime as _dt, timedelta as _td
+        auth = self._isolated_auth()
+        # Stale token already past expiry -> must re-fetch.
+        auth._access_token = "stale_token"
+        auth._token_expires_at = time.time() - 1
+        future = (_dt.now() + _td(hours=23)).strftime("%Y-%m-%d %H:%M:%S")
+
+        from test.hummingbot.connector.exchange.kis import test_kis_auth as _ta
+        session_cls, captured = _ta._make_mock_session(
+            lambda url, json=None, **kw: _ta._make_mock_response(
+                {"access_token": "fresh_token", "access_token_token_expired": future}
+            )
+        )
+        with _patch("aiohttp.ClientSession", session_cls):
+            token = await auth._get_access_token()
+        self.assertEqual("fresh_token", token)
+        self.assertEqual(1, len(captured["calls"]))
+
+    async def test_get_tokenp_timeout_propagates_not_swallowed(self):
+        # GET-tokenP-timeout class: a token fetch that times out must propagate
+        # (so the caller fails closed / reports NOT_CONNECTED), NOT return a fake
+        # token. We force the POST to raise asyncio.TimeoutError.
+        import asyncio as _asyncio
+        from unittest.mock import patch as _patch
+        auth = self._isolated_auth()
+        auth._access_token = None
+        auth._token_expires_at = 0.0
+
+        class _TimeoutSession:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                pass
+
+            def post(self, *a, **k):
+                class _C:
+                    async def __aenter__(self_inner):
+                        raise _asyncio.TimeoutError("tokenP GET/POST timed out")
+
+                    async def __aexit__(self_inner, *a):
+                        pass
+                return _C()
+
+        with _patch("aiohttp.ClientSession", _TimeoutSession):
+            with self.assertRaises(_asyncio.TimeoutError):
+                await auth._get_access_token()
+        # No fake token was cached on timeout.
+        self.assertIsNone(auth._access_token)
+
     def _expected_initial_status_dict(self) -> dict:
         # KIS decouples readiness from the exec-notification WebSocket (fills are
         # caught via REST order polling), so user_stream_initialized is always True.
