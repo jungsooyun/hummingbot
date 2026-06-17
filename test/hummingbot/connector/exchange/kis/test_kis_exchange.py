@@ -490,6 +490,18 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
             "user_stream_initialized": True,
         }
 
+    async def test_time_synchronizer_is_noop(self):
+        # KIS uses OAuth Bearer auth (no HMAC timestamp signing) and needs no
+        # server-time sync. The base _update_time_synchronizer calls
+        # web_utils.get_current_server_time(), which KIS does not provide -> the
+        # AttributeError propagates into _status_polling_loop and flaps the
+        # connector to NOT_CONNECTED (account-update failures, never stably ready).
+        # The override must be a no-op that never touches the absent helper.
+        ex = self._make_exchange()
+        self.assertFalse(hasattr(web_utils, "get_current_server_time"))
+        await ex._update_time_synchronizer()
+        await ex._update_time_synchronizer(pass_on_non_cancelled_error=True)
+
     def test_user_stream_does_not_gate_readiness(self):
         # KIS's real-time exec-notification WebSocket (ops.koreainvestment.com:21000)
         # is environment-gated and frequently unavailable (e.g. real-time WS cap /

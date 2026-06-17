@@ -194,6 +194,15 @@ class KisExchange(ExchangePyBase):
         # only decouples *readiness* from it.
         return True
 
+    async def _update_time_synchronizer(self, pass_on_non_cancelled_error: bool = False):
+        # KIS authenticates via OAuth Bearer token (no HMAC timestamp signing), so
+        # it needs no server-time synchronization. The base implementation calls
+        # web_utils.get_current_server_time(), which KIS does not provide; letting
+        # it run raises AttributeError inside _status_polling_loop, which flaps the
+        # connector to NOT_CONNECTED (account-update failures) and prevents stable
+        # readiness. No-op by design.
+        return
+
     def supported_order_types(self) -> List[OrderType]:
         return [OrderType.LIMIT, OrderType.MARKET]
 
