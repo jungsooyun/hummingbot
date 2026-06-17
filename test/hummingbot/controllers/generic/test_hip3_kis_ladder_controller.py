@@ -3,6 +3,8 @@ import inspect
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 
 from controllers.generic.hip3_kis_ladder_controller import (
@@ -145,3 +147,26 @@ class TestHip3KisLadderController(IsolatedAsyncioWrapperTestCase):
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
             sig.parameters["filter_func"].kind,
         )
+
+
+# --- JEP-162: total_size_cap = max accumulated position; fail-loud validator ---
+
+
+def test_config_rejects_rungs_exceeding_total_size_cap():
+    # one full ladder must fit within the position ceiling, else fail loud at load
+    with pytest.raises(ValueError, match="total_size_cap"):
+        Hip3KisLadderControllerConfig(
+            id="t",
+            total_size_cap=Decimal("3"),
+            rungs=[LadderRungConfig(edge_bps=Decimal("20"), size=Decimal("4"))],  # 4 > 3
+        )
+
+
+def test_config_accepts_default_rungs_within_cap():
+    cfg = Hip3KisLadderControllerConfig(id="t")  # defaults: rungs {1,2,4}=7, cap 100
+    assert sum((r.size for r in cfg.rungs), Decimal("0")) <= cfg.total_size_cap
+
+
+def test_config_default_round_trip_cost_is_positive():
+    cfg = Hip3KisLadderControllerConfig(id="t")
+    assert cfg.round_trip_cost_bps > Decimal("0")

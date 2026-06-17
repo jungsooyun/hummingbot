@@ -133,11 +133,16 @@ def build_ladder_targets(
     inventory: Decimal = ZERO,
     max_inventory: Optional[Decimal] = None,
     cost_bps: Decimal = ZERO,
+    current_position: Decimal = ZERO,
 ) -> List[RungTarget]:
     """simultaneous_maker: one order per enabled rung, size accumulated under cap.
 
-    Inventory gate: withhold BUY if inventory >= max_inventory,
-    withhold SELL if inventory <= -max_inventory.
+    ``total_size_cap`` is the **max |accumulated net position|** (shares):
+    ``current_position`` (the magnitude already held) consumes that budget, so the
+    quoted ladder shrinks toward the cap and halts once the cap is reached.
+
+    Inventory gate (separate, unhedged-exposure safety pin): withhold BUY if
+    inventory >= max_inventory, withhold SELL if inventory <= -max_inventory.
 
     ``cost_bps`` is the round-trip friction (fees + 증권거래세) added to each rung's
     NET edge so the *placement* sits at gross = net + cost. The reported
@@ -151,7 +156,9 @@ def build_ladder_targets(
             return []
 
     targets: List[RungTarget] = []
-    remaining = total_size_cap
+    remaining = total_size_cap - abs(current_position)  # position budget, not per-tick
+    if remaining <= ZERO:
+        return []
     for rung in rungs:
         if not rung.enabled or remaining <= ZERO:
             continue

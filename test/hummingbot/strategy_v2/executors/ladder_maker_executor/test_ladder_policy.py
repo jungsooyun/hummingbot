@@ -144,3 +144,27 @@ def test_build_ladder_cost_applies_to_min_edge_floor():
     rungs = [RungSpec(edge_bps=D("20"), size=D("1"), min_edge_bps=D("10"))]
     targets = build_ladder_targets(fair, rungs, D("100"), Side.SELL, D("0.1"), cost_bps=D("24"))
     assert targets[0].price == D("1004.4")
+
+
+# --- Task 3: total_size_cap = max accumulated position (current_position budget) ---
+
+
+def test_build_ladder_position_budget_trims_remaining_room():
+    fair = D("1000")
+    rungs = [RungSpec(edge_bps=D("20"), size=D("4")), RungSpec(edge_bps=D("100"), size=D("4"))]
+    # cap 7, already hold 5 -> remaining 2 -> only 2 shares quoted total
+    targets = build_ladder_targets(fair, rungs, D("7"), Side.SELL, D("0.1"), current_position=D("5"))
+    assert sum(t.size for t in targets) == D("2")
+
+
+def test_build_ladder_position_budget_halts_at_cap():
+    fair = D("1000")
+    rungs = [RungSpec(edge_bps=D("20"), size=D("1"))]
+    assert build_ladder_targets(fair, rungs, D("7"), Side.SELL, D("0.1"), current_position=D("7")) == []
+
+
+def test_build_ladder_position_budget_uses_abs_position():
+    # short side stored negative; budget consumes magnitude
+    fair = D("1000")
+    rungs = [RungSpec(edge_bps=D("20"), size=D("1"))]
+    assert build_ladder_targets(fair, rungs, D("7"), Side.SELL, D("0.1"), current_position=D("-7")) == []

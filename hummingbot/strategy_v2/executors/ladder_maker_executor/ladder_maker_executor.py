@@ -202,6 +202,7 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             inventory=self._unhedged_base_signed(),
             max_inventory=self.config.max_inventory,
             cost_bps=self.config.round_trip_cost_bps,
+            current_position=self._maker_executed_base,
         )
 
     def _should_reprice(self, targets: List) -> bool:

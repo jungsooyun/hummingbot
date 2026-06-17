@@ -13,7 +13,7 @@ One controller instance per symbol; the V2 framework runs them concurrently.
 from decimal import Decimal
 from typing import List, Optional
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from hummingbot.core.data_type.common import MarketDict, TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -23,15 +23,18 @@ from hummingbot.strategy_v2.executors.ladder_maker_executor.data_types import (
     LadderMakerExecutorConfig,
     LadderRungConfig,
 )
+from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_cost import (
+    round_trip_cost_bps as _round_trip_cost_bps,
+)
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction
 
 
 def _default_rungs() -> List[LadderRungConfig]:
-    # edge_bps, size, min_edge_bps — far rungs carry more size (cumulative cap)
+    # NET edge_bps (gross placement = net + round_trip_cost_bps); size in SHARES.
     return [
-        LadderRungConfig(edge_bps=Decimal("5"), size=Decimal("0.25"), min_edge_bps=Decimal("3")),
-        LadderRungConfig(edge_bps=Decimal("15"), size=Decimal("0.75"), min_edge_bps=Decimal("8")),
-        LadderRungConfig(edge_bps=Decimal("35"), size=Decimal("1.00"), min_edge_bps=Decimal("20")),
+        LadderRungConfig(edge_bps=Decimal("20"), size=Decimal("1"), min_edge_bps=Decimal("10")),
+        LadderRungConfig(edge_bps=Decimal("100"), size=Decimal("2"), min_edge_bps=Decimal("80")),
+        LadderRungConfig(edge_bps=Decimal("150"), size=Decimal("4"), min_edge_bps=Decimal("120")),
     ]
 
 
@@ -53,10 +56,16 @@ class Hip3KisLadderControllerConfig(ControllerConfigBase):
     # Maker side on the perp (SELL perp -> BUY KIS hedge)
     entry_side: TradeType = TradeType.SELL
 
-    # Ladder
-    total_size_cap: Decimal = Decimal("1.0")
+    # Ladder. total_size_cap = MAX |accumulated net position| (shares); one full
+    # ladder must fit (validated below). rung edge_bps are NET targets; placement
+    # gross = net + round_trip_cost_bps.
+    total_size_cap: Decimal = Decimal("100")
     rungs: List[LadderRungConfig] = Field(default_factory=_default_rungs)
     buffer_ticks: Decimal = Decimal("0")
+    round_trip_cost_bps: Decimal = Field(
+        default_factory=lambda: _round_trip_cost_bps(),
+        json_schema_extra={"is_updatable": True},
+    )
 
     # FX (USD/KRW). Use an FX connector pair if available, else a static rate.
     fx_connector: Optional[str] = None
@@ -87,6 +96,16 @@ class Hip3KisLadderControllerConfig(ControllerConfigBase):
 
     # One executor per controller (single-direction ladder per symbol)
     max_executors: int = Field(default=1, json_schema_extra={"is_updatable": True})
+
+    @model_validator(mode="after")
+    def _validate_ladder_fits_position_cap(self):
+        total = sum((r.size for r in self.rungs), Decimal("0"))
+        if total > self.total_size_cap:
+            raise ValueError(
+                f"sum(rung sizes)={total} exceeds total_size_cap (position ceiling)="
+                f"{self.total_size_cap}; one full ladder must fit within the max accumulated position."
+            )
+        return self
 
     def update_markets(self, markets: MarketDict) -> MarketDict:
         markets.add_or_update(self.maker_connector, self.maker_trading_pair)
@@ -124,6 +143,7 @@ class Hip3KisLadderController(ControllerBase):
                 entry_side=self.config.entry_side,
                 total_size_cap=self.config.total_size_cap,
                 rungs=self.config.rungs,
+                round_trip_cost_bps=self.config.round_trip_cost_bps,
                 maker_tick=self.config.maker_tick,
                 hedge_tick=self.config.hedge_tick,
                 buffer_ticks=self.config.buffer_ticks,
