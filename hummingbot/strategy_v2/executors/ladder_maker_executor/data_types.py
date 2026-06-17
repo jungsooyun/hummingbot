@@ -33,6 +33,9 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
     maker_tick: Decimal
     hedge_tick: Decimal
     buffer_ticks: Decimal = Decimal("0")
+    # Round-trip friction (fees + 증권거래세) added to each rung's NET edge so the
+    # maker quote rests at gross = net + cost. See ladder_cost.round_trip_cost_bps.
+    round_trip_cost_bps: Decimal = Decimal("0")
 
     # Fair price inputs (KIS spot KRW -> USD via FX)
     fx_connector: Optional[str] = None

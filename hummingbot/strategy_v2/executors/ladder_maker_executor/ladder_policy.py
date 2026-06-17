@@ -132,11 +132,17 @@ def build_ladder_targets(
     buffer_ticks: Decimal = ZERO,
     inventory: Decimal = ZERO,
     max_inventory: Optional[Decimal] = None,
+    cost_bps: Decimal = ZERO,
 ) -> List[RungTarget]:
     """simultaneous_maker: one order per enabled rung, size accumulated under cap.
 
     Inventory gate: withhold BUY if inventory >= max_inventory,
     withhold SELL if inventory <= -max_inventory.
+
+    ``cost_bps`` is the round-trip friction (fees + 증권거래세) added to each rung's
+    NET edge so the *placement* sits at gross = net + cost. The reported
+    ``RungTarget.edge_bps`` stays the NET target. ``cost_bps`` is also added to
+    ``min_edge_bps`` so the floor is expressed in the same net terms.
     """
     if max_inventory is not None:
         if side is Side.BUY and inventory >= max_inventory:
@@ -152,8 +158,9 @@ def build_ladder_targets(
         qty = min(rung.size, remaining)
         if qty <= ZERO:
             continue
-        price = rung_price(fair, rung.edge_bps, side, tick, buffer_ticks)
-        price = _apply_min_edge(price, fair, rung.min_edge_bps, side, tick)
+        effective_edge = rung.edge_bps + cost_bps  # NET target -> gross placement
+        price = rung_price(fair, effective_edge, side, tick, buffer_ticks)
+        price = _apply_min_edge(price, fair, rung.min_edge_bps + cost_bps, side, tick)
         targets.append(RungTarget(side=side, price=price, size=qty, edge_bps=rung.edge_bps))
         remaining -= qty
     return targets

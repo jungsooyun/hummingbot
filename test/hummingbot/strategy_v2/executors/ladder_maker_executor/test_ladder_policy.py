@@ -109,3 +109,38 @@ def test_compute_hedge_order_buy_marketable():
     assert hedge.side == Side.BUY
     assert hedge.size == D("0.5")
     assert hedge.price == D("70311")  # 70100*1.003=70310.3 -> ceil tick(1) = 70311
+
+
+# --- Task 2: net-edge placement (gross = net + cost_bps) ---
+
+
+def test_build_ladder_cost_bps_widens_sell_edge():
+    fair = D("1000")
+    rungs = [RungSpec(edge_bps=D("20"), size=D("1"))]
+    # gross = net(20) + cost(24) = 44 bps -> 1000 * 1.0044 = 1004.4, ceil tick 0.1
+    targets = build_ladder_targets(fair, rungs, D("100"), Side.SELL, D("0.1"), cost_bps=D("24"))
+    assert targets[0].price == D("1004.4")
+    assert targets[0].edge_bps == D("20")  # reported edge stays the NET target
+
+
+def test_build_ladder_cost_bps_widens_buy_edge_downward():
+    fair = D("1000")
+    rungs = [RungSpec(edge_bps=D("20"), size=D("1"))]
+    # gross 44 bps below -> 1000 * 0.9956 = 995.6, floor tick 0.1
+    targets = build_ladder_targets(fair, rungs, D("100"), Side.BUY, D("0.1"), cost_bps=D("24"))
+    assert targets[0].price == D("995.6")
+
+
+def test_build_ladder_cost_bps_default_zero_unchanged():
+    fair = D("1000")
+    rungs = [RungSpec(edge_bps=D("20"), size=D("1"))]
+    a = build_ladder_targets(fair, rungs, D("100"), Side.SELL, D("0.1"))
+    b = build_ladder_targets(fair, rungs, D("100"), Side.SELL, D("0.1"), cost_bps=D("0"))
+    assert a[0].price == b[0].price == D("1002")  # 20 bps only
+
+
+def test_build_ladder_cost_applies_to_min_edge_floor():
+    fair = D("1000")
+    rungs = [RungSpec(edge_bps=D("20"), size=D("1"), min_edge_bps=D("10"))]
+    targets = build_ladder_targets(fair, rungs, D("100"), Side.SELL, D("0.1"), cost_bps=D("24"))
+    assert targets[0].price == D("1004.4")
