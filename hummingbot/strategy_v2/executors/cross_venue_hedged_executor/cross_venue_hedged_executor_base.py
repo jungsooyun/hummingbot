@@ -145,7 +145,6 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         # Hedge queue: base awaiting a hedge order. Single-in-flight prevents double
         # hedging the same fill.
         self._pending_hedge_base = ZERO
-        self._hedge_stall_ticks = 0  # watchdog: consecutive in-flight-blocked ticks
 
         self._current_retries = 0
         self._max_retries = max_retries
@@ -265,11 +264,6 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
 
     # ============================================================ hedge queue
 
-    # Grace ticks before a hedge stuck with ``order is None`` (its created/failed/
-    # canceled event never arrived) is reaped, so hedging cannot deadlock. ~30s at the
-    # default update_interval of 1s, far above any real create+event latency.
-    _HEDGE_STALL_TICK_LIMIT: int = 30
-
     def _hedge_in_flight(self) -> bool:
         """At most one hedge order may be live at a time (double-hedge prevention).
 
@@ -281,20 +275,9 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
 
     def _process_hedges(self) -> None:
         if self._pending_hedge_base <= ZERO:
-            self._hedge_stall_ticks = 0
             return
         if self._hedge_in_flight():
-            # Watchdog: a hedge stuck with ``order is None`` (created/failed/canceled event
-            # never delivered) would block all future hedging forever. After the grace
-            # period, reap such never-created orders so the pending base re-hedges. Live
-            # orders (order is not None) are legitimately resting and are never reaped here.
-            self._hedge_stall_ticks += 1
-            if self._hedge_stall_ticks >= self._HEDGE_STALL_TICK_LIMIT:
-                for oid in [o_id for o_id, o in self.hedge_orders.items() if o.order is None]:
-                    self.hedge_orders.pop(oid, None)
-                self._hedge_stall_ticks = 0
             return
-        self._hedge_stall_ticks = 0
         spec = self._size_hedge(self._pending_hedge_base)
         if spec is None:
             return

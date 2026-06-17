@@ -47,7 +47,6 @@ class _Harness(CrossVenueHedgedExecutorBase):
         self._maker_fees_quote = Decimal("0")
         self._hedge_fees_quote = Decimal("0")
         self._pending_hedge_base = Decimal("0")
-        self._hedge_stall_ticks = 0
         self._current_retries = 0
         self._max_retries = 3
         self.maker_connector = "hl"
@@ -194,19 +193,3 @@ def test_hedge_cancel_keeps_pending_and_pops_order():
     assert h._pending_hedge_base == Decimal("1.7")  # not stranded
     h._process_hedges()
     assert h.placed[-1] == ("h1", Decimal("1"))  # re-hedge
-
-
-def test_stuck_none_hedge_is_reaped_after_grace_then_rehedges():
-    # Adversarial re-review P1: if the created/failed/canceled event never arrives, the
-    # order stays None forever and _hedge_in_flight blocks all hedging. The watchdog must
-    # reap the stuck never-created order after the grace period so pending re-hedges.
-    h = _Harness()
-    _maker_fill(h, "m0", "2.0")
-    h._process_hedges()
-    assert h.placed == [("h0", Decimal("2"))]
-    assert h.hedge_orders["h0"].order is None  # no lifecycle event ever arrives
-    for _ in range(_Harness._HEDGE_STALL_TICK_LIMIT):
-        h._process_hedges()  # blocked-in-flight; counts toward the watchdog
-    assert "h0" not in h.hedge_orders  # stuck order reaped
-    h._process_hedges()
-    assert h.placed[-1] == ("h1", Decimal("2"))  # hedging recovers
