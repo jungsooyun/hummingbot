@@ -273,21 +273,6 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         """
         return any(o.order is None or o.order.is_open for o in self.hedge_orders.values())
 
-    def _hedge_order_is_lost(self, order_id: str) -> bool:
-        """``True`` if the hedge connector has marked the order LOST.
-
-        A LOST order is one the connector gave up on after repeated not-found polls
-        (``ClientOrderTracker._lost_orders``) — a sustained hedge-venue health failure,
-        not the brief just-placed window (which is simply not-yet-tracked). Used to
-        distinguish a kill-switch trigger from a transient missing record. Defensive:
-        any connector without the lost-order registry returns ``False`` (no trigger).
-        """
-        try:
-            tracker = self.connectors[self.hedge_connector]._order_tracker
-            return tracker.fetch_lost_order(client_order_id=order_id) is not None
-        except (KeyError, AttributeError):
-            return False
-
     def _reconcile_stuck_hedges(self) -> None:
         """Resolve hedge orders stuck with ``order is None`` (lost-lifecycle-event guard).
 
@@ -336,28 +321,6 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                 continue
             in_flight = self.get_in_flight_order(self.hedge_connector, order_id)
             if in_flight is None:
-                if self._hedge_order_is_lost(order_id):
-                    # The hedge connector gave up tracking this order after repeated
-                    # not-found polls (a LOST order = a sustained hedge-venue health
-                    # failure, not the brief just-placed window). Do not keep quoting
-                    # into a venue we cannot hedge on, and do not let the maker leg
-                    # accumulate unbounded naked exposure (the only active gate is the
-                    # kill-switch). Cancel resting makers and HOLD the current position
-                    # (no market-close) so a fresh executor reconciles and resumes on
-                    # restart.
-                    self.logger().error(
-                        "Hedge order %s was marked LOST by %s (repeated not-found); "
-                        "kill-switch: cancelling makers and holding position "
-                        "(pending_hedge_base=%s, unhedged=%s).",
-                        order_id,
-                        self.hedge_connector,
-                        self._pending_hedge_base,
-                        self._unhedged_base(),
-                    )
-                    self.hedge_orders.pop(order_id, None)
-                    self._cancel_all_maker()
-                    self.early_stop(keep_position=True)
-                    return
                 # Just-placed (tracker not yet populated) or create task cancelled.
                 # Never reap here — see docstring. Wait for the next tick to adopt.
                 continue

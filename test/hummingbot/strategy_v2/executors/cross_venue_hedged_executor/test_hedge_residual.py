@@ -20,7 +20,6 @@ from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.cross_venue_he
     CrossVenueHedgedExecutorBase,
 )
 from hummingbot.strategy_v2.models.base import RunnableStatus
-from hummingbot.strategy_v2.models.executors import CloseType
 
 
 class _Inner:
@@ -86,28 +85,15 @@ class _Harness(CrossVenueHedgedExecutorBase):
         self.entry_side = TradeType.SELL
         self.hedge_side = TradeType.BUY
         self.placed = []
-        self.close_type = None
-        self.canceled_makers = []
         # The connector's order tracker (active + 30s cache) — the source of truth that
         # _reconcile_stuck_hedges consults via get_in_flight_order.
         self.connector_orders = {}
-        # Client order ids the connector has marked LOST (repeated not-found polls).
-        self.lost_orders = set()
 
     def _update_tracked(self, *_):
         pass
 
     def get_in_flight_order(self, connector_name, order_id):
         return self.connector_orders.get(order_id)
-
-    def _hedge_order_is_lost(self, order_id):
-        return order_id in self.lost_orders
-
-    def stop(self):  # bypass RunnableBase terminated.set()
-        self._status = RunnableStatus.TERMINATED
-
-    def _cancel_all_maker(self):  # record instead of touching a real strategy
-        self.canceled_makers = list(self.maker_orders.keys())
 
     def evaluate_max_retries(self):  # faithful: stop() -> TERMINATED when exceeded
         if self._current_retries > self._max_retries:
@@ -367,39 +353,6 @@ def test_unknown_to_connector_is_left_not_reaped_no_double_hedge():
     assert h._hedge_executed_base == Decimal("0")
     assert h.placed == [("h0", Decimal("2"))]  # NO second hedge (h0 not reaped)
     assert "h0" in h.hedge_orders and h.hedge_orders["h0"].order is None  # left in-flight
-
-
-def test_lost_hedge_triggers_killswitch_hold_position():
-    # A hedge the connector marked LOST (repeated not-found = sustained hedge-venue
-    # health failure, distinct from the just-placed window) triggers the kill-switch:
-    # cancel resting makers + HOLD the position (no liquidation) + stop. This caps the
-    # naked exposure the maker leg would otherwise keep accumulating while frozen.
-    h = _Harness()
-    h.maker_orders["m_open"] = _Tracked("m_open")  # a resting maker to be cancelled
-    _maker_fill(h, "m0", "2.0")
-    h._process_hedges()  # place h0(2); order None
-    assert h.placed == [("h0", Decimal("2"))]
-    del h.connector_orders["h0"]  # not in active/cache...
-    h.lost_orders.add("h0")  # ...because the connector marked it LOST
-    h._process_hedges()  # reconcile -> kill-switch
-    assert h.status == RunnableStatus.TERMINATED
-    assert h.close_type == CloseType.POSITION_HOLD  # held, NOT market-closed
-    assert "h0" not in h.hedge_orders  # cleared
-    assert "m_open" in h.canceled_makers  # resting makers cancelled
-    assert h.placed == [("h0", Decimal("2"))]  # no new hedge placed after stop
-
-
-def test_unknown_but_not_lost_does_not_killswitch():
-    # The just-placed window (tracker not yet populated, NOT marked lost) must NOT
-    # trigger the kill-switch — it waits for the next tick to adopt.
-    h = _Harness()
-    _maker_fill(h, "m0", "2.0")
-    h._process_hedges()  # place h0(2); order None
-    del h.connector_orders["h0"]  # transiently absent, but NOT in lost_orders
-    h._process_hedges()
-    assert h.status == RunnableStatus.RUNNING  # no kill-switch
-    assert h.close_type is None
-    assert "h0" in h.hedge_orders  # left in-flight, waiting
 
 
 def test_no_hedge_placed_after_reconcile_terminates_executor():
