@@ -1,11 +1,14 @@
-"""JEP-162: hedge fractional-residual carry must be fill-truth based.
+"""JEP-162: hedge fractional-residual carry must be fill-truth based + single-in-flight.
 
 Drives the REAL base event methods (process_order_filled_event /
-process_order_failed_event / _process_hedges / _unhedged_base / _hedge_in_flight)
-through a thin harness that bypasses only the heavy RunnableBase wiring. The
-payloads are lightweight (the handlers read order_id/amount/price). Covers the
-money-risk cases the placement-time-zeroing bug would strand: partial-fill-then-
-fail and fail-before-fill.
+process_order_failed_event / process_order_canceled_event / _process_hedges /
+_unhedged_base / _hedge_in_flight) through a thin harness that bypasses only the
+heavy RunnableBase wiring.
+
+Faithful to production timing: a freshly placed TrackedOrder has ``order is None``
+until the order-created event arrives, so _hedge_in_flight must treat the
+just-placed window as in-flight (else a second tick double-hedges the same
+residual now that pending is no longer zeroed at placement).
 """
 from decimal import Decimal
 
@@ -26,7 +29,7 @@ class _Inner:
 class _Tracked:
     def __init__(self, order_id):
         self.order_id = order_id
-        self.order = _Inner()
+        self.order = None  # faithful: None until the order-created event (matches production)
 
     @property
     def cum_fees_quote(self):
@@ -105,14 +108,19 @@ def _maker_fill(h, oid, amt):
     h.process_order_filled_event(None, None, _Ev(oid, amt))
 
 
+def _created(h, oid):  # simulate the order-created event populating .order
+    h.hedge_orders[oid].order = _Inner()
+
+
 def test_carry_residual_on_full_hedge_fill():
     h = _Harness()
     _maker_fill(h, "m0", "1.7")
     assert h._pending_hedge_base == Decimal("1.7")
     h._process_hedges()
     assert h.placed == [("h0", Decimal("1"))]  # floor
-    h.hedge_orders["h0"].order.is_open = False
+    _created(h, "h0")
     h.process_order_filled_event(None, None, _Ev("h0", "1"))  # hedge fill
+    h.hedge_orders["h0"].order.is_open = False  # order completes
     assert h._pending_hedge_base == Decimal("0.7") == h._unhedged_base()
     h._process_hedges()
     assert len(h.placed) == 1  # floor(0.7)=0 -> no new order
@@ -126,11 +134,33 @@ def test_sub_one_share_not_hedged_and_kept():
     assert h._pending_hedge_base == Decimal("0.3")
 
 
+def test_no_double_hedge_before_created_event():
+    # F1: pending is no longer zeroed at placement; the just-placed window (order is None)
+    # must count as in-flight or the next tick double-hedges the same residual.
+    h = _Harness()
+    _maker_fill(h, "m0", "2.0")
+    h._process_hedges()
+    assert h.placed == [("h0", Decimal("2"))]
+    assert h.hedge_orders["h0"].order is None  # order-created event not yet arrived
+    h._process_hedges()
+    assert h.placed == [("h0", Decimal("2"))]  # NO duplicate hedge
+
+
+def test_single_in_flight_blocks_double_place_after_created():
+    h = _Harness()
+    _maker_fill(h, "m0", "3.0")
+    h._process_hedges()
+    _created(h, "h0")  # order open
+    h._process_hedges()  # gated by in-flight (open)
+    assert h.placed == [("h0", Decimal("3"))]
+
+
 def test_partial_hedge_fill_then_fail_rehedges_remainder():
     h = _Harness()
     _maker_fill(h, "m0", "1.7")
     h._process_hedges()
     assert h.placed[-1] == ("h0", Decimal("1"))
+    _created(h, "h0")
     h.process_order_filled_event(None, None, _Ev("h0", "0.5"))  # partial
     h.hedge_orders["h0"].order.is_open = False
     h.process_order_failed_event(None, None, _Ev("h0", "0"))  # fail -> pops, clears in-flight
@@ -140,20 +170,26 @@ def test_partial_hedge_fill_then_fail_rehedges_remainder():
 
 
 def test_fail_before_any_fill_rehedges_full():
+    # failure at submission, before the created event (order stays None)
     h = _Harness()
     _maker_fill(h, "m0", "2.0")
     h._process_hedges()
     assert h.placed[-1] == ("h0", Decimal("2"))
-    h.hedge_orders["h0"].order.is_open = False
-    h.process_order_failed_event(None, None, _Ev("h0", "0"))
+    h.process_order_failed_event(None, None, _Ev("h0", "0"))  # pop while order is None
     assert h._pending_hedge_base == Decimal("2.0")
     h._process_hedges()
     assert h.placed[-1] == ("h1", Decimal("2"))
 
 
-def test_single_in_flight_blocks_double_place():
+def test_hedge_cancel_keeps_pending_and_pops_order():
+    # F4: a hedge cancellation must be popped (no leak/deadlock); pending stays (re-hedges).
     h = _Harness()
-    _maker_fill(h, "m0", "3.0")
+    _maker_fill(h, "m0", "1.7")
     h._process_hedges()
-    h._process_hedges()  # 2nd call gated by in-flight
-    assert h.placed == [("h0", Decimal("3"))]
+    _created(h, "h0")
+    h.hedge_orders["h0"].order.is_open = False
+    h.process_order_canceled_event(None, None, _Ev("h0", "0"))
+    assert "h0" not in h.hedge_orders  # popped
+    assert h._pending_hedge_base == Decimal("1.7")  # not stranded
+    h._process_hedges()
+    assert h.placed[-1] == ("h1", Decimal("1"))  # re-hedge

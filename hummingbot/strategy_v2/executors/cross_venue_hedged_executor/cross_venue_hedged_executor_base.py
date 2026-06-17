@@ -265,8 +265,13 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
     # ============================================================ hedge queue
 
     def _hedge_in_flight(self) -> bool:
-        """At most one hedge order may be live at a time (double-hedge prevention)."""
-        return any(o.order is not None and o.order.is_open for o in self.hedge_orders.values())
+        """At most one hedge order may be live at a time (double-hedge prevention).
+
+        A just-placed order has ``order is None`` until its created event arrives;
+        that window counts as in-flight too — otherwise, since pending is no longer
+        zeroed at placement, the next tick would re-submit the same residual.
+        """
+        return any(o.order is None or o.order.is_open for o in self.hedge_orders.values())
 
     def _process_hedges(self) -> None:
         if self._pending_hedge_base <= ZERO:
@@ -363,6 +368,9 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
 
     def process_order_canceled_event(self, _, market, event: OrderCancelledEvent):
         self.maker_orders.pop(event.order_id, None)
+        # Pop a cancelled hedge too (no leak / no stale in-flight block). Its unfilled
+        # base stays in _pending_hedge_base and is re-hedged on the next tick.
+        self.hedge_orders.pop(event.order_id, None)
 
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
         if event.order_id in self.maker_orders:

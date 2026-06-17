@@ -98,13 +98,27 @@ class Hip3KisLadderControllerConfig(ControllerConfigBase):
     max_executors: int = Field(default=1, json_schema_extra={"is_updatable": True})
 
     @model_validator(mode="after")
-    def _validate_ladder_fits_position_cap(self):
+    def _validate_config(self):
         total = sum((r.size for r in self.rungs), Decimal("0"))
         if total > self.total_size_cap:
             raise ValueError(
                 f"sum(rung sizes)={total} exceeds total_size_cap (position ceiling)="
                 f"{self.total_size_cap}; one full ladder must fit within the max accumulated position."
             )
+        # The cross-venue hedge accounting assumes 1 maker unit == 1 hedge share;
+        # pending / _unhedged_base mix units otherwise (JEP-162 adversarial finding #2).
+        if self.share_per_unit != Decimal("1"):
+            raise ValueError(
+                f"share_per_unit={self.share_per_unit} is unsupported: hedge accounting "
+                "assumes 1 maker unit == 1 hedge share (non-1 is phase 2)."
+            )
+        # A negative round_trip_cost_bps would invert the net-edge safety floor
+        # (SELL inside fair / BUY above fair) and can disable the min-edge clamp.
+        if self.round_trip_cost_bps < Decimal("0"):
+            raise ValueError(f"round_trip_cost_bps={self.round_trip_cost_bps} must be >= 0")
+        for r in self.rungs:
+            if r.size <= Decimal("0"):
+                raise ValueError(f"rung size must be > 0, got {r.size}")
         return self
 
     def update_markets(self, markets: MarketDict) -> MarketDict:

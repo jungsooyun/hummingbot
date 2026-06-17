@@ -170,3 +170,14 @@ def test_config_accepts_default_rungs_within_cap():
 def test_config_default_round_trip_cost_is_positive():
     cfg = Hip3KisLadderControllerConfig(id="t")
     assert cfg.round_trip_cost_bps > Decimal("0")
+
+
+def test_config_rejects_non_unit_share_per_unit():
+    # cross-venue hedge accounting assumes 1 maker unit == 1 hedge share
+    with pytest.raises(ValueError, match="share_per_unit"):
+        Hip3KisLadderControllerConfig(id="t", share_per_unit=Decimal("2"))
+
+
+def test_config_rejects_negative_round_trip_cost():
+    with pytest.raises(ValueError, match="round_trip_cost_bps"):
+        Hip3KisLadderControllerConfig(id="t", round_trip_cost_bps=Decimal("-1"))
