@@ -131,6 +131,15 @@ WS_TRADE_TR_ID_BY_ROUTING = {
     MARKET_ROUTING_NXT: "H0NXCNT0",
     MARKET_ROUTING_SOR: "H0UNCNT0",
 }
+# 라우팅 → REST 호가조회 FID_COND_MRKT_DIV_CODE (J:KRX / NX:NXT / UN:통합)
+# 공식 KIS 계약(inquire-asking-price-exp-ccn): "조건 시장 분류 코드 (J:KRX, NX:NXT, UN:통합)".
+# REST 스냅샷도 이 매핑을 따라야 함 — 'J' 고정이면 KRX 정규장 마감(15:30 KST) 후 KRX
+# 호가가 동결되는데 NXT 애프터마켓은 계속 거래되어 spot/fair가 stale 해짐(JEP-148).
+REST_ORDERBOOK_MRKT_DIV_BY_ROUTING = {
+    MARKET_ROUTING_KRX: "J",
+    MARKET_ROUTING_NXT: "NX",
+    MARKET_ROUTING_SOR: "UN",
+}
 
 # --------------------------------------------------------------------------- #
 # WebSocket Column Definitions

@@ -480,6 +480,34 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("test_app_key", headers["appkey"])
         self.assertEqual(CONSTANTS.DOMESTIC_STOCK_ORDERBOOK_TR_ID, headers["tr_id"])
 
+    @aioresponses()
+    def test_request_order_book_snapshot_market_div_code_follows_routing(self, mock_api):
+        """The REST orderbook snapshot must derive FID_COND_MRKT_DIV_CODE from
+        kis_market_routing (J=KRX / NX=NXT / UN=통합 per the official KIS
+        inquire-asking-price-exp-ccn contract), NOT hardcode KRX 'J'. With the
+        hardcode, after the KRX regular session closes (15:30 KST) the KRX book
+        freezes while the NXT after-market keeps trading, so the bot reads a stale
+        spot and quotes off a stale fair — a JEP-148 go-live blocker. SOR routing
+        (the default) must read the unified KRX+NXT book ('UN')."""
+        expected = {
+            CONSTANTS.MARKET_ROUTING_KRX: "J",
+            CONSTANTS.MARKET_ROUTING_NXT: "NX",
+            CONSTANTS.MARKET_ROUTING_SOR: "UN",
+        }
+        regex_url = re.compile(
+            f"{CONSTANTS.REST_URL}/{CONSTANTS.DOMESTIC_STOCK_ORDERBOOK_PATH}"
+        )
+        for routing, code in expected.items():
+            with self.subTest(routing=routing):
+                mock_api.requests.clear()
+                ds = self._make_ds(routing)
+                mock_api.get(regex_url, body=json.dumps(self._order_book_snapshot_response()))
+                self.local_event_loop.run_until_complete(
+                    ds._request_order_book_snapshot(self.trading_pair)
+                )
+                sent = next(calls[-1] for calls in mock_api.requests.values() if calls)
+                self.assertEqual(code, sent.kwargs["params"]["FID_COND_MRKT_DIV_CODE"])
+
     # ------------------------------------------------------------------
     # Test: _connected_websocket_assistant raises NotImplementedError
     # ------------------------------------------------------------------

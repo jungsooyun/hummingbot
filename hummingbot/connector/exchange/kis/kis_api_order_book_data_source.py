@@ -67,6 +67,8 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._ws_enabled = ws_enabled
         self._ob_tr_id = CONSTANTS.WS_ORDERBOOK_TR_ID_BY_ROUTING[market_routing]
         self._trade_tr_id = CONSTANTS.WS_TRADE_TR_ID_BY_ROUTING[market_routing]
+        # REST snapshot market-division code, routing-aware like the WS TR_IDs above.
+        self._rest_ob_mrkt_div = CONSTANTS.REST_ORDERBOOK_MRKT_DIV_BY_ROUTING[market_routing]
         # All market-data TR_IDs across routing modes — used to detect channel drift
         self._known_market_tr_ids = (
             set(CONSTANTS.WS_ORDERBOOK_TR_ID_BY_ROUTING.values())
@@ -344,7 +346,10 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
             trading_pair=trading_pair
         )
         params = {
-            "FID_COND_MRKT_DIV_CODE": "J",
+            # Routing-aware: KRX 'J' / NXT 'NX' / 통합 'UN'. Hardcoding 'J' froze the
+            # spot after the KRX regular close (15:30 KST) while NXT after-market kept
+            # trading -> stale fair (JEP-148). Mirrors the WS TR_ID routing.
+            "FID_COND_MRKT_DIV_CODE": self._rest_ob_mrkt_div,
             "FID_INPUT_ISCD": symbol,
         }
         rest_assistant = await self._api_factory.get_rest_assistant()
