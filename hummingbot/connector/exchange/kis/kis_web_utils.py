@@ -73,3 +73,16 @@ def build_api_factory(
 def create_throttler() -> AsyncThrottler:
     """Creates and returns an AsyncThrottler configured with KIS rate limits."""
     return AsyncThrottler(CONSTANTS.RATE_LIMITS)
+
+
+def reconnect_backoff(failures: int, base: float = 5.0, cap: float = 60.0) -> float:
+    """Capped exponential backoff for WS reconnect loops.
+
+    ``failures`` is the consecutive-failure count (1 on the first failure). Returns
+    ``base`` on the first failure, doubling each subsequent failure up to ``cap``.
+    Keeps a persistently-unavailable WS (e.g. the env-gated KIS realtime socket)
+    from hammering reconnects and flooding logs every few seconds.
+    """
+    if failures <= 1:
+        return base
+    return min(base * (2 ** min(failures - 1, 4)), cap)

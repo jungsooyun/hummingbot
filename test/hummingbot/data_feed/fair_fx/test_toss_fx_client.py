@@ -33,14 +33,18 @@ class FakeSession:
         self.rate_status = rate_status
         self.post_calls = 0
         self.get_calls = 0
+        self.last_post_headers = None
+        self.last_get_headers = None
         self.closed = False
 
     def post(self, url, data=None, headers=None):
         self.post_calls += 1
+        self.last_post_headers = headers
         return FakeResp(self.token_status, self.token_payload, text="token-err")
 
     def get(self, url, params=None, headers=None):
         self.get_calls += 1
+        self.last_get_headers = headers
         return FakeResp(self.rate_status, self.rate_payload, text="rate-err")
 
     async def close(self):
@@ -48,6 +52,21 @@ class FakeSession:
 
 
 class TossFxClientTest(unittest.IsolatedAsyncioTestCase):
+    async def test_requests_send_browser_user_agent(self):
+        # Toss sits behind Cloudflare; the default aiohttp UA gets intermittently
+        # WAF-blocked (403 "request could not be satisfied"). Both the token POST
+        # and the rate GET must carry a browser-like User-Agent + Accept: json.
+        sess = FakeSession()
+        c = TossFxClient("id", "sec", http_factory=lambda: sess)
+        await c.fetch_exchange_rate()
+        for hdrs in (sess.last_post_headers, sess.last_get_headers):
+            self.assertIsNotNone(hdrs)
+            self.assertIn("User-Agent", hdrs)
+            self.assertIn("Mozilla", hdrs["User-Agent"])
+            self.assertEqual("application/json", hdrs.get("Accept"))
+        # GET still carries the bearer token alongside the default headers.
+        self.assertTrue(sess.last_get_headers["Authorization"].startswith("Bearer "))
+
     async def test_token_cached_within_ttl(self):
         sess = FakeSession()
         c = TossFxClient("id", "sec", http_factory=lambda: sess)

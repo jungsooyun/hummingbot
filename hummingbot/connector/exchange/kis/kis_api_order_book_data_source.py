@@ -65,6 +65,7 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
             set(CONSTANTS.WS_ORDERBOOK_TR_ID_BY_ROUTING.values())
             | set(CONSTANTS.WS_TRADE_TR_ID_BY_ROUTING.values())
         )
+        self._ws_failures = 0  # consecutive WS reconnect failures (for backoff)
 
     # ------------------------------------------------------------------
     # Public interface
@@ -97,6 +98,7 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     async with session.ws_connect(ws_url) as ws:
                         # Subscribe to channels
                         await self._subscribe_ws_channels(ws, approval_key)
+                        self._ws_failures = 0  # connected; reset backoff
 
                         # Process messages
                         async for msg in ws:
@@ -107,10 +109,20 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self.logger().exception(
-                    "Unexpected error in KIS WebSocket subscription. Reconnecting..."
-                )
-                await self._sleep(5.0)
+                self._ws_failures += 1
+                delay = web_utils.reconnect_backoff(self._ws_failures)
+                # Full traceback once per streak; concise + capped-backoff thereafter
+                # so a persistently-unavailable WS doesn't flood the log every 5s.
+                if self._ws_failures == 1:
+                    self.logger().exception(
+                        "KIS orderbook WebSocket failed; retrying with backoff."
+                    )
+                else:
+                    self.logger().warning(
+                        f"KIS orderbook WebSocket still unavailable "
+                        f"(attempt {self._ws_failures}); retrying in {delay:.0f}s."
+                    )
+                await self._sleep(delay)
 
     async def _subscribe_ws_channels(self, ws: aiohttp.ClientWebSocketResponse, approval_key: str):
         """Subscribe to orderbook and trade channels for all trading pairs."""

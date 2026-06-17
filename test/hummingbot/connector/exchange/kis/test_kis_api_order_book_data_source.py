@@ -1278,8 +1278,12 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
                     await self.data_source.listen_for_subscriptions()
 
         self.assertTrue(
-            self._is_logged_partial("ERROR", "Unexpected error in KIS WebSocket subscription")
+            self._is_logged_partial("ERROR", "KIS orderbook WebSocket failed")
         )
+        # Capped exponential backoff: first failure = base 5s, second = 10s
+        # (so a persistently-down WS does not flood reconnects/logs every 5s).
+        self.assertEqual(5.0, sleep_mock.call_args_list[0].args[0])
+        self.assertEqual(10.0, sleep_mock.call_args_list[1].args[0])
 
     async def test_listen_for_subscriptions_propagates_cancelled_error(self):
         """CancelledError during WS loop should propagate cleanly."""

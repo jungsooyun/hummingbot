@@ -76,6 +76,7 @@ class KisAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
         # AES decryption state (per TR_ID)
         self._encryption_keys: Dict[str, Dict[str, str]] = {}
+        self._ws_failures = 0  # consecutive WS reconnect failures (for backoff)
 
     # ------------------------------------------------------------------ #
     # UserStreamTrackerDataSource interface
@@ -91,6 +92,7 @@ class KisAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(ws_url) as ws:
                         await self._subscribe_exec_notifications(ws, approval_key)
+                        self._ws_failures = 0  # connected; reset backoff
 
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
@@ -100,10 +102,20 @@ class KisAPIUserStreamDataSource(UserStreamTrackerDataSource):
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self.logger().exception(
-                    "Unexpected error in KIS user stream WebSocket. Reconnecting..."
-                )
-                await self._sleep(5.0)
+                self._ws_failures += 1
+                delay = web_utils.reconnect_backoff(self._ws_failures)
+                # Full traceback once per streak; concise + capped-backoff thereafter
+                # so a persistently-unavailable WS doesn't flood the log every 5s.
+                if self._ws_failures == 1:
+                    self.logger().exception(
+                        "KIS user stream WebSocket failed; retrying with backoff."
+                    )
+                else:
+                    self.logger().warning(
+                        f"KIS user stream WebSocket still unavailable "
+                        f"(attempt {self._ws_failures}); retrying in {delay:.0f}s."
+                    )
+                await self._sleep(delay)
 
     async def _subscribe_exec_notifications(
         self, ws: aiohttp.ClientWebSocketResponse, approval_key: str

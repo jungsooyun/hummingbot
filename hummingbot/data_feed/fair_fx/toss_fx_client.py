@@ -30,6 +30,17 @@ class TossFxClient:
     TOKEN_PATH = "/oauth2/token"
     RATE_PATH = "/api/v1/exchange-rate"
 
+    # Toss sits behind Cloudflare; the default aiohttp User-Agent gets intermittently
+    # WAF-blocked (HTTP 403 "The request could not be satisfied"). Send a browser-like
+    # UA + Accept so the requests are not flagged as bot traffic.
+    _DEFAULT_HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json",
+    }
+
     def __init__(
         self,
         client_id: str,
@@ -66,7 +77,7 @@ class TossFxClient:
                 "client_id": self._client_id,
                 "client_secret": self._client_secret,
             }
-            async with session.post(self.BASE + self.TOKEN_PATH, data=data) as resp:
+            async with session.post(self.BASE + self.TOKEN_PATH, data=data, headers=dict(self._DEFAULT_HEADERS)) as resp:
                 if resp.status != 200:
                     body = await resp.text()
                     raise TossFxError(f"token request failed: {resp.status} {body}")
@@ -81,7 +92,7 @@ class TossFxClient:
         token = await self._get_token()
         session = self._ensure_session()
         params = {"baseCurrency": "USD", "quoteCurrency": "KRW"}
-        headers = {"Authorization": f"Bearer {token}"}
+        headers = {**self._DEFAULT_HEADERS, "Authorization": f"Bearer {token}"}
         async with session.get(self.BASE + self.RATE_PATH, params=params, headers=headers) as resp:
             if resp.status != 200:
                 body = await resp.text()
