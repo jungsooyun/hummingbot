@@ -213,6 +213,16 @@ def test_apply_seed_handles_long_perp_and_audit_basis_without_cash_pnl():
 
 def test_await_connector_readiness_requires_ready_connectors_and_fresh_snapshots():
     h = _SeedHarness(adopt=True)
+    # Empty account_positions is the startup race: the accessor exists before the
+    # perp snapshot has completed, so freshness requires a populated position set.
+    h.connectors[h.maker_connector].account_positions = {
+        "short": SimpleNamespace(
+            trading_pair=h.maker_trading_pair,
+            position_side=PositionSide.SHORT,
+            amount=Decimal("1"),
+            entry_price=Decimal("100"),
+        )
+    }
     h.connectors[h.hedge_connector].get_balance = lambda asset: ZERO
 
     assert asyncio.run(h._await_connector_readiness()) is True
@@ -226,6 +236,15 @@ def test_await_connector_readiness_requires_snapshot_accessors():
 
     assert asyncio.run(h._await_connector_readiness(timeout_s=0, interval_s=0)) is False
 
+    # Empty account_positions is not fresh; populate it before expecting readiness.
+    h.connectors[h.maker_connector].account_positions = {
+        "short": SimpleNamespace(
+            trading_pair=h.maker_trading_pair,
+            position_side=PositionSide.SHORT,
+            amount=Decimal("1"),
+            entry_price=Decimal("100"),
+        )
+    }
     h.connectors[h.hedge_connector].get_balance = lambda asset: ZERO
     assert asyncio.run(h._await_connector_readiness(timeout_s=0, interval_s=0)) is True
 

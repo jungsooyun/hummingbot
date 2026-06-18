@@ -769,6 +769,16 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             return
         self._seed_adopting = True
         try:
+            update_positions = getattr(self.connectors[self.maker_connector], "_update_positions", None)
+            if callable(update_positions):
+                try:
+                    positions = update_positions()
+                    if inspect.isawaitable(positions):
+                        await positions
+                except Exception:
+                    self._seed_fail_closed = True
+                    return
+
             if not await self._await_connector_readiness():
                 self._seed_fail_closed = True
                 return
@@ -780,7 +790,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             if getattr(self, "_seed_fail_closed", False):
                 return
             spot_base = self._read_spot_balance_base()
-            if perp_signed == ZERO and spot_base == ZERO:
+            if perp_signed == ZERO or spot_base == ZERO:
                 self._seed_fail_closed = True
                 return
 
@@ -835,10 +845,14 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
     def _seed_snapshots_fresh(self) -> bool:
         maker = self.connectors[self.maker_connector]
         hedge = self.connectors[self.hedge_connector]
-        return (
-            hasattr(maker, "account_positions")
-            and (hasattr(hedge, "get_balance") or hasattr(hedge, "get_available_balance"))
-        )
+        if not hasattr(maker, "account_positions"):
+            return False
+        positions = getattr(maker, "account_positions", None)
+        try:
+            positions_fresh = len(positions or {}) > 0
+        except TypeError:
+            positions_fresh = any(positions)
+        return positions_fresh and (hasattr(hedge, "get_balance") or hasattr(hedge, "get_available_balance"))
 
     async def _await_connector_readiness(
         self,
