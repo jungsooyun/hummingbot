@@ -259,6 +259,8 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         elapsed = self._strategy.current_timestamp - self._last_reprice_ts
         if elapsed < self.config.min_reprice_interval_s:
             return False
+        if self._is_two_sided():
+            return self._two_sided_should_reprice(targets, open_makers)
         # Reprice only if the best target moved beyond the tick threshold.
         target_prices = sorted(t.price for t in targets)
         current_prices = sorted(o.order.price for o in open_makers if o.order is not None)
@@ -266,6 +268,42 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             return True
         delta = abs(target_prices[0] - current_prices[0])
         return delta >= self.config.min_reprice_delta_ticks * self.config.maker_tick
+
+    def _two_sided_should_reprice(self, targets: List, open_makers: List) -> bool:
+        conn = self.connectors[self.maker_connector]
+        pair = self.maker_trading_pair
+        tol = self.config.min_reprice_delta_ticks * self.config.maker_tick
+
+        def is_open_side(side: TradeType) -> bool:
+            return side == self.entry_side
+
+        tgt = {True: [], False: []}
+        for t in targets:
+            side = TradeType.SELL if t.side == Side.SELL else TradeType.BUY
+            qp = conn.quantize_order_price(pair, t.price)
+            qa = conn.quantize_order_amount(pair, t.size)
+            tgt[is_open_side(side)].append((qp, qa))
+
+        rest = {True: [], False: []}
+        for o in open_makers:
+            if o.order is None:
+                return True
+            rest[is_open_side(o.order.trade_type)].append((o.order.price, o.order.amount))
+
+        for side_key in (True, False):
+            t_side = tgt[side_key]
+            r_side = rest[side_key]
+            if len(t_side) != len(r_side):
+                return True
+            t_prices = sorted(p for p, _ in t_side)
+            r_prices = sorted(p for p, _ in r_side)
+            if any(abs(tp - rp) >= tol for tp, rp in zip(t_prices, r_prices)):
+                return True
+            t_sizes = sorted(a for _, a in t_side)
+            r_sizes = sorted(a for _, a in r_side)
+            if t_sizes != r_sizes:
+                return True
+        return False
 
     def _place_targets(self, targets: List) -> None:
         if self.config.observe:
