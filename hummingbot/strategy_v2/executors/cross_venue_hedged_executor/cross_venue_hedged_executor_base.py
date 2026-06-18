@@ -85,6 +85,7 @@ from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 
 ZERO = Decimal("0")
+ONE = Decimal("1")
 
 
 class CrossVenueHedgedExecutorBase(ExecutorBase):
@@ -145,6 +146,8 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         self._hedge_executed_quote = ZERO
         self._maker_fees_quote = ZERO
         self._hedge_fees_quote = ZERO
+        self._perp_cash = ZERO
+        self._spot_cash = ZERO
 
         # Hedge queue: signed base awaiting a hedge order. Single-in-flight prevents
         # double hedging the same fill. ``_pending_hedge_base`` is a read-only
@@ -307,6 +310,8 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             "_maker_sell_base",
             "_hedge_buy_base",
             "_hedge_sell_base",
+            "_perp_cash",
+            "_spot_cash",
             "_open_edge_base",
             "_open_edge_notional_bps",
             "_open_edge_vwap",
@@ -323,6 +328,31 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
     @staticmethod
     def _signed_base(side: TradeType, amount: Decimal) -> Decimal:
         return amount if side == TradeType.BUY else -amount
+
+    def _hedge_price_to_maker_quote(self, price: Decimal) -> Decimal:
+        """Convert a hedge-leg fill price into the maker-leg quote unit.
+
+        Default identity: the base is a generic two-venue machine, and tests inject
+        pre-converted prices. ``LadderMakerExecutor`` overrides this to divide a KRW
+        spot fill by the fill-time FX rate so ``_spot_cash`` accrues in USD (the maker
+        leg's quote), keeping the round-trip PnL single-currency.
+        """
+        return price
+
+    def _residual_mark_price(self) -> Decimal:
+        """Mark price for the naked (unhedged) residual in two-sided cash-flow PnL.
+
+        Default = the maker execution VWAP. Marking the open leg at its OWN entry price
+        contributes zero unrealized PnL on the unhedged portion, which makes the
+        cash-flow PnL a *strict generalization* of the legacy matched-quantity PnL: on
+        any single-direction sequence ``_perp_cash + _spot_cash + naked*maker_avg - fees``
+        reduces to the legacy matched spread (verified full / partial / reconcile, both
+        sides). The executor layer may later override this to a live fair mark so an
+        open two-sided inventory is marked to market instead of to entry.
+        """
+        if self._maker_executed_base > ZERO:
+            return self._maker_executed_quote / self._maker_executed_base
+        return ZERO
 
     def _maker_fill_side(self, event: OrderFilledEvent) -> TradeType:
         return getattr(event, "trade_type", None) or self.entry_side
@@ -368,6 +398,11 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         self._record_hedge_fill_side(side, amount)
         if price is not None and not price.is_nan():
             self._hedge_executed_quote += amount * price
+            self._spot_cash += (
+                self._hedge_price_to_maker_quote(price)
+                * amount
+                * (ONE if side == TradeType.SELL else -ONE)
+            )
         self._pending_hedge_signed += self._signed_base(side, amount)
 
     def _reconcile_stuck_hedges(self) -> None:
@@ -543,6 +578,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             maker_side = self._maker_fill_side(event)
             self._maker_executed_base += amount
             self._maker_executed_quote += amount * Decimal(event.price)
+            self._perp_cash += amount * Decimal(event.price) * (ONE if maker_side == TradeType.SELL else -ONE)
             self._record_maker_fill_side(maker_side, amount)
             self._record_open_edge(event.order_id, maker_side, amount)
             self._pending_hedge_signed += self._signed_base(maker_side, amount)
@@ -638,6 +674,9 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self.stop()
 
     def get_net_pnl_quote(self) -> Decimal:
+        if getattr(self.config, "two_sided", False):
+            return self._roundtrip_net_pnl_quote()
+
         matched = min(self._maker_executed_base, self._hedge_executed_base)
         if matched <= ZERO:
             return ZERO
@@ -655,6 +694,10 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             return ZERO
         gross = self._pnl_gross_quote(matched, maker_avg, hedge_avg)
         return gross - self.get_cum_fees_quote()
+
+    def _roundtrip_net_pnl_quote(self) -> Decimal:
+        residual = self._unhedged_base_signed() * self._residual_mark_price()
+        return self._perp_cash + self._spot_cash + residual - self.get_cum_fees_quote()
 
     def get_net_pnl_pct(self) -> Decimal:
         if self._maker_executed_quote <= ZERO:
