@@ -1,0 +1,27 @@
+{
+  "fixture_metadata": {
+    "fixture_provenance": "official_sample_synthetic",
+    "source_reference": "official-sample:33e0e1e65cd1c8c8b639531483ec0b327087bab1:examples_llm/domestic_futureoption/inquire_asking_price/inquire_asking_price.py",
+    "source_commit": "33e0e1e65cd1c8c8b639531483ec0b327087bab1",
+    "refreshed_at_utc": "2026-05-21",
+    "synthetic_or_captured": "synthetic"
+  },
+  "tr_id": "FHMIF10010000",
+  "route": "DAY_DERIVATIVE",
+  "request": {
+    "FID_COND_MRKT_DIV_CODE": "JF",
+    "FID_INPUT_ISCD": "A11606"
+  },
+  "output1": {
+    "futs_shrn_iscd": "A11606",
+    "bsop_date": "20260521",
+    "bsop_hour": "093000"
+  },
+  "output2": {
+    "askp1": "294500",
+    "bidp1": "294000",
+    "askp_rsqn1": "55",
+    "bidp_rsqn1": "74"
+  },
+  "ts_event_ns": "1776817800000000000"
+}

@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 from hummingbot.connector.markets_recorder import MarketsRecorder
+from hummingbot.connector.perpetual_connector_allowlist import PERPETUAL_CONNECTOR_ALLOWLIST
 from hummingbot.core.data_type.common import PositionAction, PositionMode, PriceType, TradeType
 from hummingbot.logger import HummingbotLogger
 from hummingbot.model.position import Position
@@ -584,7 +585,7 @@ class ExecutorOrchestrator:
         per trading pair, so we return None and let all activity merge into one
         PositionHold (whose net direction is derived from its buy/sell amounts).
         """
-        is_perpetual = "_perpetual" in executor_info.connector_name
+        is_perpetual = "_perpetual" in executor_info.connector_name or executor_info.connector_name in PERPETUAL_CONNECTOR_ALLOWLIST
         if not is_perpetual:
             return None
 
