@@ -432,15 +432,18 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
 
     def _size_hedge(self, pending_base: Decimal) -> Optional[Dict]:
         kis = self.connectors[self.hedge_connector]
-        best_ask = kis.get_price_by_type(self.hedge_trading_pair, PriceType.BestAsk)
-        if not best_ask or best_ask <= ZERO:
+        hedge_side = Side.BUY if self._pending_hedge_signed < ZERO else Side.SELL
+        price_type = PriceType.BestAsk if hedge_side is Side.BUY else PriceType.BestBid
+        ref = kis.get_price_by_type(self.hedge_trading_pair, price_type)
+        if not ref or ref <= ZERO:
             return None
         hedge = compute_hedge_order(
             fill_qty=pending_base,
             share_per_unit=self.config.share_per_unit,
-            kis_best_ask=Decimal(str(best_ask)),
+            kis_price=Decimal(str(ref)),
             max_slippage_bps=self.config.hedge_max_slippage_bps,
             tick=self.config.hedge_tick,
+            side=hedge_side,
         )
         amount = kis.quantize_order_amount(self.hedge_trading_pair, hedge.size)
         if amount <= ZERO:
@@ -456,6 +459,12 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             "order_type": self.config.hedge_order_type,
             "metadata": {"order_role": "hedge"},
         }
+
+    def _hedge_base_to_maker_base(self, amount: Decimal) -> Decimal:
+        spu = self.config.share_per_unit
+        if spu and spu != ZERO:
+            return amount / spu
+        return amount
 
     # ------------------------------------------------------------------ balance hook
 

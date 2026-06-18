@@ -312,15 +312,20 @@ def diff_ladder_targets(
 def compute_hedge_order(
     fill_qty: Decimal,
     share_per_unit: Decimal,
-    kis_best_ask: Decimal,
+    kis_price: Decimal,
     max_slippage_bps: Decimal,
     tick: Decimal,
+    side: Side = Side.BUY,
 ) -> HedgeOrder:
-    """HL short maker fill -> KIS spot BUY marketable-limit hedge.
+    """Maker fill -> KIS spot marketable-limit hedge.
 
-    Price walks up to best_ask + slippage so the limit order crosses (takerable).
+    BUY walks up from best ask + slippage; SELL walks down from best bid - slippage
+    so either limit order crosses (takerable).
     """
     share_qty = fill_qty * share_per_unit
     slip = max_slippage_bps / BPS
-    price = ceil_to_tick(kis_best_ask * (ONE + slip), tick)
-    return HedgeOrder(side=Side.BUY, price=price, size=share_qty)
+    if side is Side.BUY:
+        price = ceil_to_tick(kis_price * (ONE + slip), tick)
+    else:
+        price = floor_to_tick(kis_price * (ONE - slip), tick)
+    return HedgeOrder(side=side, price=price, size=share_qty)
