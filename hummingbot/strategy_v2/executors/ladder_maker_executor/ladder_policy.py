@@ -253,6 +253,7 @@ class RestingOrder:
     """Snapshot of one live maker order, for the partial-reprice diff."""
 
     order_id: str
+    side: Side
     price: Decimal
     size: Decimal
 
@@ -297,7 +298,7 @@ def diff_ladder_targets(
         candidates = [
             o
             for o in unmatched
-            if o.size == target.size and abs(o.price - target.price) < threshold
+            if o.side == target.side and o.size == target.size and abs(o.price - target.price) < threshold
         ]
         if not candidates:
             to_place.append(target)

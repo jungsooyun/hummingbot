@@ -32,6 +32,8 @@ from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.cross_venue_he
 )
 from hummingbot.strategy_v2.executors.ladder_maker_executor.data_types import LadderMakerExecutorConfig
 from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import (
+    RestingOrder,
+    RungTarget,
     RungSpec,
     Side,
     TwoSidedTargets,
@@ -41,6 +43,7 @@ from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import
     compute_eod_pressure,
     compute_fair_price,
     compute_hedge_order,
+    diff_ladder_targets,
 )
 from hummingbot.strategy_v2.gates.gate_chain import GateChain, GateContext, InventoryGate, KillSwitchGate
 from hummingbot.strategy_v2.models.executors import TrackedOrder
@@ -325,6 +328,66 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
                 return True
         return False
 
+    def _reconcile_maker(self) -> None:
+        if not self._is_two_sided():
+            return super()._reconcile_maker()
+        if getattr(self.config, "wind_down", False):
+            return super()._reconcile_maker()
+        targets = self._compute_targets()
+        if not self._should_reprice(targets):
+            return
+        if self.config.observe:
+            self._place_targets(targets)
+            return
+        resting = self._resting_maker_orders()
+        diff = diff_ladder_targets(
+            resting,
+            targets,
+            self.config.maker_tick,
+            self.config.min_reprice_delta_ticks,
+        )
+        for oid in diff.to_cancel:
+            self._strategy.cancel(self.maker_connector, self.maker_trading_pair, oid)
+        self._place_targets_subset(diff.to_place)
+        self._last_reprice_ts = self._strategy.current_timestamp
+
+    def _resting_maker_orders(self) -> List[RestingOrder]:
+        conn = self.connectors[self.maker_connector]
+        pair = self.maker_trading_pair
+        out: List[RestingOrder] = []
+        for o in self._open_maker_orders():
+            if o.order is None:
+                continue
+            side = Side.BUY if o.order.trade_type == TradeType.BUY else Side.SELL
+            out.append(
+                RestingOrder(
+                    order_id=o.order_id,
+                    side=side,
+                    price=conn.quantize_order_price(pair, o.order.price),
+                    size=conn.quantize_order_amount(pair, o.order.amount),
+                )
+            )
+        return out
+
+    def _place_target_one(self, target: RungTarget) -> None:
+        if self._is_two_sided():
+            side = TradeType.SELL if target.side == Side.SELL else TradeType.BUY
+            position_action = PositionAction.OPEN if side == self.entry_side else PositionAction.CLOSE
+            self._place_maker(
+                target.price,
+                target.size,
+                target.edge_bps,
+                side=side,
+                position_action=position_action,
+            )
+        else:
+            self._place_maker(target.price, target.size, target.edge_bps)
+
+    def _place_targets_subset(self, targets: List[RungTarget]) -> None:
+        for target in targets:
+            self._place_target_one(target)
+        self._last_reprice_ts = self._strategy.current_timestamp
+
     def _place_targets(self, targets: List) -> None:
         if self.config.observe:
             # Capture the full intended ladder (fair + spot + fx + rungs) for both the
@@ -338,18 +401,7 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
                 self._last_observe_log_ts = now
                 self.logger().info(self._format_observe_line(self._last_observe))
         for target in targets:
-            if self._is_two_sided():
-                side = TradeType.SELL if target.side == Side.SELL else TradeType.BUY
-                position_action = PositionAction.OPEN if side == self.entry_side else PositionAction.CLOSE
-                self._place_maker(
-                    target.price,
-                    target.size,
-                    target.edge_bps,
-                    side=side,
-                    position_action=position_action,
-                )
-            else:
-                self._place_maker(target.price, target.size, target.edge_bps)
+            self._place_target_one(target)
         self._last_reprice_ts = self._strategy.current_timestamp
 
     def _flatten_unwind_step(self) -> bool:

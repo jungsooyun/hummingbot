@@ -166,6 +166,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         self._hedge_buy_base = ZERO
         self._hedge_sell_base = ZERO
         self._hedge_order_side: Dict[str, Union[TradeType, tuple[TradeType, Decimal]]] = {}
+        self._hedge_credited_base: Dict[str, Decimal] = {}
         self._maker_placed_edge_bps: Dict[str, Decimal] = {}
         self._open_edge_base = ZERO
         self._open_edge_notional_bps = ZERO
@@ -350,6 +351,8 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self._pending_hedge_signed = ZERO
         if not hasattr(self, "_hedge_order_side"):
             self._hedge_order_side = {}
+        if not hasattr(self, "_hedge_credited_base"):
+            self._hedge_credited_base = {}
         if not hasattr(self, "_maker_placed_edge_bps"):
             self._maker_placed_edge_bps = {}
 
@@ -437,20 +440,27 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             return recorded[0]
         return recorded or self.hedge_side
 
-    def _credit_hedge_fill(self, order_id: str, amount: Decimal, price: Optional[Decimal]) -> None:
+    def _credit_hedge_fill(self, order_id: str, observed_cumulative: Decimal, price: Optional[Decimal]) -> None:
+        already = self._hedge_credited_base.get(order_id, ZERO)
+        if order_id not in self.hedge_orders and observed_cumulative <= already:
+            observed_cumulative = already + observed_cumulative
+        delta = observed_cumulative - already
+        if delta <= ZERO:
+            return
+        self._hedge_credited_base[order_id] = observed_cumulative
         side = self._hedge_fill_side(order_id)
         # Notional/legacy accumulators use the RAW hedge amount (money + byte-identical
         # legacy matched PnL); the signed delta ledgers use maker-unit-converted base so
         # _spot_net nets against _perp_net in one unit (see _hedge_base_to_maker_base).
-        self._hedge_executed_base += amount
+        self._hedge_executed_base += delta
         if price is not None and not price.is_nan():
-            self._hedge_executed_quote += amount * price
+            self._hedge_executed_quote += delta * price
             self._spot_cash += (
                 self._hedge_price_to_maker_quote(price)
-                * amount
+                * delta
                 * (ONE if side == TradeType.SELL else -ONE)
             )
-        maker_base = self._hedge_base_to_maker_base(amount)
+        maker_base = self._hedge_base_to_maker_base(delta)
         self._record_hedge_fill_side(side, maker_base)
         self._pending_hedge_signed += self._signed_base(side, maker_base)
 
@@ -522,6 +532,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                 self._hedge_fees_quote += in_flight.cumulative_fee_paid(in_flight.quote_asset)
                 self.hedge_orders.pop(order_id, None)
                 self._hedge_order_side.pop(order_id, None)
+                self._hedge_credited_base.pop(order_id, None)
                 if not in_flight.is_filled:
                     # Terminated without completing the hedge (lost cancel/failure): count
                     # it toward max_retries so a persistently failing hedge cannot loop.
@@ -538,6 +549,12 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             return
         if self._pending_hedge_signed == ZERO:
             return
+        needed_side = TradeType.BUY if self._pending_hedge_signed < ZERO else TradeType.SELL
+        for oid, rec in list(self._hedge_order_side.items()):
+            tracked = self.hedge_orders.get(oid)
+            side = rec[0] if isinstance(rec, tuple) else rec
+            if tracked is not None and tracked.order is not None and side != needed_side:
+                self._strategy.cancel(self.hedge_connector, self.hedge_trading_pair, oid)
         if self._hedge_in_flight():
             return
         pending_base = self._pending_hedge_base
@@ -636,7 +653,13 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             # Decrement the hedge queue by what ACTUALLY hedged (fill), not what was
             # placed, so a partial-fill-then-fail re-hedges the remainder instead of
             # stranding it. pending then tracks the fill-truth unhedged need.
-            self._credit_hedge_fill(event.order_id, amount, Decimal(event.price))
+            tracked = self.hedge_orders[event.order_id]
+            observed = getattr(getattr(tracked, "order", None), "executed_amount_base", None)
+            if observed is None:
+                # Lagging/absent connector cumulative (or a test double without the
+                # attribute): fall back to cumulative-delta = prior watermark + this fill.
+                observed = self._hedge_credited_base.get(event.order_id, ZERO) + amount
+            self._credit_hedge_fill(event.order_id, Decimal(observed), Decimal(event.price))
             # A successful hedge fill proves the venue is responding: reset the consecutive
             # failure counter so the kill-switch only trips on a *persistent* streak.
             self._current_retries = 0
@@ -656,6 +679,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             # default self.hedge_side (wrong after a two-sided sign flip) and leaked the dict.
             self.hedge_orders.pop(event.order_id, None)
             self._hedge_order_side.pop(event.order_id, None)
+            self._hedge_credited_base.pop(event.order_id, None)
 
     def process_order_canceled_event(self, _, market, event: OrderCancelledEvent):
         self._ensure_direction_accounting()
@@ -664,6 +688,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         # base stays in _pending_hedge_base and is re-hedged on the next tick.
         self.hedge_orders.pop(event.order_id, None)
         self._hedge_order_side.pop(event.order_id, None)
+        self._hedge_credited_base.pop(event.order_id, None)
 
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
         self._ensure_direction_accounting()
@@ -672,6 +697,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         elif event.order_id in self.hedge_orders:
             self.hedge_orders.pop(event.order_id, None)
             self._hedge_order_side.pop(event.order_id, None)
+            self._hedge_credited_base.pop(event.order_id, None)
             self._current_retries += 1
             self.evaluate_max_retries()
 

@@ -23,8 +23,8 @@ def _t(price, size, edge="10"):
     return RungTarget(side=Side.SELL, price=D(price), size=D(size), edge_bps=D(edge))
 
 
-def _o(oid, price, size):
-    return RestingOrder(order_id=oid, price=D(price), size=D(size))
+def _o(oid, price, size, side=Side.SELL):
+    return RestingOrder(order_id=oid, side=side, price=D(price), size=D(size))
 
 
 def test_empty_current_places_all():
@@ -127,3 +127,11 @@ def test_no_target_double_matches_same_order():
     diff = diff_ladder_targets(current, targets, TICK, THRESH)
     assert diff.to_cancel == []
     assert diff.to_place == [_t("50.11", "1")]
+
+
+def test_opposite_side_same_price_size_not_matched():
+    target = RungTarget(side=Side.BUY, price=D("50.10"), size=D("1"), edge_bps=D("10"))
+    current = [_o("sell-open", "50.10", "1", side=Side.SELL)]
+    diff = diff_ladder_targets(current, [target], TICK, THRESH)
+    assert diff.to_cancel == ["sell-open"]
+    assert diff.to_place == [target]
