@@ -358,11 +358,19 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             self.config.maker_tick,
             self.config.min_reprice_delta_ticks,
         )
+        unmatched_inflight = [oid for oid in diff.to_cancel if oid in inflight_ids]
+        placed_rung = getattr(self, "_maker_placed_rung", {})
+        blocked_sides = {
+            placed_rung[oid][0]
+            for oid in unmatched_inflight
+            if oid in placed_rung
+        }
+        to_place = [target for target in diff.to_place if target.side not in blocked_sides]
         for oid in diff.to_cancel:
             if oid in inflight_ids:
                 continue
             self._strategy.cancel(self.maker_connector, self.maker_trading_pair, oid)
-        self._place_targets_subset(diff.to_place)
+        self._place_targets_subset(to_place)
         self._last_reprice_ts = self._strategy.current_timestamp
 
     def _resting_maker_orders(self) -> List[RestingOrder]:

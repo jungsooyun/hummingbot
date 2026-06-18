@@ -567,7 +567,12 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         for oid, rec in list(self._hedge_order_side.items()):
             tracked = self.hedge_orders.get(oid)
             side = rec[0] if isinstance(rec, tuple) else rec
-            if tracked is not None and tracked.order is not None and side != needed_side:
+            if (
+                tracked is not None
+                and tracked.order is not None
+                and not getattr(tracked.order, "is_done", False)
+                and side != needed_side
+            ):
                 self._strategy.cancel(self.hedge_connector, self.hedge_trading_pair, oid)
         if self._pending_hedge_signed == ZERO:
             return

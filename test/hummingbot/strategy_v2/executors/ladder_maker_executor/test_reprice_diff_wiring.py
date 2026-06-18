@@ -136,6 +136,32 @@ def test_inflight_maker_rung_not_double_placed():
     assert ex.maker_orders["OID-0"].order is None
 
 
+def test_inflight_close_not_double_placed_on_fair_move():
+    ex = _make_executor([_target(Side.BUY, "50.10")])
+
+    ex._reconcile_maker()
+    ex._compute_targets.return_value = [_target(Side.BUY, "50.13")]
+    ex._reconcile_maker()
+
+    ex._strategy.cancel.assert_not_called()
+    ex.place_order.assert_called_once()
+    assert list(ex.maker_orders) == ["OID-0"]
+    assert ex.maker_orders["OID-0"].order is None
+
+
+def test_inflight_close_not_double_placed_on_size_shift():
+    ex = _make_executor([_target(Side.BUY, "50.10", size="1")])
+
+    ex._reconcile_maker()
+    ex._compute_targets.return_value = [_target(Side.BUY, "50.10", size="0.5")]
+    ex._reconcile_maker()
+
+    ex._strategy.cancel.assert_not_called()
+    ex.place_order.assert_called_once()
+    assert list(ex.maker_orders) == ["OID-0"]
+    assert ex.maker_orders["OID-0"].order is None
+
+
 def test_untracked_maker_not_cancelled():
     ex = _make_executor([])
     ex.maker_orders["a"] = _Tracked("a", None)

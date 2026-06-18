@@ -78,6 +78,23 @@ def test_pending_zero_flip_cancels_stale_hedge():
     assert h.placed == before
 
 
+def test_pending_zero_does_not_cancel_filled_status_lag_hedge():
+    h = _H2Harness()
+    _maker_fill(h, "open-1", "2", TradeType.SELL)
+    h._process_hedges()
+    _created(h, "h0")
+    h.hedge_orders["h0"].order.is_done = True
+    assert h.hedge_orders["h0"].order.is_open is True
+
+    _maker_fill(h, "close-1", "2", TradeType.BUY)
+    before = list(h.placed)
+    h._process_hedges()
+
+    assert h._pending_hedge_signed == Decimal("0")
+    h._strategy.cancel.assert_not_called()
+    assert h.placed == before
+
+
 def test_same_direction_hedge_not_cancelled():
     h = _H2Harness()
     _maker_fill(h, "open-1", "2", TradeType.SELL)
