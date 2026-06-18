@@ -98,6 +98,10 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
 
     _logger = None
 
+    # Past this multiple of max_retries consecutive hedge failures, the hedge kill-switch
+    # escalates from "hold + keep retrying" to a hard FAILED stop (dead-venue backstop).
+    _HEDGE_HARD_STOP_FACTOR = 3
+
     @classmethod
     def logger(cls) -> HummingbotLogger:
         if cls._logger is None:
@@ -498,6 +502,20 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                 "Clear _hedge_kill_switch once the hedge venue recovers.",
                 self._current_retries, self._max_retries, self._pending_hedge_base,
             )
+        # Hard backstop: if the venue stays dead well past the trip, stop hammering it.
+        # The kill-switch keeps re-submitting a hedge every tick to recover in place; that
+        # is right for a TRANSIENT outage (a fill resets _current_retries long before this),
+        # but a truly dead venue would otherwise be hammered forever (worsening rate limits /
+        # lockouts) and _control_shutdown would hang on the same path. Past _HEDGE_HARD_STOP_
+        # FACTOR x max_retries consecutive failures, terminate (FAILED) as a last resort.
+        if self._current_retries > self._max_retries * self._HEDGE_HARD_STOP_FACTOR:
+            self.logger().error(
+                "Hedge failed %s consecutive times (> %sx max_retries): hedge venue appears "
+                "dead; stopping the executor (FAILED) to halt repeated submissions.",
+                self._current_retries, self._HEDGE_HARD_STOP_FACTOR,
+            )
+            self.close_type = CloseType.FAILED
+            self.stop()
 
     # ============================================================ balance / pnl
 

@@ -20,6 +20,7 @@ from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.cross_venue_he
     CrossVenueHedgedExecutorBase,
 )
 from hummingbot.strategy_v2.models.base import RunnableStatus
+from hummingbot.strategy_v2.models.executors import CloseType
 
 
 class _Inner:
@@ -96,8 +97,12 @@ class _Harness(CrossVenueHedgedExecutorBase):
     def get_in_flight_order(self, connector_name, order_id):
         return self.connector_orders.get(order_id)
 
+    def stop(self):  # bypass RunnableBase terminated.set()
+        self._status = RunnableStatus.TERMINATED
+
     # NOTE: evaluate_max_retries is the REAL base method now (trips _hedge_kill_switch,
-    # never terminates) — intentionally NOT stubbed so the kill-switch is tested faithfully.
+    # then hard-FAILED-stops past _HEDGE_HARD_STOP_FACTOR x max_retries) — intentionally
+    # NOT stubbed so the kill-switch is tested faithfully.
 
     # unused abstract hooks (needed only to make the ABC concrete)
     def _gates_open(self):
@@ -397,20 +402,31 @@ def test_hedge_fill_resets_consecutive_failure_streak():
     assert h._current_retries == 3 and h._hedge_kill_switch is False
 
 
-def test_persistent_terminal_hedge_failure_trips_kill_switch_and_keeps_hedging():
-    # reconcile dropping a terminal-unfilled hedge past max_retries trips the kill-switch
-    # (not terminate); hedging of the still-pending base continues.
+def test_dead_venue_hard_stops_after_kill_switch_to_halt_hammer():
+    # A truly dead venue (failures well past the trip) must escalate from "hold + keep
+    # retrying" to a hard FAILED stop, so it does not re-submit a hedge every tick forever.
+    h = _Harness()  # _max_retries = 3 -> hard stop at > 9
+    for i in range(10):  # 10 consecutive failures > 3*3
+        h.hedge_orders[f"h{i}"] = _Tracked(f"h{i}")
+        h.process_order_failed_event(None, None, _Ev(f"h{i}", "0"))
+    assert h._hedge_kill_switch is True  # tripped earlier
+    assert h.status == RunnableStatus.TERMINATED  # hard backstop fired
+    assert h.close_type == CloseType.FAILED
+
+
+def test_kill_switch_tripped_but_executor_keeps_hedging_pending():
+    # past max_retries (but below the hard stop), the kill-switch is tripped yet the
+    # executor stays RUNNING and keeps hedging the outstanding pending in place.
     h = _Harness()
-    h._max_retries = 0  # first failure trips it
-    _maker_fill(h, "m0", "2.0")
-    h._process_hedges()  # place h0(2); order None
-    cx = h.connector_orders["h0"]
-    cx.executed_amount_base = Decimal("0")
-    cx.is_open = False  # terminal unfilled -> reconcile retry -> trip
-    h._process_hedges()
+    h._max_retries = 2  # trip at > 2; hard stop at > 6
+    _maker_fill(h, "m0", "2.0")  # pending 2
+    for i in range(3):  # 3 consecutive failures -> trip, NOT hard-stop
+        h.hedge_orders[f"f{i}"] = _Tracked(f"f{i}")
+        h.process_order_failed_event(None, None, _Ev(f"f{i}", "0"))
     assert h._hedge_kill_switch is True
-    assert h.status == RunnableStatus.RUNNING  # NOT terminated
-    assert h.placed[-1] == ("h1", Decimal("2"))  # keeps hedging the pending
+    assert h.status == RunnableStatus.RUNNING  # NOT terminated (below hard stop)
+    h._process_hedges()  # keeps hedging the still-pending base
+    assert h.placed[-1][1] == Decimal("2")
 
 
 def test_terminal_filled_nan_price_does_not_poison_quote():
