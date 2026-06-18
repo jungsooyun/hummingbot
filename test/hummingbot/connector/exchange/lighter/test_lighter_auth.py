@@ -1,64 +1,74 @@
 import asyncio
-import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest import TestCase
+from unittest.mock import patch
 
 from hummingbot.connector.exchange.lighter.lighter_auth import LighterAuth
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest, WSJSONRequest
 
 
-class TestLighterAuth(unittest.TestCase):
-    def setUp(self):
-        self.api_key = "test_private_key_hex"
-        self.account_index = 1
-        self.auth = LighterAuth(
-            api_key=self.api_key,
-            account_index=self.account_index,
+class MockSignerClient:
+    def __init__(self):
+        self.calls = 0
+
+    def create_auth_token_with_expiry(self, deadline, api_key_index):
+        self.calls += 1
+        return f"token-{self.calls}", None
+
+
+class LighterAuthTests(TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.signer_client = MockSignerClient()
+        self.auth = LighterAuth(signer_client=self.signer_client, api_key_index=9)
+
+    def async_run_with_timeout(self, coroutine, timeout: int = 1):
+        return asyncio.run(asyncio.wait_for(coroutine, timeout))
+
+    @patch("hummingbot.connector.exchange.lighter.lighter_auth.time.time")
+    def test_rest_authenticate_adds_auth_header_and_param(self, time_mock):
+        time_mock.return_value = 1000
+        request = RESTRequest(
+            method=RESTMethod.GET,
+            url="https://api.lighter.xyz/account",
+            headers={},
+            params={"account_index": 1},
+            is_auth_required=True,
         )
 
-    def test_rest_authenticate_get_request_no_change(self):
-        """GET requests should pass through without modification."""
-        request = RESTRequest(method=RESTMethod.GET, url="https://example.com/api/v1/orderBooks")
-        loop = asyncio.get_event_loop()
-        authenticated = loop.run_until_complete(self.auth.rest_authenticate(request))
-        self.assertEqual(authenticated.url, request.url)
+        authenticated_request = self.async_run_with_timeout(self.auth.rest_authenticate(request))
 
-    def test_account_index_property(self):
-        """Should expose account_index for use in queries."""
-        self.assertEqual(self.auth.account_index, 1)
+        self.assertEqual("token-1", authenticated_request.headers["authorization"])
+        self.assertEqual("token-1", authenticated_request.params["auth"])
+        self.assertEqual(1, self.signer_client.calls)
 
-    def test_api_key_stored(self):
-        """Should store api_key for signer client initialization."""
-        self.assertEqual(self.auth.api_key, self.api_key)
+    @patch("hummingbot.connector.exchange.lighter.lighter_auth.time.time")
+    def test_ws_authenticate_adds_auth_payload(self, time_mock):
+        time_mock.return_value = 1000
+        request = WSJSONRequest(payload={"type": "subscribe", "channel": "account_all_trades/1"})
 
-    def test_auth_token_generation(self):
-        """Should generate auth token via signer client."""
-        mock_signer = MagicMock()
-        mock_signer.create_auth_token_with_expiry = AsyncMock(return_value="test_token_123")
-        self.auth._signer_client = mock_signer
-        loop = asyncio.get_event_loop()
-        token = loop.run_until_complete(self.auth.get_auth_token())
-        self.assertEqual(token, "test_token_123")
+        authenticated_request = self.async_run_with_timeout(self.auth.ws_authenticate(request))
 
-    def test_ws_authenticate_passthrough(self):
-        """WS auth should pass through (no pre-auth needed)."""
-        request = MagicMock()
-        loop = asyncio.get_event_loop()
-        result = loop.run_until_complete(self.auth.ws_authenticate(request))
-        self.assertEqual(result, request)
+        self.assertEqual("token-1", authenticated_request.payload["auth"])
+        self.assertEqual(1, self.signer_client.calls)
 
-    def test_signer_client_initially_none(self):
-        """Signer client should be None until explicitly set."""
-        self.assertIsNone(self.auth.signer_client)
+    @patch("hummingbot.connector.exchange.lighter.lighter_auth.time.time")
+    def test_get_auth_token_reuses_cached_token_before_refresh_window(self, time_mock):
+        time_mock.side_effect = [1000, 1000, 1200]
 
-    def test_auth_token_returns_empty_without_signer(self):
-        """Without signer client, get_auth_token should return empty string."""
-        loop = asyncio.get_event_loop()
-        token = loop.run_until_complete(self.auth.get_auth_token())
-        self.assertEqual(token, "")
+        token_one = self.async_run_with_timeout(self.auth._get_auth_token())
+        token_two = self.async_run_with_timeout(self.auth._get_auth_token())
 
-    def test_rest_authenticate_returns_same_request_object(self):
-        """rest_authenticate should return the exact same request object."""
-        request = RESTRequest(method=RESTMethod.POST, url="https://example.com/api/v1/order")
-        loop = asyncio.get_event_loop()
-        result = loop.run_until_complete(self.auth.rest_authenticate(request))
-        self.assertIs(result, request)
+        self.assertEqual("token-1", token_one)
+        self.assertEqual(token_one, token_two)
+        self.assertEqual(1, self.signer_client.calls)
+
+    @patch("hummingbot.connector.exchange.lighter.lighter_auth.time.time")
+    def test_get_auth_token_refreshes_when_expiring(self, time_mock):
+        time_mock.side_effect = [1000, 1000, 1571, 1571]
+
+        token_one = self.async_run_with_timeout(self.auth._get_auth_token())
+        token_two = self.async_run_with_timeout(self.auth._get_auth_token())
+
+        self.assertEqual("token-1", token_one)
+        self.assertEqual("token-2", token_two)
+        self.assertEqual(2, self.signer_client.calls)
