@@ -322,9 +322,109 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
         self._set_trading_pair_symbol_map(mapping)
 
     async def _user_stream_event_listener(self):
-        # 4a/4b: no-op; WebSocket exec notifications added in slice 5.
+        """Process H0IFCNI0 execution-notification events from the user stream DS.
+
+        oder_kind2 values:
+          '0' — 체결통보 (fill); build TradeUpdate via cntg_qty + cntg_unpr.
+          'L' — 주문·정정·취소·거부 접수통보; derive OrderState and build OrderUpdate.
+
+        Best-effort: malformed or unrecognised events are logged and dropped —
+        the listener must never crash.  Fills are also reconciled by the REST
+        ccnl poll in _all_trade_updates_for_order so there is no single point
+        of failure.
+        """
         async for event_message in self._iter_user_event_queue():
-            pass
+            try:
+                event_type = event_message.get("type", "")
+                if event_type != "execution_notification":
+                    continue
+
+                data = event_message.get("data", {})
+                oder_kind2 = data.get("oder_kind2", "")
+                oder_no = data.get("oder_no", "")
+                code = data.get("stck_shrn_iscd", "")
+
+                tracked_order = self._find_tracked_order_by_exchange_id(oder_no)
+                if tracked_order is None:
+                    # Possibly an order from a previous connector session — skip.
+                    continue
+
+                if oder_kind2 == "0":
+                    # --- fill ---
+                    try:
+                        fill_qty = Decimal(str(data.get("cntg_qty", "0")))
+                        fill_price = Decimal(str(data.get("cntg_unpr", "0")))
+                    except (InvalidOperation, ValueError):
+                        self.logger().warning(
+                            f"[kis_futures] malformed fill qty/price in exec-notice "
+                            f"oder_no={oder_no}: {data}"
+                        )
+                        continue
+
+                    fill_amount = fill_qty * fill_price
+                    fee = TradeFeeBase.new_perpetual_fee(
+                        fee_schema=self.trade_fee_schema(),
+                        position_action=PositionAction.OPEN,
+                        percent_token=tracked_order.quote_asset,
+                        flat_fees=[],
+                    )
+                    trade_update = TradeUpdate(
+                        trade_id=f"{oder_no}_{data.get('stck_cntg_hour', '')}",
+                        client_order_id=tracked_order.client_order_id,
+                        exchange_order_id=oder_no,
+                        trading_pair=tracked_order.trading_pair,
+                        fee=fee,
+                        fill_base_amount=fill_qty,
+                        fill_quote_amount=fill_amount,
+                        fill_price=fill_price,
+                        fill_timestamp=self.current_timestamp,
+                    )
+                    self._order_tracker.process_trade_update(trade_update)
+
+                elif oder_kind2 == "L":
+                    # --- order lifecycle ---
+                    rfus_yn = data.get("rfus_yn", "N")
+                    acpt_yn = data.get("acpt_yn", "N")
+                    rctf_cls = data.get("rctf_cls", "")
+
+                    if rfus_yn == "Y":
+                        new_state = OrderState.FAILED
+                    elif acpt_yn == "Y":
+                        # rctf_cls "02" = cancel; otherwise new/revise acceptance
+                        new_state = OrderState.CANCELED if rctf_cls == "02" else OrderState.OPEN
+                    else:
+                        # Neither confirmed accepted nor rejected — ignore.
+                        continue
+
+                    order_update = OrderUpdate(
+                        client_order_id=tracked_order.client_order_id,
+                        exchange_order_id=oder_no,
+                        trading_pair=tracked_order.trading_pair,
+                        update_timestamp=self.current_timestamp,
+                        new_state=new_state,
+                    )
+                    self._order_tracker.process_order_update(order_update)
+
+                else:
+                    self.logger().warning(
+                        f"[kis_futures] unknown oder_kind2={oder_kind2!r} in exec-notice "
+                        f"oder_no={oder_no} — skipping"
+                    )
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().exception(
+                    "[kis_futures] unexpected error in user stream event listener"
+                )
+                await self._sleep(1.0)
+
+    def _find_tracked_order_by_exchange_id(self, exchange_order_id: str) -> Optional[InFlightOrder]:
+        """Return the in-flight order matching exchange_order_id, or None."""
+        for order in self._order_tracker.active_orders.values():
+            if order.exchange_order_id == exchange_order_id:
+                return order
+        return None
 
     # ------------------------------------------------------------------
     # Network check (mirror KIS spot)
