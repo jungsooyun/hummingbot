@@ -354,6 +354,20 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             return self._maker_executed_quote / self._maker_executed_base
         return ZERO
 
+    def _hedge_base_to_maker_base(self, amount: Decimal) -> Decimal:
+        """Convert a hedge-leg base amount (e.g. KIS shares) into maker-leg base units.
+
+        Default identity (1 hedge unit == 1 maker unit). ``LadderMakerExecutor`` overrides
+        to divide by ``share_per_unit`` so the signed inventory ledgers (``_spot_net`` /
+        ``_pending_hedge_signed``) net against ``_perp_net`` in the SAME unit. Without this
+        seam a ``share_per_unit != 1`` hedge fill would credit shares into a units-denominated
+        signed pending queue and flip its sign (the old non-negative ``_pending_hedge_base``
+        masked this by clamping at 0). The notional accumulators (``_hedge_executed_*`` /
+        ``_spot_cash``) intentionally keep the RAW hedge amount — they are money, not delta
+        units — so legacy matched PnL stays byte-identical.
+        """
+        return amount
+
     def _maker_fill_side(self, event: OrderFilledEvent) -> TradeType:
         return getattr(event, "trade_type", None) or self.entry_side
 
@@ -370,11 +384,14 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self._hedge_sell_base += amount
 
     def _record_open_edge(self, order_id: str, side: TradeType, amount: Decimal) -> None:
-        if side == TradeType.SELL:
+        # Opening = a maker fill in the entry direction (accumulate basis); closing = the
+        # opposite side (consume basis at average cost). Keyed off entry_side, not a
+        # hardcoded SELL, so a BUY-open (long-biased) two-sided executor is correct too.
+        if side == self.entry_side:
             placed_edge = self._maker_placed_edge_bps.get(order_id, ZERO)
             self._open_edge_base += amount
             self._open_edge_notional_bps += placed_edge * amount
-        elif side == TradeType.BUY and self._open_edge_base > ZERO:
+        elif self._open_edge_base > ZERO:
             close_amount = min(amount, self._open_edge_base)
             self._open_edge_notional_bps -= self._open_edge_vwap * close_amount
             self._open_edge_base -= close_amount
@@ -394,8 +411,10 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
 
     def _credit_hedge_fill(self, order_id: str, amount: Decimal, price: Optional[Decimal]) -> None:
         side = self._hedge_fill_side(order_id)
+        # Notional/legacy accumulators use the RAW hedge amount (money + byte-identical
+        # legacy matched PnL); the signed delta ledgers use maker-unit-converted base so
+        # _spot_net nets against _perp_net in one unit (see _hedge_base_to_maker_base).
         self._hedge_executed_base += amount
-        self._record_hedge_fill_side(side, amount)
         if price is not None and not price.is_nan():
             self._hedge_executed_quote += amount * price
             self._spot_cash += (
@@ -403,7 +422,9 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                 * amount
                 * (ONE if side == TradeType.SELL else -ONE)
             )
-        self._pending_hedge_signed += self._signed_base(side, amount)
+        maker_base = self._hedge_base_to_maker_base(amount)
+        self._record_hedge_fill_side(side, maker_base)
+        self._pending_hedge_signed += self._signed_base(side, maker_base)
 
     def _reconcile_stuck_hedges(self) -> None:
         """Resolve hedge orders stuck with ``order is None`` (lost-lifecycle-event guard).
@@ -602,6 +623,10 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         elif event.order_id in self.hedge_orders:
             self._update_tracked(self.hedge_connector, event.order_id)
             self._hedge_fees_quote += self.hedge_orders[event.order_id].cum_fees_quote
+            # Drop the completed hedge from BOTH books together. Leaving it in hedge_orders
+            # while popping its recorded side let a stray post-completion fill credit at the
+            # default self.hedge_side (wrong after a two-sided sign flip) and leaked the dict.
+            self.hedge_orders.pop(event.order_id, None)
             self._hedge_order_side.pop(event.order_id, None)
 
     def process_order_canceled_event(self, _, market, event: OrderCancelledEvent):
