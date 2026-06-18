@@ -94,6 +94,10 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
         self._roll_pending: Dict = {}
         self._order_acks: Dict = {}
 
+        # Set True after the FIRST successful _update_positions poll.
+        # Prevents an unsafe auto-roll before cached positions are confirmed.
+        self._positions_polled_once: bool = False
+
         # super().__init__ builds DS factories — all instance state must be ready before.
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
@@ -355,7 +359,9 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
         return int(amount)
 
     def _format_price(self, price: Decimal, trading_pair: str) -> str:
-        """Format price as a plain integer string aligned to tick; raise if misaligned."""
+        """Format price as a plain integer string aligned to tick; raise if misaligned or non-positive."""
+        if price <= 0:
+            raise ValueError(f"kis_futures price must be positive: {price}")
         tick = self._trading_rules[trading_pair].min_price_increment
         if (price % tick) != 0:
             raise ValueError(
@@ -518,6 +524,8 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
         for k in list(self._perpetual_trading.account_positions.keys()):
             if k not in seen:
                 self._perpetual_trading.remove_position(k)
+        # Mark that at least one positions poll has completed; enables safe roll detection.
+        self._positions_polled_once = True
 
     async def _update_balances(self):
         resp = await self._fetch_balance()
@@ -586,8 +594,7 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
                     return row
         return rows[0]
 
-    @staticmethod
-    def _infer_order_state(row: Dict[str, Any], order: InFlightOrder) -> OrderState:
+    def _infer_order_state(self, row: Dict[str, Any], order: InFlightOrder) -> OrderState:
         """Derive state from a KIS ccnl output1 row.
 
         Fields: tot_ccld_qty (cumulative filled), ord_qty, cncl_yn.
@@ -596,6 +603,10 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
             ccld_qty = Decimal(str(row.get("tot_ccld_qty", "0") or "0"))
             ord_qty = Decimal(str(row.get("ord_qty", "0") or "0"))
         except (InvalidOperation, ValueError, TypeError):
+            self.logger().warning(
+                f"[kis_futures] _infer_order_state: malformed numeric field in ccnl row "
+                f"for order {order.client_order_id} — defaulting to OPEN. row={row}"
+            )
             return OrderState.OPEN
 
         if str(row.get("cncl_yn", "N")).upper() == "Y":
@@ -644,6 +655,10 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
                 cum_filled = Decimal(str(row.get("tot_ccld_qty", "0") or "0"))
                 avg_price = Decimal(str(row.get("avg_idx", "0") or "0"))
             except (InvalidOperation, ValueError, TypeError):
+                self.logger().warning(
+                    f"[kis_futures] _create_order_fill_updates: malformed numeric field "
+                    f"for order {order.client_order_id} — skipping row. row={row}"
+                )
                 continue
             if cum_filled <= Decimal("0"):
                 continue
@@ -746,15 +761,23 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
                     o.trading_pair == pair
                     for o in self._order_tracker.active_orders.values()
                 )
-                if RemapGuard().can_remap(has_open, self._position_amount(pair)):
+                # Fail-closed: do NOT auto-switch until at least one _update_positions
+                # poll has confirmed the cached position state.  On fresh start the
+                # positions cache is empty and looks flat — switching here could drop
+                # an existing old-contract position silently.
+                if self._positions_polled_once and RemapGuard().can_remap(has_open, self._position_amount(pair)):
                     self._contract_by_pair[pair] = fc
                     self._roll_pending[pair] = False
                     self._pending_front.pop(pair, None)
                 else:
                     self._roll_pending[pair] = True
                     self._pending_front[pair] = fc
+                    reason = (
+                        "positions not yet polled — deferring roll until first _update_positions"
+                        if not self._positions_polled_once
+                        else "open orders or non-zero position — flatten to roll"
+                    )
                     self.logger().warning(
                         f"[kis_futures] roll pending {pair}: "
-                        f"{cur.short_code}->{fc.short_code}; "
-                        "flatten position and cancel all orders to roll."
+                        f"{cur.short_code}->{fc.short_code}; {reason}."
                     )

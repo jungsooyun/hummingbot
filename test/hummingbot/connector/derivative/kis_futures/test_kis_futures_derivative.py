@@ -480,31 +480,31 @@ def test_update_positions_zero_qty_removed():
 # ---------------------------------------------------------------------------
 
 def test_infer_order_state_filled():
-    from hummingbot.connector.derivative.kis_futures.kis_futures_derivative import KisFuturesDerivative
+    c = _make_connector()
     order = MagicMock()
     row = {"tot_ccld_qty": "3", "ord_qty": "3", "cncl_yn": "N"}
-    assert KisFuturesDerivative._infer_order_state(row, order) == OrderState.FILLED
+    assert c._infer_order_state(row, order) == OrderState.FILLED
 
 
 def test_infer_order_state_partially_filled():
-    from hummingbot.connector.derivative.kis_futures.kis_futures_derivative import KisFuturesDerivative
+    c = _make_connector()
     order = MagicMock()
     row = {"tot_ccld_qty": "1", "ord_qty": "3", "cncl_yn": "N"}
-    assert KisFuturesDerivative._infer_order_state(row, order) == OrderState.PARTIALLY_FILLED
+    assert c._infer_order_state(row, order) == OrderState.PARTIALLY_FILLED
 
 
 def test_infer_order_state_open():
-    from hummingbot.connector.derivative.kis_futures.kis_futures_derivative import KisFuturesDerivative
+    c = _make_connector()
     order = MagicMock()
     row = {"tot_ccld_qty": "0", "ord_qty": "3", "cncl_yn": "N"}
-    assert KisFuturesDerivative._infer_order_state(row, order) == OrderState.OPEN
+    assert c._infer_order_state(row, order) == OrderState.OPEN
 
 
 def test_infer_order_state_canceled():
-    from hummingbot.connector.derivative.kis_futures.kis_futures_derivative import KisFuturesDerivative
+    c = _make_connector()
     order = MagicMock()
     row = {"tot_ccld_qty": "0", "ord_qty": "3", "cncl_yn": "Y"}
-    assert KisFuturesDerivative._infer_order_state(row, order) == OrderState.CANCELED
+    assert c._infer_order_state(row, order) == OrderState.CANCELED
 
 
 def test_match_ccld_row_by_odno():
@@ -657,9 +657,11 @@ def test_resolve_front_months_roll_pending_with_open_orders():
 
 
 def test_resolve_front_months_roll_executes_when_flat():
-    """New front month + flat + no orders → code switches, roll cleared."""
+    """New front month + flat + no orders + positions_polled_once=True → code switches."""
     c = _make_connector()
     c._contract_by_pair["005930-KRW"] = _make_contract(short_code="A11607", expiry="202607")
+    # Mark positions as having been polled at least once (I2 requirement).
+    c._positions_polled_once = True
 
     new_master_bytes = (
         "1|A11608|KR4A11680001|삼성전자   F 202608 (  10)| |00000.00|1|005930|삼성전자\n"
@@ -686,3 +688,130 @@ def test_roll_accessors():
     assert c.expiry_yyyymm("005930-KRW") == "202607"
     assert c.is_roll_pending("005930-KRW") is False
     assert c.roll_pending_pairs == []
+
+
+# ---------------------------------------------------------------------------
+# I1: _format_price positive guard
+# ---------------------------------------------------------------------------
+
+def test_format_price_negative_raises():
+    """Negative price must raise ValueError before tick alignment check."""
+    c = _make_connector()
+    _patch_trading_rule(c, tick=Decimal("5"))
+    with pytest.raises(ValueError, match="must be positive"):
+        c._format_price(Decimal("-5"), "005930-KRW")
+
+
+def test_format_price_zero_raises():
+    """Zero price must raise ValueError."""
+    c = _make_connector()
+    _patch_trading_rule(c, tick=Decimal("5"))
+    with pytest.raises(ValueError, match="must be positive"):
+        c._format_price(Decimal("0"), "005930-KRW")
+
+
+# ---------------------------------------------------------------------------
+# I2: fail-closed roll when _positions_polled_once=False
+# ---------------------------------------------------------------------------
+
+def test_resolve_front_months_no_roll_before_positions_polled():
+    """New front code + positions_polled_once=False → roll stays pending, code NOT switched."""
+    c = _make_connector()
+    c._contract_by_pair["005930-KRW"] = _make_contract(short_code="A11607", expiry="202607")
+    # Explicitly ensure positions have NOT been polled yet (default).
+    c._positions_polled_once = False
+
+    new_master_bytes = (
+        "1|A11608|KR4A11680001|삼성전자   F 202608 (  10)| |00000.00|1|005930|삼성전자\n"
+    ).encode("cp949")
+
+    c._order_tracker._in_flight_orders = {}
+
+    async def _run():
+        with patch(
+            "hummingbot.connector.derivative.kis_futures.kis_futures_derivative.download_master",
+            new=AsyncMock(return_value=new_master_bytes),
+        ):
+            await c._resolve_front_months()
+
+    loop = asyncio.new_event_loop(); loop.run_until_complete(_run()); loop.close()
+    # Code must NOT have switched — old contract still in place.
+    assert c._contract_by_pair["005930-KRW"].short_code == "A11607"
+    assert c.is_roll_pending("005930-KRW") is True
+
+
+# ---------------------------------------------------------------------------
+# M6: exact wire body assertions for _place_order and _place_cancel
+# ---------------------------------------------------------------------------
+
+def test_place_order_wire_body_fields():
+    """Assert the exact POST body sent to FUT_ORDER_PATH.
+
+    aioresponses stores the body as a JSON string in call.kwargs['data'];
+    parse it back to dict for field-level assertions.
+    """
+    import json
+
+    c = _make_connector()
+    _inject_contract(c)
+
+    async def _run():
+        with aioresponses() as m:
+            m.post(
+                _re(CONSTANTS.FUT_ORDER_PATH),
+                payload={"rt_cd": "0", "msg1": "OK", "output": {"ODNO": "0000001111"}},
+            )
+            await c._place_order(
+                order_id="wire-body-test",
+                trading_pair="005930-KRW",
+                amount=Decimal("1"),
+                trade_type=TradeType.BUY,
+                order_type=OrderType.LIMIT,
+                price=Decimal("50000"),
+                position_action=PositionAction.OPEN,
+            )
+            calls = list(m.requests.values())
+            assert calls, "no POST request was captured"
+            call = calls[0][0]
+            raw = call.kwargs.get("json") or call.kwargs.get("data") or "{}"
+            return json.loads(raw) if isinstance(raw, str) else raw
+
+    loop = asyncio.new_event_loop()
+    sent = loop.run_until_complete(_run())
+    loop.close()
+
+    assert sent["SHTN_PDNO"] == "A11607"
+    assert sent["ORD_QTY"] == "1"
+    assert sent["SLL_BUY_DVSN_CD"] == "02"
+    assert sent["ORD_DVSN_CD"] == "01"
+    assert sent["NMPR_TYPE_CD"] == "01"
+    assert sent["UNIT_PRICE"] == "50000"
+
+
+def test_place_cancel_wire_body_fields():
+    """Assert the exact POST body sent to FUT_CANCEL_PATH."""
+    import json
+
+    c = _make_connector()
+    tracked = MagicMock()
+    tracked.exchange_order_id = "0000009999"
+
+    async def _run():
+        with aioresponses() as m:
+            m.post(
+                _re(CONSTANTS.FUT_CANCEL_PATH),
+                payload={"rt_cd": "0", "msg1": "OK", "output": {"ODNO": "9999"}},
+            )
+            await c._place_cancel("cancel-wire-test", tracked)
+            calls = list(m.requests.values())
+            assert calls, "no POST request was captured"
+            call = calls[0][0]
+            raw = call.kwargs.get("json") or call.kwargs.get("data") or "{}"
+            return json.loads(raw) if isinstance(raw, str) else raw
+
+    loop = asyncio.new_event_loop()
+    sent = loop.run_until_complete(_run())
+    loop.close()
+
+    assert sent["RVSE_CNCL_DVSN_CD"] == "02"
+    assert sent["ORGN_ODNO"] == "0000009999"
