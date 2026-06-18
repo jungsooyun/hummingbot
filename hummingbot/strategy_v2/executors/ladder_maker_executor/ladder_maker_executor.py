@@ -102,7 +102,10 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         # InventoryGate halts quoting once |unhedged| reaches max_inventory, so naked
         # exposure cannot grow past the config's "safety pin" (it previously only drove
         # price skew, never a hard stop). config.max_inventory <= 0 disables the hard cap.
-        _max_inv = self.config.max_inventory if self.config.max_inventory and self.config.max_inventory > ZERO else None
+        # NB: read the local ``config`` param, NOT ``self.config`` — the base class
+        # sets ``self.config`` inside ``super().__init__`` (below), so ``self.config``
+        # does not exist yet here. (Live regression: AttributeError on every action.)
+        _max_inv = config.max_inventory if config.max_inventory and config.max_inventory > ZERO else None
         self._gate_chain = GateChain([KillSwitchGate(), InventoryGate(_max_inv)])
         super().__init__(
             strategy=strategy,

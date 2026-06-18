@@ -1,0 +1,82 @@
+import unittest
+from decimal import Decimal
+from unittest.mock import MagicMock, patch
+
+from hummingbot.core.data_type.common import TradeType
+
+try:
+    # The executor module pulls the V2 strategy base (paho), absent in the local
+    # py312 env -> these tests run in Docker/CI where the full stack is available.
+    from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.cross_venue_hedged_executor_base import (
+        CrossVenueHedgedExecutorBase,
+    )
+    from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_maker_executor import (
+        LadderMakerExecutor,
+    )
+    from hummingbot.strategy_v2.gates.gate_chain import InventoryGate
+    _EXECUTOR_IMPORTABLE = True
+except Exception:  # pragma: no cover - env-dependent
+    LadderMakerExecutor = None
+    CrossVenueHedgedExecutorBase = None
+    InventoryGate = None
+    _EXECUTOR_IMPORTABLE = False
+
+
+def _mock_config(max_inventory):
+    cfg = MagicMock()
+    cfg.max_inventory = max_inventory
+    # super().__init__ reads these off the LOCAL ``config`` param (not self.config).
+    cfg.maker_market = MagicMock()
+    cfg.hedge_market = MagicMock()
+    cfg.entry_side = TradeType.SELL
+    cfg.fx_connector = "upbit"
+    return cfg
+
+
+@unittest.skipUnless(_EXECUTOR_IMPORTABLE, "ladder_maker_executor requires the V2 stack (paho) — run in Docker/CI")
+class LadderMakerInitTest(unittest.TestCase):
+    """Regression for the __init__ ordering bug.
+
+    ``__init__`` built the gate chain from ``self.config.max_inventory`` BEFORE
+    ``super().__init__`` assigned ``self.config``, so constructing the executor
+    raised ``AttributeError: 'LadderMakerExecutor' object has no attribute 'config'``
+    on every controller action — the EC2 Samsung observe crashed once per second and
+    never placed/observed a single rung. The fix reads the local ``config`` parameter.
+
+    Every other executor test builds the object with ``LadderMakerExecutor.__new__`` +
+    manual attribute injection, so NONE exercised the real ``__init__`` ordering. This
+    test calls the real constructor (with the heavy base ``__init__`` stubbed) so the
+    bug cannot silently return.
+    """
+
+    def _construct(self, max_inventory):
+        captured = {}
+
+        def fake_base_init(self, **kwargs):
+            # The base assigns self.config — and it runs AFTER the gate-chain build,
+            # so any pre-super ``self.config`` read still raises (RED on the old code).
+            captured.update(kwargs)
+            self.config = kwargs.get("config")
+
+        with patch.object(CrossVenueHedgedExecutorBase, "__init__", fake_base_init):
+            ex = LadderMakerExecutor(strategy=MagicMock(), config=_mock_config(max_inventory))
+        return ex, captured
+
+    def test_init_does_not_read_self_config_before_super(self):
+        # Must NOT raise AttributeError; the composable gate chain must be built.
+        ex, captured = self._construct(Decimal("8"))
+        self.assertIsNotNone(ex._gate_chain)
+        # config flowed into super().__init__ unchanged.
+        self.assertEqual(captured["config"].max_inventory, Decimal("8"))
+
+    def test_inventory_gate_cap_wired_from_config(self):
+        ex, _ = self._construct(Decimal("8"))
+        inv_gates = [g for g in ex._gate_chain._gates if isinstance(g, InventoryGate)]
+        self.assertEqual(len(inv_gates), 1)
+        self.assertEqual(inv_gates[0]._max_inventory, Decimal("8"))
+
+    def test_nonpositive_max_inventory_disables_inventory_cap(self):
+        ex, _ = self._construct(Decimal("0"))
+        inv_gates = [g for g in ex._gate_chain._gates if isinstance(g, InventoryGate)]
+        self.assertEqual(len(inv_gates), 1)
+        self.assertIsNone(inv_gates[0]._max_inventory)
