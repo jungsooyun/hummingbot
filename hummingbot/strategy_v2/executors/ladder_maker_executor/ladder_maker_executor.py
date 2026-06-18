@@ -234,8 +234,13 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
                 current_position=self._maker_executed_base,
             )
         state = self._two_sided_state()
+        close_side = Side.BUY if side is Side.SELL else Side.SELL
+        fair_close = self._compute_fair(close_side)
+        if fair_close is None:
+            return []
         tst: TwoSidedTargets = build_two_sided_targets(
-            fair=fair,
+            fair_open=fair,
+            fair_close=fair_close,
             rungs=rungs,
             total_size_cap=self.config.total_size_cap,
             net_position=state["Q"],

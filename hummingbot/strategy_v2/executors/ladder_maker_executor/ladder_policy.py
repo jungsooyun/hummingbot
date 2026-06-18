@@ -181,7 +181,8 @@ def build_ladder_targets(
 
 def build_two_sided_targets(
     *,
-    fair: Decimal,
+    fair_open: Decimal,
+    fair_close: Decimal,
     rungs: List[RungSpec],
     total_size_cap: Decimal,
     net_position: Decimal,
@@ -211,7 +212,7 @@ def build_two_sided_targets(
             if qty <= ZERO:
                 continue
             edge_sell = half_cost + rung.edge_bps + k_open_skew_bps * util
-            price_sell = ceil_to_tick(fair * (ONE + edge_sell / BPS) + buffer, tick)
+            price_sell = ceil_to_tick(fair_open * (ONE + edge_sell / BPS) + buffer, tick)
             open_targets.append(RungTarget(side=Side.SELL, price=price_sell, size=qty, edge_bps=edge_sell))
             open_remaining -= qty
 
@@ -226,7 +227,7 @@ def build_two_sided_targets(
                 continue
             edge_buy = half_cost + rung.edge_bps - k_close_skew_bps * util - eod_close_skew_bps * eod_pressure
             edge_buy = max(edge_buy, break_even_buy_edge)
-            price_buy = floor_to_tick(fair * (ONE - edge_buy / BPS) - buffer, tick)
+            price_buy = floor_to_tick(fair_close * (ONE - edge_buy / BPS) - buffer, tick)
             close_targets.append(RungTarget(side=Side.BUY, price=price_buy, size=qty, edge_bps=edge_buy))
             close_remaining -= qty
 

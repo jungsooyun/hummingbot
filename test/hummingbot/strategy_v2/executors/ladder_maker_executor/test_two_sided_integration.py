@@ -19,6 +19,8 @@ except Exception:  # pragma: no cover - env-dependent
 
 
 KST = timezone(timedelta(hours=9))
+FAIR_OPEN = Decimal("80100") / Decimal("1380")   # SELL fair 58.0435...
+FAIR_CLOSE = Decimal("80000") / Decimal("1381")  # BUY fair  57.9290...
 
 
 class _Tracked:
@@ -111,7 +113,9 @@ class LadderMakerTwoSidedIntegrationTest(unittest.TestCase):
         ex._open_edge_notional_bps = Decimal("0")
         ex._open_edge_vwap = open_edge_vwap
         ex._update_tracked = MagicMock()
-        ex._compute_fair = MagicMock(return_value=Decimal("100"))
+        ex._compute_fair = MagicMock(
+            side_effect=lambda side: FAIR_OPEN if side is Side.SELL else FAIR_CLOSE
+        )
         ex._policy_side = MagicMock(return_value=Side.SELL)
         ex._strategy = SimpleNamespace(current_timestamp=current_timestamp)
         return ex
@@ -184,6 +188,16 @@ class LadderMakerTwoSidedIntegrationTest(unittest.TestCase):
         self.assertEqual([Side.BUY], [target.side for target in targets])
         self.assertEqual([Decimal("1")], [target.size for target in targets])
 
+    def test_two_sided_close_fair_missing_returns_no_targets(self):
+        # Spec case 5: fair_close is None -> fail-closed, no targets (not open-only).
+        ex = self._make_executor()
+        ex._maker_sell_base = Decimal("1")
+        ex._hedge_buy_base = Decimal("1")
+        ex._compute_fair = MagicMock(
+            side_effect=lambda side: FAIR_OPEN if side is Side.SELL else None
+        )
+        self.assertEqual([], ex._compute_targets())
+
     def test_eod_ramp_shifts_close_under_budget(self):
         timestamp = datetime(2026, 6, 18, 15, 20, 0, tzinfo=KST).timestamp()
         baseline = self._make_executor(
@@ -211,10 +225,12 @@ class LadderMakerTwoSidedIntegrationTest(unittest.TestCase):
         )
 
         self.assertEqual(Decimal("0.5"), eod._two_sided_state()["eod"])
-        self.assertEqual(Decimal("99.87"), baseline_close.price)
+        # JEP-169: close prices now anchor to FAIR_CLOSE (80000/1381), not the entry
+        # SELL fair (80100/1380). The ~19.76 bps drop is the intended close-side fix.
+        self.assertEqual(Decimal("57.85"), baseline_close.price)   # floor(FAIR_CLOSE*(1-13/1e4))
         self.assertEqual(Decimal("-3"), budget_floor)
         self.assertEqual(budget_floor, eod_close.edge_bps)
-        self.assertEqual(Decimal("100.03"), eod_close.price)
+        self.assertEqual(Decimal("57.94"), eod_close.price)        # floor(FAIR_CLOSE*(1-(-3)/1e4))
         self.assertNotEqual(baseline_close.price, eod_close.price)
         self.assertEqual(
             -eod.config.max_close_cost_bps,
