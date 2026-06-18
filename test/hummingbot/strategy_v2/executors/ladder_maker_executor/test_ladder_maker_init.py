@@ -1,6 +1,7 @@
+import asyncio
 import unittest
 from decimal import Decimal
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from hummingbot.core.data_type.common import TradeType
 
@@ -80,3 +81,37 @@ class LadderMakerInitTest(unittest.TestCase):
         inv_gates = [g for g in ex._gate_chain._gates if isinstance(g, InventoryGate)]
         self.assertEqual(len(inv_gates), 1)
         self.assertIsNone(inv_gates[0]._max_inventory)
+
+
+@unittest.skipUnless(_EXECUTOR_IMPORTABLE, "ladder_maker_executor requires the V2 stack (paho) — run in Docker/CI")
+class LadderMakerBalanceValidationTest(unittest.TestCase):
+    """Regression for the observe balance-validation bug.
+
+    ``on_start()`` calls ``validate_sufficient_balance()``. The base implementation sizes
+    a PerpetualOrderCandidate at the FULL ``total_size_cap`` and, on an underfunded maker
+    account, stops the executor (``CloseType.INSUFFICIENT_BALANCE``) — before it ever
+    quotes. In observe mode (zero real orders) that balance is irrelevant, so the ladder
+    must SKIP the check; otherwise observe silently terminates every tick and never logs a
+    rung (JEP-162 live regression: executor created then immediately TERMINATED, active=0).
+    No prior test exercised the on_start balance path.
+    """
+
+    @staticmethod
+    def _exec(observe):
+        ex = LadderMakerExecutor.__new__(LadderMakerExecutor)
+        ex.config = MagicMock(observe=observe)
+        return ex
+
+    def test_observe_skips_maker_balance_validation(self):
+        ex = self._exec(observe=True)
+        with patch.object(CrossVenueHedgedExecutorBase, "validate_sufficient_balance",
+                          new_callable=AsyncMock) as base_check:
+            asyncio.run(LadderMakerExecutor.validate_sufficient_balance(ex))
+        base_check.assert_not_called()
+
+    def test_live_mode_runs_maker_balance_validation(self):
+        ex = self._exec(observe=False)
+        with patch.object(CrossVenueHedgedExecutorBase, "validate_sufficient_balance",
+                          new_callable=AsyncMock) as base_check:
+            asyncio.run(LadderMakerExecutor.validate_sufficient_balance(ex))
+        base_check.assert_called_once()

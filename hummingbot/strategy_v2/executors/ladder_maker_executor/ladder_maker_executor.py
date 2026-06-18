@@ -365,3 +365,14 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             price=fair,
             leverage=Decimal(str(self.config.leverage)),
         )
+
+    async def validate_sufficient_balance(self):
+        # Observe (no-submit) places ZERO real orders, so maker-leg balance is irrelevant.
+        # The base check sizes a PerpetualOrderCandidate at the FULL total_size_cap and, on
+        # an underfunded maker account, stops the executor (CloseType.INSUFFICIENT_BALANCE)
+        # inside on_start() — before it ever quotes — so observe would silently never run.
+        # (JEP-162 live regression: executor created then immediately TERMINATED every tick,
+        # _gates_open never reached.)
+        if self.config.observe:
+            return
+        await super().validate_sufficient_balance()
