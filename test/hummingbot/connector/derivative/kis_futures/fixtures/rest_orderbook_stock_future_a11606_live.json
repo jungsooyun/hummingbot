@@ -1,0 +1,43 @@
+{
+  "fixture_metadata": {
+    "fixture_provenance": "redacted_live_response",
+    "source_reference": "gate6c-live-readonly-validation:20260521T102035Z",
+    "source_commit": "33e0e1e65cd1c8c8b639531483ec0b327087bab1",
+    "refreshed_at_utc": "2026-05-21T01:20:35+00:00",
+    "synthetic_or_captured": "captured"
+  },
+  "tr_id": "FHMIF10010000",
+  "route": "DAY_DERIVATIVE",
+  "request": {
+    "FID_COND_MRKT_DIV_CODE": "JF",
+    "FID_INPUT_ISCD": "A11606"
+  },
+  "output1": {
+    "futs_shrn_iscd": "A11606",
+    "bsop_date": "20260521",
+    "bsop_hour": "102035"
+  },
+  "output2": {
+    "futs_askp1": "294500",
+    "futs_bidp1": "294000",
+    "askp_rsqn1": "55",
+    "bidp_rsqn1": "74",
+    "futs_askp2": "295000",
+    "futs_bidp2": "293500",
+    "askp_rsqn2": "12",
+    "bidp_rsqn2": "18",
+    "futs_askp3": "295500",
+    "futs_bidp3": "293000",
+    "askp_rsqn3": "7",
+    "bidp_rsqn3": "10",
+    "futs_askp4": "296000",
+    "futs_bidp4": "292500",
+    "askp_rsqn4": "4",
+    "bidp_rsqn4": "5",
+    "futs_askp5": "296500",
+    "futs_bidp5": "292000",
+    "askp_rsqn5": "3",
+    "bidp_rsqn5": "4"
+  },
+  "ts_event_ns": "1776817835000000000"
+}
