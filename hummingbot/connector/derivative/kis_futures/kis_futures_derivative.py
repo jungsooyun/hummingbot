@@ -578,10 +578,17 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
     async def _update_positions(self):
         """Refresh positions from KIS balance response (output1).
 
+        Atomic parse-then-apply pattern:
+        1. PARSE the entire snapshot into memory — any malformed row raises IOError
+           BEFORE any set_position/remove_position call (prior state fully intact,
+           _positions_polled_once stays False).
+        2. APPLY atomically only after the whole snapshot parses cleanly.
+        3. Set _positions_polled_once = True only at the very end.
+
         Fail-closed:
-        - Raises IOError if rt_cd != "0" — caller retries; prior positions kept.
-        - Raises IOError if output1 is not a list — malformed response; prior positions kept.
-        - Sets _positions_polled_once = True ONLY after a verified full snapshot.
+        - Raises IOError if rt_cd != "0".
+        - Raises IOError if output1 is not a list.
+        - Raises IOError on any malformed numeric field in any row.
         """
         from hummingbot.connector.derivative.position import Position
         from hummingbot.core.data_type.common import PositionSide
@@ -599,14 +606,22 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
                 "— keeping prior positions"
             )
 
-        seen = set()
+        # Phase 1: PARSE — no state mutation; raise on any malformed row.
+        parsed: Dict[str, Any] = {}   # pos_key -> Position
+        roll_codes: List[Tuple[str, Dict]] = []  # non-current codes to expose roll
+
         for row in output1:
             code = (row.get("shtn_pdno") or row.get("pdno") or "").strip()
             pair = self._pair_for_code(code)
             if pair is None:
-                self._maybe_expose_roll_position(code, row)
+                roll_codes.append((code, row))
                 continue
-            qty = Decimal(str(row.get("cblc_qty", "0") or "0"))
+            try:
+                qty = Decimal(str(row.get("cblc_qty", "0") or "0"))
+            except (InvalidOperation, ValueError, TypeError) as exc:
+                raise IOError(
+                    f"[kis_futures] _update_positions: malformed cblc_qty in row {row}"
+                ) from exc
             if qty == 0:
                 continue
             side = (
@@ -614,23 +629,34 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
                 if str(row.get("sll_buy_dvsn_cd")) == "02"
                 else PositionSide.SHORT
             )
-            pos_key = self._perpetual_trading.position_key(pair, side)
             entry_price_raw = row.get("pchs_avg_pric") or row.get("ccld_avg_unpr1") or "0"
-            pos = Position(
+            try:
+                unrealized_pnl = Decimal(str(row.get("evlu_pfls_amt", "0") or "0"))
+                entry_price = Decimal(str(entry_price_raw))
+            except (InvalidOperation, ValueError, TypeError) as exc:
+                raise IOError(
+                    f"[kis_futures] _update_positions: malformed pnl/price in row {row}"
+                ) from exc
+            pos_key = self._perpetual_trading.position_key(pair, side)
+            parsed[pos_key] = Position(
                 trading_pair=pair,
                 position_side=side,
-                unrealized_pnl=Decimal(str(row.get("evlu_pfls_amt", "0") or "0")),
-                entry_price=Decimal(str(entry_price_raw)),
+                unrealized_pnl=unrealized_pnl,
+                entry_price=entry_price,
                 amount=(qty if side == PositionSide.LONG else -qty),
                 leverage=Decimal("1"),
             )
+
+        # Phase 2: APPLY — only reached when the whole snapshot parsed cleanly.
+        for pos_key, pos in parsed.items():
             self._perpetual_trading.set_position(pos_key, pos)
-            seen.add(pos_key)
-        # Remove positions no longer present in the verified snapshot.
         for k in list(self._perpetual_trading.account_positions.keys()):
-            if k not in seen:
+            if k not in parsed:
                 self._perpetual_trading.remove_position(k)
-        # Mark that at least one verified positions poll has completed.
+        for code, row in roll_codes:
+            self._maybe_expose_roll_position(code, row)
+
+        # Mark verified only after a successful apply.
         self._positions_polled_once = True
 
     async def _update_balances(self):

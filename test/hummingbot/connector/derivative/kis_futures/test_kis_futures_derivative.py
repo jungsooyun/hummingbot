@@ -1077,3 +1077,73 @@ def test_get_last_traded_price_returns_correct_value():
     price = loop.run_until_complete(_run())
     loop.close()
     assert price == 294500.0
+
+
+# B2 — _update_positions atomicity (parse-then-apply)
+
+def test_update_positions_no_partial_apply_on_malformed_row():
+    """Valid first row + malformed second row -> raises, account_positions UNCHANGED, _positions_polled_once stays False.
+
+    This verifies the parse-then-apply pattern: no state mutation until the
+    ENTIRE snapshot is parsed cleanly.  A partial apply (some positions set,
+    others not) on a half-processed snapshot would be a silent data corruption.
+    """
+    c = _make_connector()
+    _inject_contract(c, short_code="A11607")
+
+    # Seed a pre-existing position so we can verify it's untouched after failure.
+    from hummingbot.connector.derivative.position import Position
+    from hummingbot.core.data_type.common import PositionSide
+    pre_pos_key = c._perpetual_trading.position_key("005930-KRW", PositionSide.LONG)
+    pre_pos = Position(
+        trading_pair="005930-KRW",
+        position_side=PositionSide.LONG,
+        unrealized_pnl=Decimal("1000"),
+        entry_price=Decimal("50000"),
+        amount=Decimal("2"),
+        leverage=Decimal("1"),
+    )
+    c._perpetual_trading.set_position(pre_pos_key, pre_pos)
+    assert c._positions_polled_once is False
+
+    # Response: row 1 is valid, row 2 has un-parseable cblc_qty.
+    resp = {
+        "rt_cd": "0",
+        "msg1": "OK",
+        "output1": [
+            {
+                "shtn_pdno": "A11607",
+                "sll_buy_dvsn_cd": "02",  # BUY/LONG
+                "cblc_qty": "3",           # valid
+                "pchs_avg_pric": "50000",
+                "evlu_pfls_amt": "5000",
+            },
+            {
+                "shtn_pdno": "A11607",
+                "sll_buy_dvsn_cd": "01",  # SELL/SHORT
+                "cblc_qty": "NOT_A_NUMBER",  # malformed — must abort entire parse
+                "pchs_avg_pric": "50000",
+                "evlu_pfls_amt": "0",
+            },
+        ],
+    }
+
+    async def _run():
+        with patch.object(c, "_fetch_balance", return_value=resp):
+            await c._update_positions()
+
+    with pytest.raises(IOError, match="malformed cblc_qty"):
+        loop = asyncio.new_event_loop(); loop.run_until_complete(_run()); loop.close()
+
+    # Prior position must be intact — NO partial apply.
+    assert pre_pos_key in c._perpetual_trading.account_positions, (
+        "Pre-existing position was mutated despite parse failure — partial apply bug"
+    )
+    surviving = c._perpetual_trading.account_positions[pre_pos_key]
+    assert surviving.amount == Decimal("2"), (
+        "Position amount was changed by partial apply"
+    )
+    # _positions_polled_once must remain False.
+    assert c._positions_polled_once is False, (
+        "_positions_polled_once must not be set on a failed snapshot"
+    )
