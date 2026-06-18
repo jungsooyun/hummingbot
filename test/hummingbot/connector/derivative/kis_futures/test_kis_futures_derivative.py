@@ -143,6 +143,23 @@ def test_ob_ds_get_funding_info_returns_inert():
     loop = asyncio.new_event_loop(); loop.run_until_complete(_run()); loop.close()
 
 
+def test_funding_info_initializes_for_readiness():
+    """Perp-checklist conformance: the inert get_funding_info must seed funding
+    info so status_dict['funding_info'] flips True and the connector can reach
+    `ready` (mirrors PerpetualDerivativePyBase._init_funding_info)."""
+    c = _make_connector()
+    ds = c._create_order_book_data_source()
+
+    async def _seed():
+        for tp in c.trading_pairs:
+            fi = await ds.get_funding_info(tp)
+            c._perpetual_trading.initialize_funding_info(fi)
+
+    loop = asyncio.new_event_loop(); loop.run_until_complete(_seed()); loop.close()
+    assert c._perpetual_trading.is_funding_info_initialized() is True
+    assert c.status_dict["funding_info"] is True
+
+
 # ---------------------------------------------------------------------------
 # Task 3b: _sandbox_tr_id, _validate_contract_qty, _format_price
 # ---------------------------------------------------------------------------
@@ -191,7 +208,7 @@ def test_format_price_strips_trailing_zeros():
 
 
 def test_format_price_floors_to_krx_tier():
-    """Misaligned prices are floored to the exact KRX tier, never sent raw."""
+    """BUY (default) misaligned prices are floored to the exact KRX tier."""
     c = _make_connector()
     # 50,001 -> tier 100 -> 50,000 (no raise; floored)
     assert c._format_price(Decimal("50001"), "005930-KRW") == "50000"
@@ -200,9 +217,43 @@ def test_format_price_floors_to_krx_tier():
     assert c._format_price(Decimal("363500"), "005930-KRW") == "363500"
 
 
+def test_format_price_side_aware_sell_ceils():
+    """SELL/ask is ceiled UP so a passive ask is never repriced downward
+    (which could make it marketable / self-cross)."""
+    c = _make_connector()
+    # 363,005 -> SELL ceils to 363,500 (vs BUY floors to 363,000)
+    assert c._format_price(Decimal("363005"), "005930-KRW", TradeType.SELL) == "363500"
+    assert c._format_price(Decimal("363005"), "005930-KRW", TradeType.BUY) == "363000"
+    # 50,001 -> SELL ceils to 50,100
+    assert c._format_price(Decimal("50001"), "005930-KRW", TradeType.SELL) == "50100"
+    # already aligned -> unchanged on both sides
+    assert c._format_price(Decimal("363500"), "005930-KRW", TradeType.SELL) == "363500"
+
+
 # ---------------------------------------------------------------------------
 # Task 3b: _place_order
 # ---------------------------------------------------------------------------
+
+def test_place_order_fails_closed_without_resolved_contract():
+    """If front-month resolution has not succeeded (empty contract map), placing
+    an order must fail closed with a clear message — never a bare KeyError and
+    never an order submitted without a contract code."""
+    c = _make_connector()  # fresh connector: _contract_by_pair is empty
+    assert c._contract_by_pair == {}
+
+    async def _run():
+        return await c._place_order(
+            order_id="x1",
+            trading_pair="005930-KRW",
+            amount=Decimal("1"),
+            trade_type=TradeType.BUY,
+            order_type=OrderType.LIMIT,
+            price=Decimal("363000"),
+        )
+
+    with pytest.raises(ValueError, match="no resolved.*front-month"):
+        loop = asyncio.new_event_loop(); loop.run_until_complete(_run()); loop.close()
+
 
 def test_place_order_buy_sends_correct_body():
     c = _make_connector()

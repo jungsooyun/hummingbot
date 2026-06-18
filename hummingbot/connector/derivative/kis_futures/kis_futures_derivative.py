@@ -23,6 +23,7 @@ from hummingbot.connector.derivative.kis_futures.kis_futures_master import (
     resolve_front_month,
 )
 from hummingbot.connector.derivative.kis_futures.kis_futures_tick import (
+    ceil_to_tick,
     floor_to_tick,
     tick_size_for_price,
 )
@@ -472,25 +473,33 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
             )
         return int(amount)
 
-    def _format_price(self, price: Decimal, trading_pair: str) -> str:
-        """Format an order price as a plain integer string, floored to the exact
+    def _format_price(
+        self, price: Decimal, trading_pair: str, trade_type: TradeType = TradeType.BUY
+    ) -> str:
+        """Format an order price as a plain integer string, quantized to the exact
         KRX 호가가격단위 (호가단위) for the price's own tier.
+
+        Side-aware quantization preserves maker intent and never reprices an order
+        in the adverse direction:
+          - BUY/bid  -> floor (never pay above the intended price)
+          - SELL/ask -> ceil  (never sell below the intended price; a downward
+            floor could make a passive ask marketable / self-cross)
 
         Authoritative tick gate: the tick is derived from the order price itself
         (price-tiered, per KRX 2026 rule) rather than the static per-pair
         min_price_increment, so the result is always a KRX-valid price regardless
         of where the price sits relative to the rule tick. Mirrors the
-        live-verified nautilus gate5c floor_to_tick.
+        live-verified nautilus gate5c tick flooring (extended to side-aware ceil).
 
         Fail-closed: raises ValueError for non-positive prices (or prices that
-        floor to <= 0).
+        quantize to <= 0).
         """
         if price <= 0:
             raise ValueError(f"kis_futures price must be positive: {price}")
-        aligned = floor_to_tick(price)
+        aligned = ceil_to_tick(price) if trade_type == TradeType.SELL else floor_to_tick(price)
         if aligned <= 0:
             raise ValueError(
-                f"kis_futures price {price} floored to non-positive tick boundary"
+                f"kis_futures price {price} quantized to non-positive tick boundary"
             )
         text = format(aligned, "f")
         # Strip trailing decimal zeros (e.g. "50000.0" → "50000")
@@ -512,7 +521,16 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
         # Read contract code under _roll_lock to prevent interleaving with a concurrent
         # _resolve_front_months swap that could change fc.short_code mid-flight.
         async with self._roll_lock:
-            fc = self._contract_by_pair[trading_pair]  # KeyError intentional: caller ensures resolution
+            fc = self._contract_by_pair.get(trading_pair)
+        # Fail closed with a clear message: trading rules can be published with a
+        # default tick even when front-month resolution failed (fail-soft), so the
+        # contract map may be empty here. Never submit an order without a resolved
+        # front-month contract code.
+        if fc is None:
+            raise ValueError(
+                f"kis_futures cannot place order for {trading_pair}: no resolved "
+                f"front-month contract (front-month resolution has not succeeded yet)"
+            )
         qty = self._validate_contract_qty(amount)
         # 매수(long)=02, 매도(short)=01
         sll_buy = "02" if trade_type == TradeType.BUY else "01"
@@ -523,7 +541,7 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
             "SLL_BUY_DVSN_CD": sll_buy,
             "SHTN_PDNO": fc.short_code,
             "ORD_QTY": str(qty),
-            "UNIT_PRICE": self._format_price(price, trading_pair),
+            "UNIT_PRICE": self._format_price(price, trading_pair, trade_type),
             "NMPR_TYPE_CD": "01",
             "KRX_NMPR_CNDT_CD": "0",
             "ORD_DVSN_CD": "01",

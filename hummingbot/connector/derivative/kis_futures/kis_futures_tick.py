@@ -65,3 +65,19 @@ def floor_to_tick(price: Decimal) -> Decimal:
     """
     tick = tick_size_for_price(price)
     return (price // tick) * tick
+
+
+def ceil_to_tick(price: Decimal) -> Decimal:
+    """Round ``price`` UP to the nearest valid KRX tick boundary.
+
+    Used for maker SELL/ask quantization so the order is never repriced
+    *downward* (which could make a passive ask marketable). Every tier threshold
+    is itself an exact multiple of the next tier's tick, so a ceil that lands on
+    or crosses a tier boundary remains a KRX-valid price.
+
+    Fail-closed: raises ``ValueError`` for non-positive prices.
+    """
+    floored = floor_to_tick(price)
+    if floored == price:
+        return floored
+    return floored + tick_size_for_price(price)

@@ -20,6 +20,7 @@ from decimal import Decimal
 import pytest
 
 from hummingbot.connector.derivative.kis_futures.kis_futures_tick import (
+    ceil_to_tick,
     floor_to_tick,
     tick_size_for_price,
 )
@@ -87,3 +88,32 @@ def test_floor_to_tick_nonpositive_raises(bad):
 def test_floor_to_tick_returns_decimal():
     result = floor_to_tick(Decimal("363005"))
     assert isinstance(result, Decimal)
+
+
+@pytest.mark.parametrize(
+    "price, ceiled",
+    [
+        ("363000", "363000"),   # already aligned to 500
+        ("363005", "363500"),   # 200k-500k tier: tick 500 -> ceil up
+        ("363499", "363500"),
+        ("363500", "363500"),
+        ("50000", "50000"),     # aligned to 100
+        ("50001", "50100"),     # 50k-200k tier: tick 100 -> ceil up
+        ("50099", "50100"),
+        ("1999", "1999"),       # <2000 tier: tick 1, integer already valid
+        ("3001", "3005"),       # <5000 tier: tick 5
+        ("199950", "200000"),   # ceil CROSSES tier boundary -> 200000 valid in 500-tier
+        ("499999", "500000"),   # ceil crosses into top tier -> 500000 valid (mult of 1000)
+    ],
+)
+def test_ceil_to_tick(price, ceiled):
+    result = ceil_to_tick(Decimal(price))
+    assert result == Decimal(ceiled)
+    # The ceiled price must itself be a valid KRX tick boundary in its own tier.
+    assert result % tick_size_for_price(result) == 0
+
+
+@pytest.mark.parametrize("bad", ["0", "-5"])
+def test_ceil_to_tick_nonpositive_raises(bad):
+    with pytest.raises(ValueError):
+        ceil_to_tick(Decimal(bad))
