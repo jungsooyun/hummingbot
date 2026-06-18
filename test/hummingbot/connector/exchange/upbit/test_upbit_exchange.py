@@ -2,6 +2,7 @@ import asyncio
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from aioresponses import aioresponses
 from bidict import bidict
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 
@@ -14,6 +15,33 @@ from hummingbot.core.utils.xemm_diagnostics import (
     HB_DIAG_WS_RECV_TS_MS,
     extract_xemm_diag_payload,
 )
+
+
+class OpenOrderRecordTests(IsolatedAsyncioWrapperTestCase):
+    def test_open_order_record_is_frozen_dataclass_with_contract_fields(self):
+        import dataclasses
+
+        from hummingbot.connector.exchange.open_order_record import OpenOrderRecord
+
+        rec = OpenOrderRecord(
+            trading_pair="BTC-KRW",
+            exchange_order_id="EX-1",
+            client_order_id=None,
+            trade_type=TradeType.BUY,
+            price=Decimal("100"),
+            amount=Decimal("2"),
+            remaining_amount=Decimal("1.5"),
+        )
+        self.assertTrue(dataclasses.is_dataclass(rec))
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            rec.price = Decimal("200")
+        self.assertEqual(rec.trading_pair, "BTC-KRW")
+        self.assertEqual(rec.exchange_order_id, "EX-1")
+        self.assertIsNone(rec.client_order_id)
+        self.assertEqual(rec.trade_type, TradeType.BUY)
+        self.assertEqual(rec.price, Decimal("100"))
+        self.assertEqual(rec.amount, Decimal("2"))
+        self.assertEqual(rec.remaining_amount, Decimal("1.5"))
 
 
 class UpbitExchangeTests(IsolatedAsyncioWrapperTestCase):
@@ -52,6 +80,67 @@ class UpbitExchangeTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(self.exchange.available_balances["BTC"], Decimal("1.2"))
         self.assertEqual(self.exchange.get_balance("BTC"), Decimal("1.5"))
         self.assertEqual(self.exchange.available_balances["KRW"], Decimal("1000000"))
+
+    async def test_get_open_orders_returns_normalized_records(self):
+        payload = [
+            {"uuid": "u-buy", "side": "bid", "market": "KRW-BTC",
+             "price": "55000000", "volume": "0.5", "remaining_volume": "0.5", "state": "wait"},
+            {"uuid": "u-sell", "side": "ask", "market": "KRW-BTC",
+             "price": "56000000", "volume": "0.2", "remaining_volume": "0.1", "state": "wait"},
+        ]
+        with patch.object(self.exchange, "_api_get", AsyncMock(return_value=payload)):
+            records = await self.exchange.get_open_orders()
+        self.assertEqual(len(records), 2)
+        buy = next(r for r in records if r.exchange_order_id == "u-buy")
+        sell = next(r for r in records if r.exchange_order_id == "u-sell")
+        self.assertEqual(buy.trade_type, TradeType.BUY)
+        self.assertEqual(buy.trading_pair, "BTC-KRW")
+        self.assertEqual(buy.price, Decimal("55000000"))
+        self.assertEqual(buy.amount, Decimal("0.5"))
+        self.assertEqual(buy.remaining_amount, Decimal("0.5"))
+        self.assertEqual(sell.trade_type, TradeType.SELL)
+        self.assertEqual(sell.amount, Decimal("0.2"))
+        self.assertEqual(sell.remaining_amount, Decimal("0.1"))
+
+    async def test_get_open_orders_empty_returns_empty_list(self):
+        with patch.object(self.exchange, "_api_get", AsyncMock(return_value=[])):
+            records = await self.exchange.get_open_orders()
+        self.assertEqual(records, [])
+
+    async def test_get_open_orders_external_order_has_no_client_id(self):
+        payload = [{"uuid": "not-tracked", "side": "bid", "market": "KRW-BTC",
+                    "price": "1", "volume": "1", "remaining_volume": "1", "state": "wait"}]
+        with patch.object(self.exchange, "_api_get", AsyncMock(return_value=payload)):
+            records = await self.exchange.get_open_orders()
+        self.assertEqual(len(records), 1)
+        self.assertIsNone(records[0].client_order_id)
+
+    async def test_get_open_orders_hits_correct_endpoint_and_auth(self):
+        with patch.object(self.exchange, "_api_get", AsyncMock(return_value=[])) as mock_api:
+            await self.exchange.get_open_orders()
+        kwargs = mock_api.call_args.kwargs
+        self.assertEqual(kwargs["path_url"], CONSTANTS.GET_OPEN_ORDERS_PATH_URL)
+        self.assertTrue(kwargs["is_auth_required"])
+
+    @aioresponses()
+    async def test_get_open_orders_hits_private_endpoint(self, mock_api):
+        import json
+        import re
+
+        from hummingbot.connector.exchange.upbit import upbit_web_utils as web_utils
+
+        base_url = web_utils.private_rest_url(CONSTANTS.GET_OPEN_ORDERS_PATH_URL)
+        url = re.compile(f"^{re.escape(base_url)}.*")
+        mock_api.get(url, body=json.dumps([]))
+        records = await self.exchange.get_open_orders()
+        self.assertEqual(records, [])
+        # Assert the GET request landed on the expected private URL. aioresponses keys
+        # requests by (method, yarl.URL); RequestCall is a namedtuple of (args, kwargs) ONLY
+        # (no .url), and _all_executed_requests is NOT available on this test class.
+        # JWT Authorization-header correctness is covered by the upbit_auth unit tests; this
+        # test only proves get_open_orders() reaches the private open-orders endpoint.
+        matched = [k for k in mock_api.requests if k[0].upper() == "GET" and base_url in str(k[1])]
+        self.assertTrue(matched, f"expected a GET to {base_url}, saw {list(mock_api.requests)}")
 
     async def test_place_limit_order_builds_payload(self):
         with patch.object(self.exchange, "_api_post", AsyncMock(return_value={"uuid": "order-1"})) as mock_post:

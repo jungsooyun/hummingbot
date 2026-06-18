@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from bidict import bidict
 
 from hummingbot.connector.constants import s_decimal_NaN
+from hummingbot.connector.exchange.open_order_record import OpenOrderRecord
 from hummingbot.connector.exchange.bithumb import bithumb_constants as CONSTANTS, bithumb_utils, bithumb_web_utils as web_utils
 from hummingbot.connector.exchange.bithumb.bithumb_api_order_book_data_source import BithumbAPIOrderBookDataSource
 from hummingbot.connector.exchange.bithumb.bithumb_api_user_stream_data_source import BithumbAPIUserStreamDataSource
@@ -434,6 +435,7 @@ class BithumbExchange(ExchangePyBase):
                         min_order_size=Decimal("0.00000001"),
                         min_price_increment=Decimal("0.00000001"),
                         min_base_amount_increment=Decimal("0.00000001"),
+                        min_notional_size=Decimal(str(CONSTANTS.MIN_NOTIONAL_KRW)),
                     )
                 )
             except Exception:
@@ -443,6 +445,37 @@ class BithumbExchange(ExchangePyBase):
 
     async def _update_trading_fees(self):
         pass
+
+    async def get_open_orders(self, trading_pair: Optional[str] = None) -> List[OpenOrderRecord]:
+        # VERIFY: Bithumb v1/orders schema - state filter (wait/watch) + field names (side/price/volume/remaining_volume/uuid) + that params={"market": ..., "state": "wait"} per market is the live resting-list contract.
+        pairs = [trading_pair] if trading_pair is not None else list(self._trading_pairs)
+        records: List[OpenOrderRecord] = []
+        by_eoid = self._order_tracker.all_fillable_orders_by_exchange_order_id
+        for tp in pairs:
+            exchange_symbol = await self.exchange_symbol_associated_to_pair(tp)
+            rows = await self._api_get(
+                path_url=CONSTANTS.GET_OPEN_ORDERS_PATH_URL,
+                params={"market": exchange_symbol, "state": "wait"},
+                is_auth_required=True,
+            )
+            for row in rows or []:
+                state = str(row.get("state", "")).lower()
+                if state and state not in ("wait", "watch"):
+                    continue
+                side = str(row.get("side", "")).lower()
+                trade_type = TradeType.BUY if side == "bid" else TradeType.SELL
+                eoid = str(row.get("uuid", ""))
+                tracked = by_eoid.get(eoid)
+                records.append(OpenOrderRecord(
+                    trading_pair=tp,
+                    exchange_order_id=eoid,
+                    client_order_id=tracked.client_order_id if tracked else None,
+                    trade_type=trade_type,
+                    price=Decimal(str(row.get("price", "0"))),
+                    amount=Decimal(str(row.get("volume", "0"))),
+                    remaining_amount=Decimal(str(row.get("remaining_volume", row.get("volume", "0")))),
+                ))
+        return records
 
     async def _update_balances(self):
         local_asset_names = set(self._account_balances.keys())

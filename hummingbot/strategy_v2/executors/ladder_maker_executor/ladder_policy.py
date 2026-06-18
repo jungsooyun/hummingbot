@@ -43,6 +43,12 @@ class RungTarget:
 
 
 @dataclass(frozen=True)
+class TwoSidedTargets:
+    open: list[RungTarget]
+    close: list[RungTarget]
+
+
+@dataclass(frozen=True)
 class HedgeOrder:
     side: Side
     price: Decimal
@@ -173,11 +179,81 @@ def build_ladder_targets(
     return targets
 
 
+def build_two_sided_targets(
+    *,
+    fair_open: Decimal,
+    fair_close: Decimal,
+    rungs: List[RungSpec],
+    total_size_cap: Decimal,
+    net_position: Decimal,
+    open_edge_vwap: Decimal,
+    util: Decimal,
+    eod_pressure: Decimal,
+    cost_bps: Decimal,
+    k_open_skew_bps: Decimal,
+    k_close_skew_bps: Decimal,
+    eod_close_skew_bps: Decimal,
+    max_close_cost_bps: Decimal,
+    tick: Decimal,
+    buffer_ticks: Decimal,
+    wind_down: bool,
+) -> TwoSidedTargets:
+    buffer = tick * buffer_ticks
+    half_cost = cost_bps / Decimal("2")
+    break_even_buy_edge = cost_bps - open_edge_vwap - max_close_cost_bps
+
+    open_targets: List[RungTarget] = []
+    open_remaining = total_size_cap - net_position
+    if not wind_down and net_position < total_size_cap and open_remaining > ZERO:
+        for rung in rungs:
+            if not rung.enabled or open_remaining <= ZERO:
+                continue
+            qty = min(rung.size, open_remaining)
+            if qty <= ZERO:
+                continue
+            edge_sell = half_cost + rung.edge_bps + k_open_skew_bps * util
+            price_sell = ceil_to_tick(fair_open * (ONE + edge_sell / BPS) + buffer, tick)
+            open_targets.append(RungTarget(side=Side.SELL, price=price_sell, size=qty, edge_bps=edge_sell))
+            open_remaining -= qty
+
+    close_targets: List[RungTarget] = []
+    close_remaining = net_position
+    if close_remaining > ZERO:
+        for rung in rungs:
+            if not rung.enabled or close_remaining <= ZERO:
+                continue
+            qty = min(rung.size, close_remaining)
+            if qty <= ZERO:
+                continue
+            edge_buy = half_cost + rung.edge_bps - k_close_skew_bps * util - eod_close_skew_bps * eod_pressure
+            edge_buy = max(edge_buy, break_even_buy_edge)
+            price_buy = floor_to_tick(fair_close * (ONE - edge_buy / BPS) - buffer, tick)
+            close_targets.append(RungTarget(side=Side.BUY, price=price_buy, size=qty, edge_bps=edge_buy))
+            close_remaining -= qty
+
+    return TwoSidedTargets(open=open_targets, close=close_targets)
+
+
+def compute_eod_pressure(now_kst_min: int, krx_close_min: int, wind_minutes: int) -> Decimal:
+    wind_minutes_dec = Decimal(wind_minutes)
+    if wind_minutes_dec <= ZERO:
+        return ZERO
+
+    wind_start = Decimal(krx_close_min) - wind_minutes_dec
+    pressure = (Decimal(now_kst_min) - wind_start) / (Decimal(krx_close_min) - wind_start)
+    if pressure <= ZERO:
+        return ZERO
+    if pressure >= ONE:
+        return ONE
+    return pressure
+
+
 @dataclass(frozen=True)
 class RestingOrder:
     """Snapshot of one live maker order, for the partial-reprice diff."""
 
     order_id: str
+    side: Side
     price: Decimal
     size: Decimal
 
@@ -222,7 +298,7 @@ def diff_ladder_targets(
         candidates = [
             o
             for o in unmatched
-            if o.size == target.size and abs(o.price - target.price) < threshold
+            if o.side == target.side and o.size == target.size and abs(o.price - target.price) < threshold
         ]
         if not candidates:
             to_place.append(target)
@@ -238,15 +314,20 @@ def diff_ladder_targets(
 def compute_hedge_order(
     fill_qty: Decimal,
     share_per_unit: Decimal,
-    kis_best_ask: Decimal,
+    kis_price: Decimal,
     max_slippage_bps: Decimal,
     tick: Decimal,
+    side: Side = Side.BUY,
 ) -> HedgeOrder:
-    """HL short maker fill -> KIS spot BUY marketable-limit hedge.
+    """Maker fill -> KIS spot marketable-limit hedge.
 
-    Price walks up to best_ask + slippage so the limit order crosses (takerable).
+    BUY walks up from best ask + slippage; SELL walks down from best bid - slippage
+    so either limit order crosses (takerable).
     """
     share_qty = fill_qty * share_per_unit
     slip = max_slippage_bps / BPS
-    price = ceil_to_tick(kis_best_ask * (ONE + slip), tick)
-    return HedgeOrder(side=Side.BUY, price=price, size=share_qty)
+    if side is Side.BUY:
+        price = ceil_to_tick(kis_price * (ONE + slip), tick)
+    else:
+        price = floor_to_tick(kis_price * (ONE - slip), tick)
+    return HedgeOrder(side=side, price=price, size=share_qty)

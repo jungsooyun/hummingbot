@@ -11,6 +11,8 @@ just-placed window as in-flight (else a second tick double-hedges the same
 residual now that pending is no longer zeroed at placement).
 """
 from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -75,7 +77,7 @@ class _Harness(CrossVenueHedgedExecutorBase):
         self._hedge_executed_quote = Decimal("0")
         self._maker_fees_quote = Decimal("0")
         self._hedge_fees_quote = Decimal("0")
-        self._pending_hedge_base = Decimal("0")
+        self._pending_hedge_signed = Decimal("0")
         self._current_retries = 0
         self._max_retries = 3
         self._hedge_kill_switch = False
@@ -90,6 +92,7 @@ class _Harness(CrossVenueHedgedExecutorBase):
         # The connector's order tracker (active + 30s cache) — the source of truth that
         # _reconcile_stuck_hedges consults via get_in_flight_order.
         self.connector_orders = {}
+        self._strategy = SimpleNamespace(cancel=MagicMock())
 
     def _update_tracked(self, *_):
         pass
@@ -237,6 +240,44 @@ def test_hedge_cancel_keeps_pending_and_pops_order():
     assert h._pending_hedge_base == Decimal("1.7")  # not stranded
     h._process_hedges()
     assert h.placed[-1] == ("h1", Decimal("1"))  # re-hedge
+
+
+def test_late_fill_after_optimistic_cancel_credits_cross_once(caplog):
+    h = _Harness()
+    _maker_fill(h, "m0", "1.0")
+    h._process_hedges()
+    _created(h, "h0")
+    h.process_order_filled_event(None, None, _Ev("h0", "0.6"))
+    assert h._spot_net() == Decimal("0.6")
+    assert h._pending_hedge_signed == Decimal("-0.4")
+
+    h.connector_orders["h0"].executed_amount_base = Decimal("1.0")
+    h.hedge_orders["h0"].order.is_open = False
+    h.process_order_canceled_event(None, None, _Ev("h0", "0"))
+    assert "h0" not in h.hedge_orders
+
+    with caplog.at_level("WARNING", logger=mod.__name__):
+        h.process_order_filled_event(None, None, _Ev("h0", "0.4"))
+
+    assert "post-optimistic-cancel" in caplog.text
+    assert h._spot_net() == Decimal("1.0")
+    assert h._pending_hedge_signed == Decimal("0.0")
+
+    h.process_order_filled_event(None, None, _Ev("h0", "0.4"))
+
+    assert h._spot_net() == Decimal("1.0")
+    assert h._pending_hedge_signed == Decimal("0.0")
+
+
+def test_unknown_fill_logs_warning_and_does_not_credit(caplog):
+    h = _Harness()
+
+    with caplog.at_level("WARNING", logger=mod.__name__):
+        h.process_order_filled_event(None, None, _Ev("unknown-h0", "1.0"))
+
+    assert "unknown order" in caplog.text
+    assert h._spot_net() == Decimal("0")
+    assert h._pending_hedge_signed == Decimal("0")
 
 
 # ----------------------------------------------------------------- never-event reconcile

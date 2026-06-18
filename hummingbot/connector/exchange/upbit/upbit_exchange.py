@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from bidict import bidict
 
 from hummingbot.connector.constants import s_decimal_NaN
+from hummingbot.connector.exchange.open_order_record import OpenOrderRecord
 from hummingbot.connector.exchange.upbit import upbit_constants as CONSTANTS, upbit_utils, upbit_web_utils as web_utils
 from hummingbot.connector.exchange.upbit.upbit_api_order_book_data_source import UpbitAPIOrderBookDataSource
 from hummingbot.connector.exchange.upbit.upbit_api_user_stream_data_source import UpbitAPIUserStreamDataSource
@@ -408,6 +409,39 @@ class UpbitExchange(ExchangePyBase):
 
     async def _update_trading_fees(self):
         pass
+
+    async def get_open_orders(self, trading_pair: Optional[str] = None) -> List[OpenOrderRecord]:
+        # Upbit v1/orders/open schema: verify side/price/volume/remaining_volume/uuid/market + state(wait/watch) against live response.
+        rows = await self._api_get(
+            path_url=CONSTANTS.GET_OPEN_ORDERS_PATH_URL,
+            is_auth_required=True,
+        )
+        records: List[OpenOrderRecord] = []
+        by_eoid = self._order_tracker.all_fillable_orders_by_exchange_order_id
+        for row in rows or []:
+            state = str(row.get("state", "")).lower()
+            if state and state not in ("wait", "watch"):
+                continue
+            symbol = row["market"]
+            tp = await self.trading_pair_associated_to_exchange_symbol(symbol)
+            if trading_pair is not None and tp != trading_pair:
+                continue
+            side = str(row.get("side", "")).lower()
+            trade_type = TradeType.BUY if side == "bid" else TradeType.SELL
+            amount = Decimal(str(row.get("volume", "0")))
+            remaining = Decimal(str(row.get("remaining_volume", row.get("volume", "0"))))
+            eoid = str(row.get("uuid", ""))
+            tracked = by_eoid.get(eoid)
+            records.append(OpenOrderRecord(
+                trading_pair=tp,
+                exchange_order_id=eoid,
+                client_order_id=tracked.client_order_id if tracked else None,
+                trade_type=trade_type,
+                price=Decimal(str(row.get("price", "0"))),
+                amount=amount,
+                remaining_amount=remaining,
+            ))
+        return records
 
     async def _update_balances(self):
         local_asset_names = set(self._account_balances.keys())

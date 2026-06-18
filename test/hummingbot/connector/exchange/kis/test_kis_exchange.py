@@ -405,6 +405,137 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
             domain=domain,
         )
 
+    def _open_orders_response(self, rows, nk100="", tr_cont=""):
+        return {
+            "rt_cd": "0",
+            "msg_cd": "MCA00000",
+            "msg1": "ok",
+            "ctx_area_fk100": "",
+            "ctx_area_nk100": nk100,
+            "tr_cont": tr_cont,
+            "output1": rows,
+        }
+
+    @aioresponses()
+    async def test_get_open_orders_returns_normalized_records(self, mock_api):
+        symbol = self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)
+        ex = self._make_exchange()
+        ex._auth._access_token = "test_access_token"
+        ex._auth._token_expires_at = time.time() + 86400
+        ex._set_trading_pair_symbol_map(bidict({symbol: self.trading_pair}))
+        rows = [
+            {"odno": "K-buy", "pdno": symbol, "sll_buy_dvsn_cd": "02",
+             "ord_unpr": "70000", "ord_qty": "10", "tot_ccld_qty": "0", "rmn_qty": "10", "cncl_yn": "N"},
+            {"odno": "K-sell", "pdno": symbol, "sll_buy_dvsn_cd": "01",
+             "ord_unpr": "72000", "ord_qty": "5", "tot_ccld_qty": "3", "rmn_qty": "2", "cncl_yn": "N"},
+        ]
+        url = re.compile(f"^{re.escape(web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH))}.*")
+        mock_api.get(url, body=json.dumps(self._open_orders_response(rows)))
+        records = await ex.get_open_orders()
+        self.assertEqual(len(records), 2)
+        buy = next(r for r in records if r.exchange_order_id == "K-buy")
+        sell = next(r for r in records if r.exchange_order_id == "K-sell")
+        self.assertEqual(buy.trade_type, TradeType.BUY)
+        self.assertEqual(buy.trading_pair, self.trading_pair)
+        self.assertEqual(buy.price, Decimal("70000"))
+        self.assertEqual(buy.amount, Decimal("10"))
+        self.assertEqual(buy.remaining_amount, Decimal("10"))
+        self.assertEqual(sell.trade_type, TradeType.SELL)
+        self.assertEqual(sell.remaining_amount, Decimal("2"))
+
+    @aioresponses()
+    async def test_get_open_orders_excludes_terminal_rows(self, mock_api):
+        symbol = self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)
+        ex = self._make_exchange()
+        ex._auth._access_token = "test_access_token"
+        ex._auth._token_expires_at = time.time() + 86400
+        ex._set_trading_pair_symbol_map(bidict({symbol: self.trading_pair}))
+        rows = [
+            {"odno": "resting", "pdno": symbol, "sll_buy_dvsn_cd": "02",
+             "ord_unpr": "1", "ord_qty": "10", "tot_ccld_qty": "4", "rmn_qty": "6", "cncl_yn": "N"},
+            {"odno": "filled", "pdno": symbol, "sll_buy_dvsn_cd": "02",
+             "ord_unpr": "1", "ord_qty": "10", "tot_ccld_qty": "10", "rmn_qty": "0", "cncl_yn": "N"},
+            {"odno": "cancelled", "pdno": symbol, "sll_buy_dvsn_cd": "01",
+             "ord_unpr": "1", "ord_qty": "5", "tot_ccld_qty": "0", "rmn_qty": "5", "cncl_yn": "Y"},
+        ]
+        url = re.compile(f"^{re.escape(web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH))}.*")
+        mock_api.get(url, body=json.dumps(self._open_orders_response(rows)))
+        records = await ex.get_open_orders()
+        self.assertEqual({r.exchange_order_id for r in records}, {"resting"})
+
+    @aioresponses()
+    async def test_get_open_orders_empty_returns_empty_list(self, mock_api):
+        ex = self._make_exchange()
+        ex._auth._access_token = "test_access_token"
+        ex._auth._token_expires_at = time.time() + 86400
+        url = re.compile(f"^{re.escape(web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH))}.*")
+        mock_api.get(url, body=json.dumps(self._open_orders_response([])))
+        self.assertEqual(await ex.get_open_orders(), [])
+
+    @aioresponses()
+    async def test_get_open_orders_external_order_has_no_client_id(self, mock_api):
+        symbol = self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)
+        ex = self._make_exchange()
+        ex._auth._access_token = "test_access_token"
+        ex._auth._token_expires_at = time.time() + 86400
+        ex._set_trading_pair_symbol_map(bidict({symbol: self.trading_pair}))
+        rows = [{"odno": "untracked", "pdno": symbol, "sll_buy_dvsn_cd": "02",
+                 "ord_unpr": "1", "ord_qty": "1", "tot_ccld_qty": "0", "rmn_qty": "1", "cncl_yn": "N"}]
+        url = re.compile(f"^{re.escape(web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH))}.*")
+        mock_api.get(url, body=json.dumps(self._open_orders_response(rows)))
+        records = await ex.get_open_orders()
+        self.assertIsNone(records[0].client_order_id)
+
+    @aioresponses()
+    async def test_get_open_orders_hits_correct_endpoint_and_auth(self, mock_api):
+        ex = self._make_exchange()
+        ex._auth._access_token = "test_access_token"
+        ex._auth._token_expires_at = time.time() + 86400
+        url = re.compile(f"^{re.escape(web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH))}.*")
+        mock_api.get(url, body=json.dumps(self._open_orders_response([])))
+        await ex.get_open_orders()
+        sent = next(calls[-1] for calls in mock_api.requests.values() if calls)
+        matched = [k for k in mock_api.requests if CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH in str(k[1])]
+        self.assertTrue(matched, f"expected inquire-daily-ccld URL, saw {list(mock_api.requests)}")
+        self._assert_request_authenticated(sent, CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_TR_ID)
+
+    @aioresponses()
+    async def test_get_open_orders_paginates_continuation(self, mock_api):
+        symbol = self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)
+        ex = self._make_exchange()
+        ex._auth._access_token = "test_access_token"
+        ex._auth._token_expires_at = time.time() + 86400
+        ex._set_trading_pair_symbol_map(bidict({symbol: self.trading_pair}))
+        page1 = self._open_orders_response(
+            [{"odno": "p1", "pdno": symbol, "sll_buy_dvsn_cd": "02",
+              "ord_unpr": "1", "ord_qty": "1", "tot_ccld_qty": "0", "rmn_qty": "1", "cncl_yn": "N"}],
+            nk100="NEXT", tr_cont="M")
+        page2 = self._open_orders_response(
+            [{"odno": "p2", "pdno": symbol, "sll_buy_dvsn_cd": "01",
+              "ord_unpr": "2", "ord_qty": "1", "tot_ccld_qty": "0", "rmn_qty": "1", "cncl_yn": "N"}],
+            nk100="", tr_cont="")
+        url = re.compile(f"^{re.escape(web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH))}.*")
+        mock_api.get(url, body=json.dumps(page1))
+        mock_api.get(url, body=json.dumps(page2))
+        records = await ex.get_open_orders()
+        self.assertEqual({r.exchange_order_id for r in records}, {"p1", "p2"})
+
+    @aioresponses()
+    async def test_get_open_orders_routes_per_kis_market_routing(self, mock_api):
+        symbol = self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)
+        ex = self._make_exchange(kis_market_routing="sor")
+        ex._auth._access_token = "test_access_token"
+        ex._auth._token_expires_at = time.time() + 86400
+        ex._set_trading_pair_symbol_map(bidict({symbol: self.trading_pair}))
+        rows = [{"odno": "sor-1", "pdno": symbol, "sll_buy_dvsn_cd": "02",
+                 "ord_unpr": "1", "ord_qty": "1", "tot_ccld_qty": "0", "rmn_qty": "1", "cncl_yn": "N"}]
+        url = re.compile(f"^{re.escape(web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH))}.*")
+        mock_api.get(url, body=json.dumps(self._open_orders_response(rows)))
+        records = await ex.get_open_orders()
+        self.assertEqual(len(records), 1)
+        sent = next(calls[-1] for calls in mock_api.requests.values() if calls)
+        self.assertEqual(sent.kwargs["params"]["EXCG_ID_DVSN_CD"], ex._excg_for_routing())
+
     @aioresponses()
     async def test_get_last_traded_price_market_div_code_follows_routing(self, mock_api):
         """The last-traded-price (ticker) REST call must derive FID_COND_MRKT_DIV_CODE
@@ -535,6 +666,17 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         self.assertEqual(CONSTANTS.DOMESTIC_STOCK_BALANCE_PATH, ex.check_network_request_path)
         self.assertNotEqual(CONSTANTS.TOKEN_PATH_URL, ex.check_network_request_path)
 
+    def test_open_orders_source_endpoint_is_verified_inquire_daily_ccld(self):
+        # Default open-orders source = the EXISTING, proven inquire-daily-ccld endpoint
+        # (HIGH-1: inquire-psbl-rvsecncl/TTTC0084R is unverified - do not assert it here).
+        self.assertEqual(
+            CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH,
+            "uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+        )
+        self.assertEqual(CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_TR_ID, "TTTC8001R")
+        rate_limit_ids = {rl.limit_id for rl in CONSTANTS.RATE_LIMITS}
+        self.assertIn(CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH, rate_limit_ids)
+
     @aioresponses()
     async def test_network_check_uses_authenticated_balance_request(self, mock_api):
         # The network probe must hit the authenticated balance inquiry (works 24/7,
@@ -654,6 +796,93 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         )
         await self.exchange._update_balances()
         self.assertGreater(len(self.exchange._account_balances), 0)
+
+    @aioresponses()
+    async def test_krw_available_uses_ord_psbl_cash(self, mock_api):
+        resp = {
+            "rt_cd": "0", "msg_cd": "MCA00000", "msg1": "ok",
+            "output1": [],
+            "output2": [{"dnca_tot_amt": "1000000", "ord_psbl_cash": "600000",
+                         "nxdy_excc_amt": "0", "tot_evlu_amt": "1000000"}],
+        }
+        mock_api.get(re.compile(f"^{re.escape(self.balance_url)}.*"), body=json.dumps(resp))
+        await self.exchange._update_balances()
+        self.assertEqual(self.exchange.get_available_balance(self.quote_asset), Decimal("600000"))
+        self.assertEqual(self.exchange.get_balance(self.quote_asset), Decimal("1000000"))
+
+    @aioresponses()
+    async def test_krw_available_uses_nrcvb_buy_amt_when_ord_psbl_cash_missing(self, mock_api):
+        # HIGH-3 precedence: ord_psbl_cash absent -> use nrcvb_buy_amt (NOT dnca_tot_amt).
+        resp = {
+            "rt_cd": "0", "msg_cd": "MCA00000", "msg1": "ok",
+            "output1": [],
+            "output2": [{"dnca_tot_amt": "1000000", "nrcvb_buy_amt": "700000",
+                         "nxdy_excc_amt": "0", "tot_evlu_amt": "1000000"}],
+        }
+        mock_api.get(re.compile(f"^{re.escape(self.balance_url)}.*"), body=json.dumps(resp))
+        await self.exchange._update_balances()
+        self.assertEqual(self.exchange.get_available_balance(self.quote_asset), Decimal("700000"))
+        self.assertEqual(self.exchange.get_balance(self.quote_asset), Decimal("1000000"))
+
+    @aioresponses()
+    async def test_krw_available_falls_back_to_dnca_tot_amt_when_field_missing(self, mock_api):
+        resp = {
+            "rt_cd": "0", "msg_cd": "MCA00000", "msg1": "ok",
+            "output1": [],
+            "output2": [{"dnca_tot_amt": "1000000", "nxdy_excc_amt": "0", "tot_evlu_amt": "1000000"}],
+        }
+        mock_api.get(re.compile(f"^{re.escape(self.balance_url)}.*"), body=json.dumps(resp))
+        await self.exchange._update_balances()
+        self.assertEqual(self.exchange.get_available_balance(self.quote_asset), Decimal("1000000"))
+        self.assertEqual(self.exchange.get_balance(self.quote_asset), Decimal("1000000"))
+
+    @aioresponses()
+    async def test_balance_snapshot_refresh_rest_only(self, mock_api):
+        base = self.base_asset
+        quote = self.quote_asset
+        first = {
+            "rt_cd": "0", "msg_cd": "MCA00000", "msg1": "ok",
+            "output1": [{"pdno": base, "hldg_qty": "10", "ord_psbl_qty": "10"}],
+            "output2": [{"dnca_tot_amt": "1000000", "ord_psbl_cash": "1000000"}],
+        }
+        mock_api.get(re.compile(f"^{re.escape(self.balance_url)}.*"), body=json.dumps(first))
+        await self.exchange._update_balances()
+        self.assertEqual(self.exchange.get_balance(base), Decimal("10"))
+        self.assertEqual(self.exchange.get_available_balance(quote), Decimal("1000000"))
+
+        second = {
+            "rt_cd": "0", "msg_cd": "MCA00000", "msg1": "ok",
+            "output1": [{"pdno": base, "hldg_qty": "3", "ord_psbl_qty": "3"}],
+            "output2": [{"dnca_tot_amt": "1000000", "ord_psbl_cash": "400000"}],
+        }
+        mock_api.get(re.compile(f"^{re.escape(self.balance_url)}.*"), body=json.dumps(second))
+        await self.exchange._update_balances()
+        self.assertEqual(self.exchange.get_balance(base), Decimal("3"))
+        self.assertEqual(self.exchange.get_available_balance(base), Decimal("3"))
+        self.assertEqual(self.exchange.get_available_balance(quote), Decimal("400000"))
+        self.assertEqual(self.exchange.get_balance(quote), Decimal("1000000"))
+
+    @aioresponses()
+    async def test_balance_snapshot_removes_vanished_asset(self, mock_api):
+        base = self.base_asset
+        first = {
+            "rt_cd": "0", "msg_cd": "MCA00000", "msg1": "ok",
+            "output1": [{"pdno": base, "hldg_qty": "10", "ord_psbl_qty": "10"}],
+            "output2": [{"dnca_tot_amt": "1000000", "ord_psbl_cash": "1000000"}],
+        }
+        mock_api.get(re.compile(f"^{re.escape(self.balance_url)}.*"), body=json.dumps(first))
+        await self.exchange._update_balances()
+        self.assertIn(base, self.exchange._account_balances)
+
+        second = {
+            "rt_cd": "0", "msg_cd": "MCA00000", "msg1": "ok",
+            "output1": [],
+            "output2": [{"dnca_tot_amt": "1000000", "ord_psbl_cash": "1000000"}],
+        }
+        mock_api.get(re.compile(f"^{re.escape(self.balance_url)}.*"), body=json.dumps(second))
+        await self.exchange._update_balances()
+        self.assertNotIn(base, self.exchange._account_balances)
+        self.assertNotIn(base, self.exchange._account_available_balances)
 
     @aioresponses()
     async def test_update_trading_rules_does_not_raise(self, mock_api):

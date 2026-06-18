@@ -2,6 +2,7 @@ import asyncio
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from aioresponses import aioresponses
 from bidict import bidict
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 
@@ -53,6 +54,92 @@ class BithumbExchangeTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(self.exchange.available_balances["BTC"], Decimal("1.0"))
         self.assertEqual(self.exchange.get_balance("BTC"), Decimal("1.2"))
         self.assertEqual(self.exchange.available_balances["KRW"], Decimal("500000"))
+
+    async def test_get_open_orders_returns_normalized_records(self):
+        payload = [
+            {"uuid": "b-buy", "side": "bid", "market": "KRW-BTC",
+             "price": "55000000", "volume": "0.5", "remaining_volume": "0.5", "state": "wait"},
+            {"uuid": "b-sell", "side": "ask", "market": "KRW-BTC",
+             "price": "56000000", "volume": "0.2", "remaining_volume": "0.1", "state": "wait"},
+        ]
+        with patch.object(self.exchange, "_api_get", AsyncMock(return_value=payload)):
+            records = await self.exchange.get_open_orders()
+        self.assertEqual(len(records), 2)
+        buy = next(r for r in records if r.exchange_order_id == "b-buy")
+        sell = next(r for r in records if r.exchange_order_id == "b-sell")
+        self.assertEqual(buy.trade_type, TradeType.BUY)
+        self.assertEqual(buy.trading_pair, "BTC-KRW")
+        self.assertEqual(buy.price, Decimal("55000000"))
+        self.assertEqual(buy.amount, Decimal("0.5"))
+        self.assertEqual(buy.remaining_amount, Decimal("0.5"))
+        self.assertEqual(sell.trade_type, TradeType.SELL)
+        self.assertEqual(sell.remaining_amount, Decimal("0.1"))
+
+    async def test_get_open_orders_empty_returns_empty_list(self):
+        with patch.object(self.exchange, "_api_get", AsyncMock(return_value=[])):
+            self.assertEqual(await self.exchange.get_open_orders(), [])
+
+    async def test_get_open_orders_external_order_has_no_client_id(self):
+        payload = [{"uuid": "ext", "side": "ask", "market": "KRW-BTC",
+                    "price": "1", "volume": "1", "remaining_volume": "1", "state": "wait"}]
+        with patch.object(self.exchange, "_api_get", AsyncMock(return_value=payload)):
+            records = await self.exchange.get_open_orders()
+        self.assertIsNone(records[0].client_order_id)
+
+    async def test_get_open_orders_hits_correct_endpoint_and_auth(self):
+        with patch.object(self.exchange, "_api_get", AsyncMock(return_value=[])) as mock_api:
+            await self.exchange.get_open_orders()
+        kwargs = mock_api.call_args.kwargs
+        self.assertEqual(kwargs["path_url"], CONSTANTS.GET_OPEN_ORDERS_PATH_URL)
+        self.assertTrue(kwargs["is_auth_required"])
+        params = kwargs["params"]
+        self.assertEqual(params["market"], "KRW-BTC")
+        self.assertEqual(params["state"], "wait")
+
+    @aioresponses()
+    async def test_get_open_orders_hits_private_endpoint(self, mock_api):
+        import json
+        import re
+
+        from hummingbot.connector.exchange.bithumb import bithumb_web_utils as web_utils
+
+        base_url = web_utils.private_rest_url(CONSTANTS.GET_OPEN_ORDERS_PATH_URL)
+        url = re.compile(f"^{re.escape(base_url)}.*")
+        mock_api.get(url, body=json.dumps([]))
+        records = await self.exchange.get_open_orders()
+        self.assertEqual(records, [])
+        # aioresponses keys requests by (method, yarl.URL) with params merged into the URL;
+        # RequestCall is a namedtuple of (args, kwargs) ONLY (no .url), and
+        # _all_executed_requests is NOT available on this test class. JWT Authorization-header
+        # correctness is covered by the bithumb_auth unit tests; this test only proves
+        # get_open_orders() reaches the private open-orders endpoint.
+        matched = [k for k in mock_api.requests if k[0].upper() == "GET" and base_url in str(k[1])]
+        self.assertTrue(matched, f"expected a GET to {base_url}, saw {list(mock_api.requests)}")
+
+    async def test_min_notional_set_on_trading_rule(self):
+        markets = [{"market": "KRW-BTC", "korean_name": "비트코인", "english_name": "Bitcoin",
+                    "market_warning": "NONE"}]
+        rules = await self.exchange._format_trading_rules(markets)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].min_notional_size, Decimal(str(CONSTANTS.MIN_NOTIONAL_KRW)))
+
+    async def test_order_below_min_notional_rejected(self):
+        markets = [{"market": "KRW-BTC", "korean_name": "비트코인", "english_name": "Bitcoin",
+                    "market_warning": "NONE"}]
+        rules = await self.exchange._format_trading_rules(markets)
+        self.exchange._trading_rules = {r.trading_pair: r for r in rules}
+        price = Decimal("1000")
+        tiny_amount = (Decimal(str(CONSTANTS.MIN_NOTIONAL_KRW)) - Decimal("1")) / price
+        with patch.object(self.exchange, "_place_order_and_process_update", AsyncMock()) as mock_place:
+            await self.exchange._create_order(
+                trade_type=TradeType.BUY,
+                order_id="rule2-reject",
+                trading_pair="BTC-KRW",
+                amount=tiny_amount,
+                order_type=OrderType.LIMIT,
+                price=price,
+            )
+        mock_place.assert_not_awaited()
 
     async def test_place_limit_order_builds_payload(self):
         with patch.object(self.exchange, "_api_post", AsyncMock(return_value={"uuid": "order-2"})) as mock_post:

@@ -93,6 +93,17 @@ class Hip3KisLadderControllerConfig(ControllerConfigBase):
     kill_switch: bool = Field(default=False, json_schema_extra={"is_updatable": True})
     # No-submit verification: executor computes fair + logs intended quotes, no orders.
     observe: bool = Field(default=False, json_schema_extra={"is_updatable": True})
+    adopt_existing_inventory: bool = Field(default=False, json_schema_extra={"is_updatable": True})
+
+    # Two-sided MM
+    two_sided: bool = False
+    k_open_skew_bps: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
+    k_close_skew_bps: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
+    eod_close_skew_bps: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
+    eod_wind_minutes: int = Field(default=0, json_schema_extra={"is_updatable": True})
+    max_close_cost_bps: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
+    wind_down: bool = Field(default=False, json_schema_extra={"is_updatable": True})
+    flatten_timeout_s: float = Field(default=30.0, json_schema_extra={"is_updatable": True})
 
     # One executor per controller (single-direction ladder per symbol)
     max_executors: int = Field(default=1, json_schema_extra={"is_updatable": True})
@@ -175,6 +186,15 @@ class Hip3KisLadderController(ControllerBase):
                 leverage=self.config.leverage,
                 kill_switch=self.config.kill_switch,
                 observe=self.config.observe,
+                adopt_existing_inventory=self.config.adopt_existing_inventory,
+                two_sided=self.config.two_sided,
+                k_open_skew_bps=self.config.k_open_skew_bps,
+                k_close_skew_bps=self.config.k_close_skew_bps,
+                eod_close_skew_bps=self.config.eod_close_skew_bps,
+                eod_wind_minutes=self.config.eod_wind_minutes,
+                max_close_cost_bps=self.config.max_close_cost_bps,
+                wind_down=self.config.wind_down,
+                flatten_timeout_s=self.config.flatten_timeout_s,
                 controller_id=self.config.id,
             ),
             controller_id=self.config.id,

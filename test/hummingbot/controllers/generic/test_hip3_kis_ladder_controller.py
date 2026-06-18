@@ -84,6 +84,62 @@ class TestHip3KisLadderController(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(all(isinstance(a, ExecutorAction) for a in actions))
         self.assertEqual(1, len(actions))
 
+    def test_two_sided_fields_default_to_single_direction(self):
+        self.controller.executors_info = []
+
+        actions = self.controller.determine_executor_actions()
+        executor_config = actions[0].executor_config
+
+        self.assertIsInstance(executor_config, LadderMakerExecutorConfig)
+        self.assertIs(executor_config.two_sided, False)
+        self.assertEqual(Decimal("0"), executor_config.k_open_skew_bps)
+        self.assertEqual(Decimal("0"), executor_config.k_close_skew_bps)
+        self.assertEqual(Decimal("0"), executor_config.eod_close_skew_bps)
+        self.assertEqual(0, executor_config.eod_wind_minutes)
+        self.assertEqual(Decimal("0"), executor_config.max_close_cost_bps)
+        self.assertIs(executor_config.wind_down, False)
+        self.assertEqual(30.0, executor_config.flatten_timeout_s)
+
+    def test_two_sided_fields_passthrough(self):
+        self.config.two_sided = True
+        self.config.k_open_skew_bps = Decimal("3.5")
+        self.config.k_close_skew_bps = Decimal("4.5")
+        self.config.eod_close_skew_bps = Decimal("7.5")
+        self.config.eod_wind_minutes = 25
+        self.config.max_close_cost_bps = Decimal("2.5")
+        self.config.wind_down = True
+        self.config.flatten_timeout_s = 45.5
+        self.controller.executors_info = []
+
+        actions = self.controller.determine_executor_actions()
+        executor_config = actions[0].executor_config
+
+        self.assertIs(executor_config.two_sided, True)
+        self.assertEqual(Decimal("3.5"), executor_config.k_open_skew_bps)
+        self.assertEqual(Decimal("4.5"), executor_config.k_close_skew_bps)
+        self.assertEqual(Decimal("7.5"), executor_config.eod_close_skew_bps)
+        self.assertEqual(25, executor_config.eod_wind_minutes)
+        self.assertEqual(Decimal("2.5"), executor_config.max_close_cost_bps)
+        self.assertIs(executor_config.wind_down, True)
+        self.assertEqual(45.5, executor_config.flatten_timeout_s)
+
+    def test_adopt_existing_inventory_defaults_false(self):
+        self.controller.executors_info = []
+
+        actions = self.controller.determine_executor_actions()
+        executor_config = actions[0].executor_config
+
+        self.assertIs(executor_config.adopt_existing_inventory, False)
+
+    def test_adopt_existing_inventory_passthrough(self):
+        self.config.adopt_existing_inventory = True
+        self.controller.executors_info = []
+
+        actions = self.controller.determine_executor_actions()
+        executor_config = actions[0].executor_config
+
+        self.assertIs(executor_config.adopt_existing_inventory, True)
+
     def test_determine_executor_actions_filters_done_through_real_base(self):
         # One running (not-done) + one terminated (done). The not-done lambda is
         # applied through the REAL ControllerBase.filter_executors. The single

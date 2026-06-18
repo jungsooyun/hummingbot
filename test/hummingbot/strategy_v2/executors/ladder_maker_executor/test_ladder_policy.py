@@ -111,6 +111,22 @@ def test_compute_hedge_order_buy_marketable():
     assert hedge.price == D("70311")  # 70100*1.003=70310.3 -> ceil tick(1) = 70311
 
 
+def test_compute_hedge_order_sell_marketable():
+    hedge = compute_hedge_order(
+        D("0.5"),
+        D("2"),
+        D("70000"),
+        D("30"),
+        D("1"),
+        side=Side.SELL,
+    )
+
+    assert hedge.side == Side.SELL
+    assert hedge.size == D("1.0")
+    assert hedge.price == D("69790")  # 70000*0.997=69790 -> floor tick(1) = 69790
+    assert hedge.price < D("70000")
+
+
 # --- Task 2: net-edge placement (gross = net + cost_bps) ---
 
 

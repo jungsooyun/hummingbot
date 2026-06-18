@@ -32,18 +32,25 @@ from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.cross_venue_he
 )
 from hummingbot.strategy_v2.executors.ladder_maker_executor.data_types import LadderMakerExecutorConfig
 from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import (
+    RestingOrder,
+    RungTarget,
     RungSpec,
     Side,
+    TwoSidedTargets,
     apply_inventory_skew,
     build_ladder_targets,
+    build_two_sided_targets,
+    compute_eod_pressure,
     compute_fair_price,
     compute_hedge_order,
+    diff_ladder_targets,
 )
 from hummingbot.strategy_v2.gates.gate_chain import GateChain, GateContext, InventoryGate, KillSwitchGate
 from hummingbot.strategy_v2.models.executors import TrackedOrder
 
 ZERO = Decimal("0")
 _KST = timezone(timedelta(hours=9))
+_KRX_CLOSE_MIN = 15 * 60 + 30  # 15:30 KST
 
 
 def _fmt_num(x) -> Optional[str]:
@@ -132,6 +139,8 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         return total
 
     def _gates_open(self) -> bool:
+        if getattr(self, "_seed_fail_closed", False):
+            return False
         ctx = GateContext(
             now_kst=datetime.fromtimestamp(self._strategy.current_timestamp, tz=_KST),
             kis_age_s=0.0,  # feed-age gates land in JEP-133
@@ -193,6 +202,20 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
 
     # ------------------------------------------------------------------ ladder hooks
 
+    def _is_two_sided(self) -> bool:
+        return getattr(self.config, "two_sided", False) is True
+
+    def _compute_eod_pressure(self) -> Decimal:
+        wind = getattr(self.config, "eod_wind_minutes", 0)
+        if not wind or wind <= 0:
+            return ZERO
+        now = datetime.fromtimestamp(self._strategy.current_timestamp, tz=_KST)
+        now_kst_min = now.hour * 60 + now.minute
+        return compute_eod_pressure(now_kst_min, _KRX_CLOSE_MIN, wind)
+
+    def _effective_wind_down(self) -> bool:
+        return bool(getattr(self.config, "wind_down", False)) or getattr(self, "_flatten_on_stop", False)
+
     def _compute_targets(self) -> List:
         side = self._policy_side()
         fair = self._compute_fair(side)
@@ -202,18 +225,55 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             RungSpec(edge_bps=r.edge_bps, size=r.size, min_edge_bps=r.min_edge_bps, enabled=r.enabled)
             for r in self.config.rungs
         ]
-        return build_ladder_targets(
-            fair=fair,
+        if not self._is_two_sided():
+            return build_ladder_targets(
+                fair=fair,
+                rungs=rungs,
+                total_size_cap=self.config.total_size_cap,
+                side=side,
+                tick=self.config.maker_tick,
+                buffer_ticks=self.config.buffer_ticks,
+                inventory=self._unhedged_base_signed(),
+                max_inventory=self.config.max_inventory,
+                cost_bps=self.config.round_trip_cost_bps,
+                current_position=self._maker_executed_base,
+            )
+        state = self._two_sided_state()
+        close_side = Side.BUY if side is Side.SELL else Side.SELL
+        fair_close = self._compute_fair(close_side)
+        if fair_close is None:
+            return []
+        tst: TwoSidedTargets = build_two_sided_targets(
+            fair_open=fair,
+            fair_close=fair_close,
             rungs=rungs,
             total_size_cap=self.config.total_size_cap,
-            side=side,
+            net_position=state["Q"],
+            open_edge_vwap=self._open_edge_vwap,
+            util=state["util"],
+            eod_pressure=state["eod"],
+            cost_bps=self.config.round_trip_cost_bps,
+            k_open_skew_bps=self.config.k_open_skew_bps,
+            k_close_skew_bps=self.config.k_close_skew_bps,
+            eod_close_skew_bps=self.config.eod_close_skew_bps,
+            max_close_cost_bps=self.config.max_close_cost_bps,
             tick=self.config.maker_tick,
             buffer_ticks=self.config.buffer_ticks,
-            inventory=self._unhedged_base_signed(),
-            max_inventory=self.config.max_inventory,
-            cost_bps=self.config.round_trip_cost_bps,
-            current_position=self._maker_executed_base,
+            wind_down=self._effective_wind_down(),
         )
+        return list(tst.open) + list(tst.close)
+
+    def _two_sided_state(self) -> Dict[str, Decimal]:
+        cap = self.config.total_size_cap
+        q = self._paired_oi()
+        util = (q / cap) if cap > ZERO else ZERO
+        return {
+            "Q": q,
+            "U": abs(self._unhedged_base_signed()),
+            "util": util,
+            "eod": self._compute_eod_pressure(),
+            "pending_signed": self._pending_hedge_signed,
+        }
 
     def _should_reprice(self, targets: List) -> bool:
         open_makers = self._open_maker_orders()
@@ -222,6 +282,8 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         elapsed = self._strategy.current_timestamp - self._last_reprice_ts
         if elapsed < self.config.min_reprice_interval_s:
             return False
+        if self._is_two_sided():
+            return self._two_sided_should_reprice(targets, open_makers)
         # Reprice only if the best target moved beyond the tick threshold.
         target_prices = sorted(t.price for t in targets)
         current_prices = sorted(o.order.price for o in open_makers if o.order is not None)
@@ -229,6 +291,124 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             return True
         delta = abs(target_prices[0] - current_prices[0])
         return delta >= self.config.min_reprice_delta_ticks * self.config.maker_tick
+
+    def _two_sided_should_reprice(self, targets: List, open_makers: List) -> bool:
+        conn = self.connectors[self.maker_connector]
+        pair = self.maker_trading_pair
+        tol = self.config.min_reprice_delta_ticks * self.config.maker_tick
+
+        def is_open_side(side: TradeType) -> bool:
+            return side == self.entry_side
+
+        tgt = {True: [], False: []}
+        for t in targets:
+            side = TradeType.SELL if t.side == Side.SELL else TradeType.BUY
+            qp = conn.quantize_order_price(pair, t.price)
+            qa = conn.quantize_order_amount(pair, t.size)
+            tgt[is_open_side(side)].append((qp, qa))
+
+        rest = {True: [], False: []}
+        for o in open_makers:
+            if o.order is None:
+                return True
+            rest[is_open_side(o.order.trade_type)].append((o.order.price, o.order.amount))
+
+        for side_key in (True, False):
+            t_side = tgt[side_key]
+            r_side = rest[side_key]
+            if len(t_side) != len(r_side):
+                return True
+            t_prices = sorted(p for p, _ in t_side)
+            r_prices = sorted(p for p, _ in r_side)
+            if any(abs(tp - rp) >= tol for tp, rp in zip(t_prices, r_prices)):
+                return True
+            t_sizes = sorted(a for _, a in t_side)
+            r_sizes = sorted(a for _, a in r_side)
+            if t_sizes != r_sizes:
+                return True
+        return False
+
+    def _reconcile_maker(self) -> None:
+        if not self._is_two_sided():
+            return super()._reconcile_maker()
+        if getattr(self.config, "wind_down", False):
+            return super()._reconcile_maker()
+        targets = self._compute_targets()
+        if not self._should_reprice(targets):
+            return
+        if self.config.observe:
+            self._place_targets(targets)
+            return
+        if hasattr(self, "_maker_placed_rung"):
+            live_order_ids = set(self.maker_orders)
+            self._maker_placed_rung = {
+                oid: rung for oid, rung in self._maker_placed_rung.items() if oid in live_order_ids
+            }
+        inflight_ids = {oid for oid, o in self.maker_orders.items() if o.order is None}
+        resting = self._resting_maker_orders()
+        for oid in inflight_ids:
+            rung = getattr(self, "_maker_placed_rung", {}).get(oid)
+            if rung is None:
+                continue
+            side, price, size = rung
+            resting.append(RestingOrder(order_id=oid, side=side, price=price, size=size))
+        diff = diff_ladder_targets(
+            resting,
+            targets,
+            self.config.maker_tick,
+            self.config.min_reprice_delta_ticks,
+        )
+        unmatched_inflight = [oid for oid in diff.to_cancel if oid in inflight_ids]
+        placed_rung = getattr(self, "_maker_placed_rung", {})
+        blocked_sides = {
+            placed_rung[oid][0]
+            for oid in unmatched_inflight
+            if oid in placed_rung
+        }
+        to_place = [target for target in diff.to_place if target.side not in blocked_sides]
+        for oid in diff.to_cancel:
+            if oid in inflight_ids:
+                continue
+            self._strategy.cancel(self.maker_connector, self.maker_trading_pair, oid)
+        self._place_targets_subset(to_place)
+        self._last_reprice_ts = self._strategy.current_timestamp
+
+    def _resting_maker_orders(self) -> List[RestingOrder]:
+        conn = self.connectors[self.maker_connector]
+        pair = self.maker_trading_pair
+        out: List[RestingOrder] = []
+        for o in self._open_maker_orders():
+            if o.order is None:
+                continue
+            side = Side.BUY if o.order.trade_type == TradeType.BUY else Side.SELL
+            out.append(
+                RestingOrder(
+                    order_id=o.order_id,
+                    side=side,
+                    price=conn.quantize_order_price(pair, o.order.price),
+                    size=conn.quantize_order_amount(pair, o.order.amount),
+                )
+            )
+        return out
+
+    def _place_target_one(self, target: RungTarget) -> None:
+        if self._is_two_sided():
+            side = TradeType.SELL if target.side == Side.SELL else TradeType.BUY
+            position_action = PositionAction.OPEN if side == self.entry_side else PositionAction.CLOSE
+            self._place_maker(
+                target.price,
+                target.size,
+                target.edge_bps,
+                side=side,
+                position_action=position_action,
+            )
+        else:
+            self._place_maker(target.price, target.size, target.edge_bps)
+
+    def _place_targets_subset(self, targets: List[RungTarget]) -> None:
+        for target in targets:
+            self._place_target_one(target)
+        self._last_reprice_ts = self._strategy.current_timestamp
 
     def _place_targets(self, targets: List) -> None:
         if self.config.observe:
@@ -243,10 +423,69 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
                 self._last_observe_log_ts = now
                 self.logger().info(self._format_observe_line(self._last_observe))
         for target in targets:
-            self._place_maker(target.price, target.size, target.edge_bps)
+            self._place_target_one(target)
         self._last_reprice_ts = self._strategy.current_timestamp
 
-    def _place_maker(self, price: Decimal, amount: Decimal, edge_bps: Decimal) -> None:
+    def _flatten_unwind_step(self) -> bool:
+        self._process_hedges()
+        perp = self._perp_net()
+        taker_live = self._flatten_taker_live()
+        if perp == ZERO and not taker_live:
+            return False
+        if self._hedge_kill_switch:
+            return True
+        if taker_live:
+            return True
+        now = self._strategy.current_timestamp
+        if self._flatten_started_ts is None:
+            self._flatten_started_ts = now
+        elapsed = now - self._flatten_started_ts
+        if elapsed < self.config.flatten_timeout_s:
+            self._reconcile_maker()
+        elif self._open_maker_orders():
+            self._cancel_all_maker()
+        else:
+            self._place_flatten_taker(abs(perp))
+        return True
+
+    def _flatten_taker_live(self) -> bool:
+        """True while the flatten MARKET taker is pending or open."""
+        oid = getattr(self, "_flatten_taker_oid", None)
+        if oid is None:
+            return False
+        o = self.maker_orders.get(oid)
+        if o is None:
+            return False
+        return o.order is None or o.order.is_open
+
+    def _place_flatten_taker(self, amount: Decimal) -> None:
+        conn = self.connectors[self.maker_connector]
+        q_amount = conn.quantize_order_amount(self.maker_trading_pair, amount)
+        if q_amount <= ZERO:
+            return
+        close_side = TradeType.BUY if self.entry_side == TradeType.SELL else TradeType.SELL
+        order_id = self.place_order(
+            connector_name=self.maker_connector,
+            trading_pair=self.maker_trading_pair,
+            order_type=OrderType.MARKET,
+            side=close_side,
+            amount=q_amount,
+            position_action=PositionAction.CLOSE,
+            price=Decimal("NaN"),
+            metadata={"order_role": "flatten_taker"},
+        )
+        self.maker_orders[order_id] = TrackedOrder(order_id=order_id)
+        self._flatten_taker_oid = order_id
+
+    def _place_maker(
+        self,
+        price: Decimal,
+        amount: Decimal,
+        edge_bps: Decimal,
+        side: Optional[TradeType] = None,
+        position_action: PositionAction = PositionAction.OPEN,
+    ) -> None:
+        side = side if side is not None else self.entry_side
         connector = self.connectors[self.maker_connector]
         q_amount = connector.quantize_order_amount(self.maker_trading_pair, amount)
         q_price = connector.quantize_order_price(self.maker_trading_pair, price)
@@ -259,13 +498,25 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             connector_name=self.maker_connector,
             trading_pair=self.maker_trading_pair,
             order_type=OrderType.LIMIT_MAKER,
-            side=self.entry_side,
+            side=side,
             amount=q_amount,
-            position_action=PositionAction.OPEN,
+            position_action=position_action,
             price=q_price,
             metadata={"order_role": "maker", "edge_bps": str(edge_bps)},
         )
         self.maker_orders[order_id] = TrackedOrder(order_id=order_id)
+        if self._is_two_sided():
+            # Only the two-sided diff path reads _maker_placed_rung (and prunes it to
+            # live orders each reconcile). Recording it on the single-sided path would
+            # leak, since base _reconcile_maker never prunes it.
+            if not hasattr(self, "_maker_placed_rung"):
+                self._maker_placed_rung = {}
+            policy_side = Side.BUY if side == TradeType.BUY else Side.SELL
+            self._maker_placed_rung[order_id] = (policy_side, q_price, q_amount)
+        if position_action == PositionAction.OPEN:
+            if not hasattr(self, "_maker_placed_edge_bps"):
+                self._maker_placed_edge_bps = {}
+            self._maker_placed_edge_bps[order_id] = Decimal(edge_bps)
 
     # ------------------------------------------------------------------ observe
 
@@ -282,6 +533,45 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         fx_bid, fx_ask = self._get_fx()
         fair = self._compute_fair(self._policy_side())
         conn = self.connectors[self.maker_connector]
+        if self._is_two_sided():
+            state = self._two_sided_state()
+
+            def serialize(target) -> Dict:
+                side = TradeType.SELL if target.side == Side.SELL else TradeType.BUY
+                position_action = PositionAction.OPEN if side == self.entry_side else PositionAction.CLOSE
+                return {
+                    "side": side.name,
+                    "position_action": position_action.name,
+                    "edge_bps": _fmt_num(target.edge_bps),
+                    "price": _fmt_num(conn.quantize_order_price(self.maker_trading_pair, target.price)),
+                    "size": _fmt_num(target.size),
+                }
+
+            open_targets = []
+            close_targets = []
+            for target in targets:
+                serialized = serialize(target)
+                if serialized["position_action"] == PositionAction.OPEN.name:
+                    open_targets.append(serialized)
+                else:
+                    close_targets.append(serialized)
+            return {
+                "two_sided": True,
+                "side": self.entry_side.name,
+                "fair": _fmt_num(fair),
+                "spot_pair": self.hedge_trading_pair,
+                "spot_bid": _fmt_num(bid),
+                "spot_ask": _fmt_num(ask),
+                "fx_bid": _fmt_num(fx_bid),
+                "fx_ask": _fmt_num(fx_ask),
+                "Q": _fmt_num(state["Q"]),
+                "U": _fmt_num(state["U"]),
+                "util": _fmt_num(state["util"]),
+                "eod": _fmt_num(state["eod"]),
+                "pending_signed": _fmt_num(state["pending_signed"]),
+                "open": open_targets,
+                "close": close_targets,
+            }
         rungs = [
             {
                 "edge_bps": _fmt_num(t.edge_bps),
@@ -303,6 +593,14 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
 
     @staticmethod
     def _format_observe_line(obs: Dict) -> str:
+        if obs.get("two_sided"):
+            open_rungs = " ".join(f"{r['side']} {r['price']}@{r['edge_bps']}bps" for r in obs["open"])
+            close_rungs = " ".join(f"{r['side']} {r['price']}@{r['edge_bps']}bps" for r in obs["close"])
+            return (
+                f"[OBSERVE] {obs['side']} two_sided fair={obs['fair']} "
+                f"Q={obs['Q']} util={obs['util']} "
+                f"open: {open_rungs} close: {close_rungs} -- no submit"
+            )
         rungs = " ".join(f"{r['price']}@{r['edge_bps']}bps" for r in obs["rungs"])
         return (
             f"[OBSERVE] {obs['side']} fair={obs['fair']} "
@@ -317,19 +615,26 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             info["last_quote"] = self._last_observe
         return info
 
+    def _residual_mark_price(self) -> Decimal:
+        fair = self._compute_fair(self._policy_side())
+        return fair if fair is not None else super()._residual_mark_price()
+
     # ------------------------------------------------------------------ hedge hook
 
     def _size_hedge(self, pending_base: Decimal) -> Optional[Dict]:
         kis = self.connectors[self.hedge_connector]
-        best_ask = kis.get_price_by_type(self.hedge_trading_pair, PriceType.BestAsk)
-        if not best_ask or best_ask <= ZERO:
+        hedge_side = Side.BUY if self._pending_hedge_signed < ZERO else Side.SELL
+        price_type = PriceType.BestAsk if hedge_side is Side.BUY else PriceType.BestBid
+        ref = kis.get_price_by_type(self.hedge_trading_pair, price_type)
+        if not ref or ref <= ZERO:
             return None
         hedge = compute_hedge_order(
             fill_qty=pending_base,
             share_per_unit=self.config.share_per_unit,
-            kis_best_ask=Decimal(str(best_ask)),
+            kis_price=Decimal(str(ref)),
             max_slippage_bps=self.config.hedge_max_slippage_bps,
             tick=self.config.hedge_tick,
+            side=hedge_side,
         )
         amount = kis.quantize_order_amount(self.hedge_trading_pair, hedge.size)
         if amount <= ZERO:
@@ -345,6 +650,12 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             "order_type": self.config.hedge_order_type,
             "metadata": {"order_role": "hedge"},
         }
+
+    def _hedge_base_to_maker_base(self, amount: Decimal) -> Decimal:
+        spu = self.config.share_per_unit
+        if spu and spu != ZERO:
+            return amount / spu
+        return amount
 
     # ------------------------------------------------------------------ balance hook
 

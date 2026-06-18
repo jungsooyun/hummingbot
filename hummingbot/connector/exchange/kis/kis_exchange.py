@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from bidict import bidict
 
 from hummingbot.connector.constants import s_decimal_NaN
+from hummingbot.connector.exchange.open_order_record import OpenOrderRecord
 from hummingbot.connector.exchange.kis import (
     kis_constants as CONSTANTS,
     kis_utils,
@@ -459,7 +460,10 @@ class KisExchange(ExchangePyBase):
         # Parse KRW cash from output2
         for cash_info in result.get("output2", []):
             krw_total = Decimal(str(cash_info.get("dnca_tot_amt", "0")))
-            krw_available = Decimal(str(cash_info.get("dnca_tot_amt", "0")))
+            krw_available = next(
+                (Decimal(str(cash_info[k])) for k in ("ord_psbl_cash", "nrcvb_buy_amt", "dnca_tot_amt") if k in cash_info),
+                Decimal("0"),
+            )  # orderable cash precedence: ord_psbl_cash -> nrcvb_buy_amt -> dnca_tot_amt (first present wins). VERIFY exact key against live output2
             if krw_total > 0:
                 # Use quote asset name from trading pairs
                 for tp in self._trading_pairs:
@@ -566,6 +570,80 @@ class KisExchange(ExchangePyBase):
             is_auth_required=True,
             headers={"tr_id": tr_id},
         )
+
+    async def get_open_orders(self, trading_pair: Optional[str] = None) -> List[OpenOrderRecord]:
+        # HIGH-1: built on the EXISTING, verified inquire-daily-ccld endpoint, filtered to
+        # NON-TERMINAL (resting) rows. (A dedicated inquire-psbl-rvsecncl endpoint may replace
+        # this ONLY after its path+TR_ID+field contract is verified against KIS docs/live.)
+        tr_id = CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_TR_ID
+        if self._sandbox:
+            tr_id = self._sandbox_tr_id(tr_id)
+        today = self._kst_today()
+        records: List[OpenOrderRecord] = []
+        by_eoid = self._order_tracker.all_fillable_orders_by_exchange_order_id
+        fk100, nk100 = "", ""
+        max_pages = 50
+        for _ in range(max_pages):
+            params = {
+                "CANO": self._cano,
+                "ACNT_PRDT_CD": self._acnt_prdt_cd,
+                "INQR_STRT_DT": today,
+                "INQR_END_DT": today,
+                "SLL_BUY_DVSN_CD": "00",
+                "INQR_DVSN": "00",
+                "PDNO": "",
+                "CCLD_DVSN": "00",
+                "ORD_GNO_BRNO": "",
+                "ODNO": "",
+                "INQR_DVSN_3": "00",
+                "INQR_DVSN_1": "",
+                "EXCG_ID_DVSN_CD": self._excg_for_routing(),
+                "CTX_AREA_FK100": fk100,
+                "CTX_AREA_NK100": nk100,
+            }
+            result = await self._api_get(
+                path_url=CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH,
+                params=params,
+                is_auth_required=True,
+                headers={"tr_id": tr_id},
+            )
+            for row in result.get("output1", []) or []:
+                if str(row.get("cncl_yn", "N")).upper() == "Y":
+                    continue
+                ord_qty = Decimal(str(row.get("ord_qty", "0") or "0"))
+                ccld_qty = Decimal(str(row.get("tot_ccld_qty", "0") or "0"))
+                if ord_qty > 0 and ccld_qty >= ord_qty:
+                    continue
+                pdno = str(row.get("pdno", ""))
+                try:
+                    tp = await self.trading_pair_associated_to_exchange_symbol(pdno)
+                except KeyError:
+                    continue
+                if trading_pair is not None and tp != trading_pair:
+                    continue
+                trade_type = TradeType.SELL if str(row.get("sll_buy_dvsn_cd", "")) == "01" else TradeType.BUY
+                eoid = str(row.get("odno", ""))
+                tracked = by_eoid.get(eoid)
+                # VERIFY: inquire-daily-ccld remaining-qty field name (rmn_qty/ord_psbl_qty) + ord_unpr unit-price key against the connector's existing parser / KIS docs
+                remaining = row.get("rmn_qty", row.get("ord_psbl_qty"))
+                remaining_amount = Decimal(str(remaining)) if remaining is not None else (ord_qty - ccld_qty)
+                records.append(OpenOrderRecord(
+                    trading_pair=tp,
+                    exchange_order_id=eoid,
+                    client_order_id=tracked.client_order_id if tracked else None,
+                    trade_type=trade_type,
+                    price=Decimal(str(row.get("ord_unpr", "0"))),
+                    amount=ord_qty,
+                    remaining_amount=remaining_amount,
+                ))
+            # VERIFY: pagination (ctx_area_nk100/tr_cont) + after-15:30 resting-order visibility against KIS live response
+            nk100 = str(result.get("ctx_area_nk100", "")).strip()
+            fk100 = str(result.get("ctx_area_fk100", "")).strip()
+            if not nk100 and not str(result.get("tr_cont", "")).strip():
+                break
+            if not nk100:
+                break
+        return records
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         trade_updates = []
