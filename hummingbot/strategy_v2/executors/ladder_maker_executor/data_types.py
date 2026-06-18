@@ -73,6 +73,7 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
     eod_wind_minutes: int = 0
     max_close_cost_bps: Decimal = Decimal("0")
     wind_down: bool = False
+    flatten_timeout_s: float = 30.0
 
     # Display / bookkeeping
     execution_purpose: str = Field(default="ladder_market_making")

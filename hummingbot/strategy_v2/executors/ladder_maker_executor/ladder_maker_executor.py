@@ -208,6 +208,9 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         now_kst_min = now.hour * 60 + now.minute
         return compute_eod_pressure(now_kst_min, _KRX_CLOSE_MIN, wind)
 
+    def _effective_wind_down(self) -> bool:
+        return bool(getattr(self.config, "wind_down", False)) or getattr(self, "_flatten_on_stop", False)
+
     def _compute_targets(self) -> List:
         side = self._policy_side()
         fair = self._compute_fair(side)
@@ -246,7 +249,7 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             max_close_cost_bps=self.config.max_close_cost_bps,
             tick=self.config.maker_tick,
             buffer_ticks=self.config.buffer_ticks,
-            wind_down=self.config.wind_down,
+            wind_down=self._effective_wind_down(),
         )
         return list(tst.open) + list(tst.close)
 
@@ -341,6 +344,57 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             else:
                 self._place_maker(target.price, target.size, target.edge_bps)
         self._last_reprice_ts = self._strategy.current_timestamp
+
+    def _flatten_unwind_step(self) -> bool:
+        self._process_hedges()
+        perp = self._perp_net()
+        taker_live = self._flatten_taker_live()
+        if perp == ZERO and not taker_live:
+            return False
+        if self._hedge_kill_switch:
+            return True
+        if taker_live:
+            return True
+        now = self._strategy.current_timestamp
+        if self._flatten_started_ts is None:
+            self._flatten_started_ts = now
+        elapsed = now - self._flatten_started_ts
+        if elapsed < self.config.flatten_timeout_s:
+            self._reconcile_maker()
+        elif self._open_maker_orders():
+            self._cancel_all_maker()
+        else:
+            self._place_flatten_taker(abs(perp))
+        return True
+
+    def _flatten_taker_live(self) -> bool:
+        """True while the flatten MARKET taker is pending or open."""
+        oid = getattr(self, "_flatten_taker_oid", None)
+        if oid is None:
+            return False
+        o = self.maker_orders.get(oid)
+        if o is None:
+            return False
+        return o.order is None or o.order.is_open
+
+    def _place_flatten_taker(self, amount: Decimal) -> None:
+        conn = self.connectors[self.maker_connector]
+        q_amount = conn.quantize_order_amount(self.maker_trading_pair, amount)
+        if q_amount <= ZERO:
+            return
+        close_side = TradeType.BUY if self.entry_side == TradeType.SELL else TradeType.SELL
+        order_id = self.place_order(
+            connector_name=self.maker_connector,
+            trading_pair=self.maker_trading_pair,
+            order_type=OrderType.MARKET,
+            side=close_side,
+            amount=q_amount,
+            position_action=PositionAction.CLOSE,
+            price=Decimal("NaN"),
+            metadata={"order_role": "flatten_taker"},
+        )
+        self.maker_orders[order_id] = TrackedOrder(order_id=order_id)
+        self._flatten_taker_oid = order_id
 
     def _place_maker(
         self,

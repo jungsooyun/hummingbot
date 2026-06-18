@@ -138,6 +138,8 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         # Order books keyed by client order id.
         self.maker_orders: Dict[str, TrackedOrder] = {}
         self.hedge_orders: Dict[str, TrackedOrder] = {}
+        self._flatten_on_stop = False
+        self._flatten_started_ts = None
 
         # Fill accounting.
         self._maker_executed_base = ZERO
@@ -261,7 +263,13 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         elif self.status == RunnableStatus.SHUTTING_DOWN:
             await self._control_shutdown()
 
-    def early_stop(self, keep_position: bool = False):
+    def early_stop(self, keep_position: bool = False, flatten: bool = False):
+        if flatten:
+            self._flatten_on_stop = True
+            self._flatten_started_ts = self._strategy.current_timestamp
+            self.close_type = CloseType.EARLY_STOP
+            self._status = RunnableStatus.SHUTTING_DOWN
+            return
         if keep_position:
             self.close_type = CloseType.POSITION_HOLD
             self.stop()
@@ -270,11 +278,21 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         self._status = RunnableStatus.SHUTTING_DOWN
 
     async def _control_shutdown(self):
+        if getattr(self, "_flatten_on_stop", False) and self._flatten_unwind_step():
+            return
         self._cancel_all_maker()
         # Best-effort: hedge any remaining unhedged fills before terminating.
         self._process_hedges()
         if not self._has_open_orders() and self._unhedged_base() <= ZERO:
             self.stop()
+
+    def _flatten_unwind_step(self) -> bool:
+        """Override to actively unwind held inventory during a flatten shutdown.
+
+        Return True while still unwinding (skip the cancel+stop), False when there is
+        nothing left to flatten (let the base finish).
+        """
+        return False
 
     # ============================================================ maker reconcile
 
