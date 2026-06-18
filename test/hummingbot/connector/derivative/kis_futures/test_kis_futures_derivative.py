@@ -815,3 +815,265 @@ def test_place_cancel_wire_body_fields():
 
     assert sent["RVSE_CNCL_DVSN_CD"] == "02"
     assert sent["ORGN_ODNO"] == "0000009999"
+
+
+# ---------------------------------------------------------------------------
+# Adversarial hardening tests (B2/B3/B4/I5/I7)
+# ---------------------------------------------------------------------------
+
+# B2 — fail-closed account state
+
+def test_update_balances_raises_on_bad_rt_cd():
+    """_update_balances raises IOError (not silently zeroing KRW) when rt_cd != '0'."""
+    c = _make_connector()
+
+    bad_resp = {"rt_cd": "1", "msg1": "ERROR", "output2": {}}
+
+    async def _run():
+        with patch.object(c, "_fetch_balance", return_value=bad_resp):
+            await c._update_balances()
+
+    with pytest.raises(IOError, match="rt_cd=1"):
+        loop = asyncio.new_event_loop(); loop.run_until_complete(_run()); loop.close()
+
+
+def test_update_balances_raises_on_missing_output2():
+    """_update_balances raises IOError when output2 is missing/empty."""
+    c = _make_connector()
+
+    resp = {"rt_cd": "0", "msg1": "OK"}  # no output2 key
+
+    async def _run():
+        with patch.object(c, "_fetch_balance", return_value=resp):
+            await c._update_balances()
+
+    with pytest.raises(IOError, match="output2 missing"):
+        loop = asyncio.new_event_loop(); loop.run_until_complete(_run()); loop.close()
+
+
+def test_update_balances_does_not_zero_on_failure():
+    """Existing balance is preserved when _update_balances fails."""
+    c = _make_connector()
+    c._account_balances["KRW"] = Decimal("5000000")
+
+    bad_resp = {"rt_cd": "9", "msg1": "TIMEOUT"}
+
+    async def _run():
+        with patch.object(c, "_fetch_balance", return_value=bad_resp):
+            await c._update_balances()
+
+    try:
+        loop = asyncio.new_event_loop(); loop.run_until_complete(_run()); loop.close()
+    except IOError:
+        pass
+    assert c._account_balances["KRW"] == Decimal("5000000"), (
+        "Prior balance must be kept on failure — no zeroing"
+    )
+
+
+def test_update_positions_raises_on_bad_rt_cd():
+    """_update_positions raises IOError when rt_cd != '0'."""
+    c = _make_connector()
+
+    bad_resp = {"rt_cd": "2", "msg1": "FAIL", "output1": []}
+
+    async def _run():
+        with patch.object(c, "_fetch_balance", return_value=bad_resp):
+            await c._update_positions()
+
+    with pytest.raises(IOError, match="rt_cd=2"):
+        loop = asyncio.new_event_loop(); loop.run_until_complete(_run()); loop.close()
+
+
+def test_update_positions_raises_on_missing_output1():
+    """_update_positions raises IOError when output1 is not a list."""
+    c = _make_connector()
+
+    resp = {"rt_cd": "0", "msg1": "OK"}  # output1 missing
+
+    async def _run():
+        with patch.object(c, "_fetch_balance", return_value=resp):
+            await c._update_positions()
+
+    with pytest.raises(IOError, match="output1 missing"):
+        loop = asyncio.new_event_loop(); loop.run_until_complete(_run()); loop.close()
+
+
+def test_positions_polled_once_not_set_on_failure():
+    """_positions_polled_once stays False when _update_positions fails."""
+    c = _make_connector()
+    assert c._positions_polled_once is False
+
+    bad_resp = {"rt_cd": "5", "msg1": "ERR"}
+
+    async def _run():
+        with patch.object(c, "_fetch_balance", return_value=bad_resp):
+            await c._update_positions()
+
+    try:
+        loop = asyncio.new_event_loop(); loop.run_until_complete(_run()); loop.close()
+    except IOError:
+        pass
+    assert c._positions_polled_once is False
+
+
+# B3 — _prev_contract_by_pair / stale fill resolution
+
+def test_pair_for_code_resolves_prev_contract():
+    """After a roll, old contract code still resolves via _prev_contract_by_pair."""
+    c = _make_connector()
+    old_fc = _make_contract(short_code="A11606", expiry="202606")
+    new_fc = _make_contract(short_code="A11607", expiry="202607")
+    c._contract_by_pair["005930-KRW"] = new_fc
+    c._prev_contract_by_pair["005930-KRW"] = old_fc
+
+    assert c._pair_for_code("A11607") == "005930-KRW"
+    assert c._pair_for_code("A11606") == "005930-KRW"
+
+
+def test_pair_for_code_returns_none_when_unknown():
+    """Unknown contract code returns None."""
+    c = _make_connector()
+    c._contract_by_pair["005930-KRW"] = _make_contract(short_code="A11607")
+    assert c._pair_for_code("UNKNOWN") is None
+
+
+# B4 — multiplier notional
+
+def test_create_fill_updates_applies_multiplier():
+    """fill_quote_amount = delta × price × multiplier (B4: 1 contract → 10× notional)."""
+    c = _make_connector()
+    _inject_contract(c, short_code="A11607")
+    # Set multiplier to 10 (standard Samsung futures)
+    c._contract_by_pair["005930-KRW"].multiplier  # access check
+
+    from hummingbot.core.data_type.common import OrderType, TradeType
+    from hummingbot.core.data_type.in_flight_order import InFlightOrder
+    import time
+
+    order = InFlightOrder(
+        client_order_id="C1",
+        exchange_order_id="E1",
+        trading_pair="005930-KRW",
+        order_type=OrderType.LIMIT,
+        trade_type=TradeType.BUY,
+        amount=Decimal("1"),
+        price=Decimal("50000"),
+        creation_timestamp=time.time(),
+    )
+
+    fill_data = {
+        "output1": [
+            {
+                "odno": "E1",
+                "tot_ccld_qty": "1",
+                "avg_idx": "50000",
+            }
+        ]
+    }
+    updates = c._create_order_fill_updates(order, fill_data)
+    assert len(updates) == 1
+    u = updates[0]
+    assert u.fill_base_amount == Decimal("1")
+    # Notional = 1 contract × 50000 price × 10 multiplier
+    assert u.fill_quote_amount == Decimal("500000")
+    assert u.fill_price == Decimal("50000")
+
+
+def test_multiplier_for_defaults_to_ten():
+    """_multiplier_for returns 10 when no contract is mapped."""
+    c = _make_connector()
+    assert c._multiplier_for("005930-KRW") == Decimal("10")
+
+
+# I5 — no first-row fallback in _match_ccld_row
+
+def test_match_ccld_row_no_match_returns_none():
+    """When no row matches exchange_order_id, None is returned (not rows[0])."""
+    from hummingbot.core.data_type.in_flight_order import InFlightOrder
+    import time
+
+    order = InFlightOrder(
+        client_order_id="C1",
+        exchange_order_id="TRACKED",
+        trading_pair="005930-KRW",
+        order_type=OrderType.LIMIT,
+        trade_type=TradeType.BUY,
+        amount=Decimal("1"),
+        price=Decimal("50000"),
+        creation_timestamp=time.time(),
+    )
+    result = {"output1": [{"odno": "OTHER_ORDER", "tot_ccld_qty": "1"}]}
+    row = _make_connector()._match_ccld_row.__func__(result, order)
+    assert row is None
+
+
+def test_match_ccld_row_empty_output_returns_none():
+    """Empty output1 list returns None."""
+    from hummingbot.core.data_type.in_flight_order import InFlightOrder
+    import time
+
+    order = InFlightOrder(
+        client_order_id="C1",
+        exchange_order_id="E1",
+        trading_pair="005930-KRW",
+        order_type=OrderType.LIMIT,
+        trade_type=TradeType.BUY,
+        amount=Decimal("1"),
+        price=Decimal("50000"),
+        creation_timestamp=time.time(),
+    )
+    row = _make_connector()._match_ccld_row.__func__({"output1": []}, order)
+    assert row is None
+
+
+# I7 — _get_last_traded_price fail-closed
+
+def test_get_last_traded_price_fail_closed_on_bad_rt_cd():
+    """_get_last_traded_price raises IOError when rt_cd != '0'."""
+    c = _make_connector()
+    _inject_contract(c)
+
+    bad_resp = {"rt_cd": "1", "msg1": "FAIL"}
+
+    async def _run():
+        with aioresponses() as m:
+            m.get(_re(CONSTANTS.FUT_TICKER_PATH), payload=bad_resp)
+            return await c._get_last_traded_price("005930-KRW")
+
+    with pytest.raises(IOError, match="rt_cd=1"):
+        loop = asyncio.new_event_loop(); loop.run_until_complete(_run()); loop.close()
+
+
+def test_get_last_traded_price_fail_closed_on_zero():
+    """_get_last_traded_price raises IOError when price <= 0."""
+    c = _make_connector()
+    _inject_contract(c)
+
+    zero_resp = {"rt_cd": "0", "msg1": "OK", "output": {"futs_prpr": "0"}}
+
+    async def _run():
+        with aioresponses() as m:
+            m.get(_re(CONSTANTS.FUT_TICKER_PATH), payload=zero_resp)
+            return await c._get_last_traded_price("005930-KRW")
+
+    with pytest.raises(IOError, match="price=0.0"):
+        loop = asyncio.new_event_loop(); loop.run_until_complete(_run()); loop.close()
+
+
+def test_get_last_traded_price_returns_correct_value():
+    """_get_last_traded_price returns the futs_prpr float on a valid response."""
+    c = _make_connector()
+    _inject_contract(c)
+
+    ok_resp = {"rt_cd": "0", "msg1": "OK", "output": {"futs_prpr": "294500"}}
+
+    async def _run():
+        with aioresponses() as m:
+            m.get(_re(CONSTANTS.FUT_TICKER_PATH), payload=ok_resp)
+            return await c._get_last_traded_price("005930-KRW")
+
+    loop = asyncio.new_event_loop()
+    price = loop.run_until_complete(_run())
+    loop.close()
+    assert price == 294500.0

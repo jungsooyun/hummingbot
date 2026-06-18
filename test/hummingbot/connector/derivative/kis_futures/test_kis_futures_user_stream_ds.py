@@ -131,15 +131,30 @@ def test_aes_cbc_decrypt_known_vector():
 # _handle_data_message: parse without encryption
 # ---------------------------------------------------------------------------
 
-def test_handle_data_message_enqueues_event():
-    """Unencrypted 22-field frame is parsed and enqueued."""
+def test_handle_data_message_enqueues_event_with_key():
+    """Frame with known AES key is decrypted and enqueued (post-B1: key-before-parse guard)."""
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import pad as aes_pad
     ds, _ = _make_ds()
     queue = asyncio.Queue()
 
-    fields = {col: str(i) for i, col in enumerate(CONSTANTS.WS_EXEC_NOTICE_COLUMNS)}
-    fields["oder_kind2"] = "0"
-    fields["oder_no"] = "E999"
-    raw = _build_exec_notice_raw(fields)
+    # Build a plaintext payload and AES-encrypt it.
+    columns = CONSTANTS.WS_EXEC_NOTICE_COLUMNS
+    field_vals = {col: str(i) for i, col in enumerate(columns)}
+    field_vals["oder_kind2"] = "0"
+    field_vals["oder_no"] = "E999"
+    plaintext = "^".join(field_vals.get(col, "") for col in columns)
+
+    key = "0123456789ABCDEF0123456789ABCDEF"
+    iv  = "0123456789ABCDEF"
+    cipher = AES.new(key.encode(), AES.MODE_CBC, iv.encode())
+    ct_b64 = base64.b64encode(cipher.encrypt(aes_pad(plaintext.encode(), AES.block_size))).decode()
+
+    tr_id = "H0IFCNI0"
+    raw = f"0|{tr_id}|0001|{ct_b64}"
+
+    # Pre-store the AES key (as the subscribe-response handler would).
+    ds._encryption_keys[tr_id] = {"key": key, "iv": iv}
 
     _run(ds._handle_data_message(raw, queue))
 
@@ -147,6 +162,18 @@ def test_handle_data_message_enqueues_event():
     event = queue.get_nowait()
     assert event["type"] == "execution_notification"
     assert event["data"]["oder_no"] == "E999"
+
+
+def test_handle_data_message_no_key_drops_frame():
+    """Frame arriving before AES key is received is dropped (key-before-parse guard)."""
+    ds, _ = _make_ds()
+    queue = asyncio.Queue()
+    # No key stored; even a well-formed caret frame should be dropped.
+    fields = {col: str(i) for i, col in enumerate(CONSTANTS.WS_EXEC_NOTICE_COLUMNS)}
+    raw = _build_exec_notice_raw(fields)
+    # ds._encryption_keys is empty
+    _run(ds._handle_data_message(raw, queue))
+    assert queue.empty()
 
 
 def test_handle_data_message_too_short_frame_dropped():
@@ -171,16 +198,43 @@ def test_handle_data_message_too_few_fields_dropped():
 # ---------------------------------------------------------------------------
 
 def test_handle_control_message_pingpong_echoed():
-    """PINGPONG control frame is echoed back on the WS."""
+    """PINGPONG control frame is echoed back on the WS; returns True (continue)."""
     ds, _ = _make_ds()
     ws = MagicMock()
     ws.send_str = AsyncMock()
 
     raw = json.dumps({"header": {"tr_id": "PINGPONG"}})
-    _run(ds._handle_control_message(ws, raw))
+    result = _run(ds._handle_control_message(ws, raw))
 
     ws.send_str.assert_called_once_with(raw)
     assert ds._encryption_keys == {}
+    assert result is True
+
+
+def test_handle_control_message_subscribe_failure_returns_false():
+    """Subscribe response with rt_cd != '0' returns False (trigger reconnect)."""
+    ds, _ = _make_ds()
+    ws = MagicMock()
+    ws.send_str = AsyncMock()
+
+    raw = json.dumps({
+        "header": {"tr_id": "H0IFCNI0", "encrypt": "N"},
+        "body": {"rt_cd": "1", "msg1": "SUBSCRIBE FAILED"},
+    })
+    result = _run(ds._handle_control_message(ws, raw))
+    assert result is False
+
+
+def test_handle_control_message_success_returns_true():
+    """Subscribe response with rt_cd == '0' returns True (continue)."""
+    ds, _ = _make_ds()
+    ws = MagicMock()
+    raw = json.dumps({
+        "header": {"tr_id": "H0IFCNI0", "encrypt": "N"},
+        "body": {"rt_cd": "0"},
+    })
+    result = _run(ds._handle_control_message(ws, raw))
+    assert result is True
 
 
 def test_handle_control_message_stores_aes_key():
@@ -235,8 +289,13 @@ def test_subscribe_uses_hts_id_as_tr_key():
 # _user_stream_event_listener (connector)
 # ---------------------------------------------------------------------------
 
-def test_user_stream_listener_fill_calls_process_trade_update():
-    """oder_kind2='0' produces a TradeUpdate via process_trade_update."""
+def test_user_stream_listener_fill_does_not_call_process_trade_update():
+    """oder_kind2='0' (fill) must NOT call process_trade_update (B1: ccnl-only fills).
+
+    The WS exec-notice is no longer the authoritative fill source.
+    _all_trade_updates_for_order (ccnl REST poll) owns fills exclusively to
+    avoid cross-source double-counting with different trade_id schemes.
+    """
     from hummingbot.connector.derivative.kis_futures.kis_futures_derivative import KisFuturesDerivative
     c = KisFuturesDerivative(
         kis_futures_app_key="k",
@@ -252,7 +311,6 @@ def test_user_stream_listener_fill_calls_process_trade_update():
     c._auth._access_token = "test_access_token"
     c._auth._token_expires_at = time.time() + 86400
 
-    # Register a tracked order
     order = _make_inflight_order(exchange_order_id="E123")
     c._order_tracker._in_flight_orders[order.client_order_id] = order
 
@@ -269,19 +327,18 @@ def test_user_stream_listener_fill_calls_process_trade_update():
         },
     }
 
-    # Enqueue one event, then poison pill to end the async generator
     async def _mock_iter():
         yield event
 
     with patch.object(c, "_iter_user_event_queue", return_value=_mock_iter()), \
-         patch.object(c._order_tracker, "process_trade_update") as mock_trade:
+         patch.object(c._order_tracker, "process_trade_update") as mock_trade, \
+         patch.object(c._order_tracker, "process_order_update") as mock_order:
         _run(c._user_stream_event_listener())
 
-    mock_trade.assert_called_once()
-    trade_update = mock_trade.call_args[0][0]
-    assert trade_update.fill_base_amount == Decimal("2")
-    assert trade_update.fill_price == Decimal("294500")
-    assert trade_update.exchange_order_id == "E123"
+    # WS fill must NOT emit a TradeUpdate (ccnl poll is the sole fill source).
+    mock_trade.assert_not_called()
+    # WS fill must also NOT accidentally emit an OrderUpdate.
+    mock_order.assert_not_called()
 
 
 def test_user_stream_listener_lifecycle_cancel():

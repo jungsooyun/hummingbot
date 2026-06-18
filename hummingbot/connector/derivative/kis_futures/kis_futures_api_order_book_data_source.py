@@ -121,6 +121,14 @@ class KisFuturesAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             bid_size_templates=["bidp_rsqn{idx}"],
         )
 
+        # Fail-closed: do not emit an empty/zero book — it would wipe the local
+        # order book and disable trading until the next successful poll.
+        if not asks and not bids:
+            raise IOError(
+                f"[kis_futures] _order_book_snapshot: no valid levels in response "
+                f"for {trading_pair} — refusing to emit empty order book"
+            )
+
         content = {
             "trading_pair": trading_pair,
             "update_id": update_id,
@@ -354,7 +362,19 @@ class KisFuturesAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
     async def get_last_traded_prices(
         self, trading_pairs: List[str], domain: Optional[str] = None
     ) -> Dict[str, float]:
-        return {tp: 0.0 for tp in trading_pairs}
+        """Fetch last traded prices via the connector's _get_last_traded_price.
+
+        Fail-closed: raises IOError (propagates from _get_last_traded_price) on
+        any bad response or price <= 0.  Never silently returns 0.0.
+        """
+        if self._connector is None:
+            raise IOError(
+                "[kis_futures] get_last_traded_prices: no connector attached"
+            )
+        result: Dict[str, float] = {}
+        for tp in trading_pairs:
+            result[tp] = await self._connector._get_last_traded_price(tp)
+        return result
 
     async def subscribe_to_trading_pair(self, trading_pair: str) -> bool:
         return True

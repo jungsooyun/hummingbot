@@ -90,9 +90,17 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
 
         # Futures master state (populated by _resolve_front_months).
         self._contract_by_pair: Dict = {}
+        # Previous front-month contracts, retained until the old code is flat
+        # (no open orders + no open position).  Used by _pair_for_code so that
+        # fills/positions on the old contract still map correctly after a roll.
+        self._prev_contract_by_pair: Dict = {}
         self._pending_front: Dict = {}
         self._roll_pending: Dict = {}
         self._order_acks: Dict = {}
+
+        # Per-pair roll guard: prevents _resolve_front_months swap from interleaving
+        # with _place_order reading fc.short_code.
+        self._roll_lock: asyncio.Lock = asyncio.Lock()
 
         # Set True after the FIRST successful _update_positions poll.
         # Prevents an unsafe auto-roll before cached positions are confirmed.
@@ -325,13 +333,16 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
         """Process H0IFCNI0 execution-notification events from the user stream DS.
 
         oder_kind2 values:
-          '0' — 체결통보 (fill); build TradeUpdate via cntg_qty + cntg_unpr.
+          '0' — 체결통보 (fill): WS fills are NOT emitted as TradeUpdates here.
+                Fills are owned exclusively by _all_trade_updates_for_order (ccnl
+                REST poll) to avoid double-counting with a different trade_id scheme.
+                The exec-notice simply acts as an early signal; the ccnl poll is the
+                single authoritative fill source.  TODO: unify dedup when fill events
+                are confirmed to carry a stable unique fill ID.
           'L' — 주문·정정·취소·거부 접수통보; derive OrderState and build OrderUpdate.
 
         Best-effort: malformed or unrecognised events are logged and dropped —
-        the listener must never crash.  Fills are also reconciled by the REST
-        ccnl poll in _all_trade_updates_for_order so there is no single point
-        of failure.
+        the listener must never crash.
         """
         async for event_message in self._iter_user_event_queue():
             try:
@@ -342,7 +353,6 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
                 data = event_message.get("data", {})
                 oder_kind2 = data.get("oder_kind2", "")
                 oder_no = data.get("oder_no", "")
-                code = data.get("stck_shrn_iscd", "")
 
                 tracked_order = self._find_tracked_order_by_exchange_id(oder_no)
                 if tracked_order is None:
@@ -350,36 +360,10 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
                     continue
 
                 if oder_kind2 == "0":
-                    # --- fill ---
-                    try:
-                        fill_qty = Decimal(str(data.get("cntg_qty", "0")))
-                        fill_price = Decimal(str(data.get("cntg_unpr", "0")))
-                    except (InvalidOperation, ValueError):
-                        self.logger().warning(
-                            f"[kis_futures] malformed fill qty/price in exec-notice "
-                            f"oder_no={oder_no}: {data}"
-                        )
-                        continue
-
-                    fill_amount = fill_qty * fill_price
-                    fee = TradeFeeBase.new_perpetual_fee(
-                        fee_schema=self.trade_fee_schema(),
-                        position_action=PositionAction.OPEN,
-                        percent_token=tracked_order.quote_asset,
-                        flat_fees=[],
-                    )
-                    trade_update = TradeUpdate(
-                        trade_id=f"{oder_no}_{data.get('stck_cntg_hour', '')}",
-                        client_order_id=tracked_order.client_order_id,
-                        exchange_order_id=oder_no,
-                        trading_pair=tracked_order.trading_pair,
-                        fee=fee,
-                        fill_base_amount=fill_qty,
-                        fill_quote_amount=fill_amount,
-                        fill_price=fill_price,
-                        fill_timestamp=self.current_timestamp,
-                    )
-                    self._order_tracker.process_trade_update(trade_update)
+                    # --- fill notification: do NOT emit TradeUpdate from WS ---
+                    # ccnl REST poll (_all_trade_updates_for_order) is the single
+                    # authoritative fill source.  No-op here prevents double-counting.
+                    pass
 
                 elif oder_kind2 == "L":
                     # --- order lifecycle ---
@@ -484,7 +468,10 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
         position_action: PositionAction = PositionAction.NIL,
         **kwargs,
     ) -> Tuple[str, float]:
-        fc = self._contract_by_pair[trading_pair]   # KeyError intentional: caller ensures resolution
+        # Read contract code under _roll_lock to prevent interleaving with a concurrent
+        # _resolve_front_months swap that could change fc.short_code mid-flight.
+        async with self._roll_lock:
+            fc = self._contract_by_pair[trading_pair]  # KeyError intentional: caller ensures resolution
         qty = self._validate_contract_qty(amount)
         # 매수(long)=02, 매도(short)=01
         sll_buy = "02" if trade_type == TradeType.BUY else "01"
@@ -589,12 +576,31 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
         )
 
     async def _update_positions(self):
+        """Refresh positions from KIS balance response (output1).
+
+        Fail-closed:
+        - Raises IOError if rt_cd != "0" — caller retries; prior positions kept.
+        - Raises IOError if output1 is not a list — malformed response; prior positions kept.
+        - Sets _positions_polled_once = True ONLY after a verified full snapshot.
+        """
         from hummingbot.connector.derivative.position import Position
         from hummingbot.core.data_type.common import PositionSide
 
         resp = await self._fetch_balance()
+        if resp.get("rt_cd") != "0":
+            raise IOError(
+                f"KIS futures _update_positions: rt_cd={resp.get('rt_cd')} "
+                f"msg={resp.get('msg1')} — keeping prior positions"
+            )
+        output1 = resp.get("output1")
+        if not isinstance(output1, list):
+            raise IOError(
+                "[kis_futures] _update_positions: output1 missing or not a list "
+                "— keeping prior positions"
+            )
+
         seen = set()
-        for row in resp.get("output1", []):
+        for row in output1:
             code = (row.get("shtn_pdno") or row.get("pdno") or "").strip()
             pair = self._pair_for_code(code)
             if pair is None:
@@ -620,18 +626,34 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
             )
             self._perpetual_trading.set_position(pos_key, pos)
             seen.add(pos_key)
-        # Remove positions no longer present in the response.
+        # Remove positions no longer present in the verified snapshot.
         for k in list(self._perpetual_trading.account_positions.keys()):
             if k not in seen:
                 self._perpetual_trading.remove_position(k)
-        # Mark that at least one positions poll has completed; enables safe roll detection.
+        # Mark that at least one verified positions poll has completed.
         self._positions_polled_once = True
 
     async def _update_balances(self):
+        """Refresh KRW balances from KIS balance response (output2).
+
+        Fail-closed:
+        - Raises IOError if rt_cd != "0" — caller retries; prior balances kept.
+        - Raises IOError if output2 is missing/empty — no zeroing of KRW.
+        """
         resp = await self._fetch_balance()
-        out2 = resp.get("output2", {})
+        if resp.get("rt_cd") != "0":
+            raise IOError(
+                f"KIS futures _update_balances: rt_cd={resp.get('rt_cd')} "
+                f"msg={resp.get('msg1')} — keeping prior balances"
+            )
+        out2 = resp.get("output2")
         if isinstance(out2, list):
-            out2 = out2[0] if out2 else {}
+            out2 = out2[0] if out2 else None
+        if not out2:
+            raise IOError(
+                "[kis_futures] _update_balances: output2 missing/empty "
+                "— keeping prior balances"
+            )
         total = Decimal(str(out2.get("dnca_tot_amt") or out2.get("tot_dncl_amt") or "0"))
         free = Decimal(str(out2.get("ord_psbl_cash") or "0"))
         self._account_balances["KRW"] = total
@@ -641,7 +663,46 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
         return []
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
-        return 0.0
+        """Fetch last traded price from KIS ticker endpoint (FHMIF10000000).
+
+        Fail-closed: raises IOError on rt_cd != "0" or price <= 0, never returns 0.0.
+        """
+        code = self.current_contract_code(trading_pair)
+        if not code:
+            raise IOError(
+                f"[kis_futures] _get_last_traded_price: no contract code for {trading_pair}"
+            )
+        params = {
+            "FID_COND_MRKT_DIV_CODE": CONSTANTS.MRKT_DIV_STOCK_FUTURE,
+            "FID_INPUT_ISCD": code,
+        }
+        resp = await self._api_get(
+            path_url=CONSTANTS.FUT_TICKER_PATH,
+            params=params,
+            is_auth_required=True,
+            headers={"tr_id": CONSTANTS.FUT_TICKER_TR_ID},
+        )
+        if resp.get("rt_cd") != "0":
+            raise IOError(
+                f"[kis_futures] _get_last_traded_price: rt_cd={resp.get('rt_cd')} "
+                f"msg={resp.get('msg1')} for {trading_pair}"
+            )
+        output = resp.get("output") or resp.get("output1") or {}
+        if isinstance(output, list):
+            output = output[0] if output else {}
+        raw_price = output.get("futs_prpr") or output.get("prpr") or "0"
+        try:
+            price = float(raw_price)
+        except (ValueError, TypeError):
+            raise IOError(
+                f"[kis_futures] _get_last_traded_price: malformed price {raw_price!r} "
+                f"for {trading_pair}"
+            )
+        if price <= 0:
+            raise IOError(
+                f"[kis_futures] _get_last_traded_price: price={price} <= 0 for {trading_pair}"
+            )
+        return price
 
     # ------------------------------------------------------------------
     # Task 3d: reconcile (inquire-ccnl + order status)
@@ -682,17 +743,24 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
         )
 
     @staticmethod
-    def _match_ccld_row(result: Dict[str, Any], order: InFlightOrder) -> Dict[str, Any]:
-        """Return this order's ccnl output1 row (matched by odno), else first row, else {}."""
+    @staticmethod
+    def _match_ccld_row(result: Dict[str, Any], order: InFlightOrder) -> Optional[Dict[str, Any]]:
+        """Return the ccnl output1 row matching this order's exchange_order_id.
+
+        Returns None (not found sentinel) when no row matches — callers must treat
+        None as "no update available" and NOT mutate order state.  The previous
+        first-row fallback was removed: inferring state from an unrelated order's
+        row can corrupt order state.
+        """
         rows = result.get("output1", [])
         if not isinstance(rows, list) or not rows:
-            return {}
+            return None
         eoid = str(order.exchange_order_id) if order.exchange_order_id else ""
         if eoid:
             for row in rows:
                 if str(row.get("odno", "")) == eoid:
                     return row
-        return rows[0]
+        return None
 
     def _infer_order_state(self, row: Dict[str, Any], order: InFlightOrder) -> OrderState:
         """Derive state from a KIS ccnl output1 row.
@@ -720,6 +788,16 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         result = await self._request_futures_ccnl(tracked_order)
         row = self._match_ccld_row(result, tracked_order)
+        if row is None:
+            # No matching ccnl row yet (order may still be pending or page didn't include it).
+            # Return a non-mutating OPEN update so the tracker keeps the current state.
+            return OrderUpdate(
+                client_order_id=tracked_order.client_order_id,
+                exchange_order_id=tracked_order.exchange_order_id or "",
+                trading_pair=tracked_order.trading_pair,
+                update_timestamp=self.current_timestamp,
+                new_state=tracked_order.current_state,
+            )
         new_state = self._infer_order_state(row, tracked_order)
         return OrderUpdate(
             client_order_id=tracked_order.client_order_id,
@@ -731,6 +809,19 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
             new_state=new_state,
         )
 
+    def _multiplier_for(self, trading_pair: str) -> Decimal:
+        """Return the contract multiplier for a pair (shares per contract).
+
+        KIS stock futures: 1 contract = multiplier × underlying shares.
+        Default 10 if the contract map hasn't been resolved yet.
+        The multiplier converts contract qty to notional:
+          notional_KRW = qty_contracts × price × multiplier
+        """
+        fc = self._contract_by_pair.get(trading_pair)
+        if fc is not None and fc.multiplier and fc.multiplier > 0:
+            return fc.multiplier
+        return Decimal("10")
+
     def _create_order_fill_updates(
         self, order: InFlightOrder, fill_data: Dict[str, Any]
     ) -> List[TradeUpdate]:
@@ -739,13 +830,17 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
         KIS returns cumulative tot_ccld_qty per row; we emit the INCREMENT vs the
         order's already-executed base to avoid double-counting on repeated polls.
         avg_idx = weighted average fill price for futures (vs avg_prvs used in spot).
-        Fee is computed (not parsed); no STT on futures.
+
+        Multiplier: fill_quote_amount = delta_contracts × price × multiplier.
+        fill_base_amount = delta_contracts (hummingbot tracks in contract units).
+        Fee is computed from notional (not parsed); no STT on futures.
         """
         updates: List[TradeUpdate] = []
         rows = fill_data.get("output1", [])
         if not isinstance(rows, list):
             return updates
 
+        multiplier = self._multiplier_for(order.trading_pair)
         eoid = str(order.exchange_order_id) if order.exchange_order_id else ""
         for row in rows:
             odno = str(row.get("odno", "") or "")
@@ -766,7 +861,8 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
             delta = cum_filled - already
             if delta <= Decimal("0"):
                 continue
-            fill_quote = delta * avg_price
+            # Notional = contracts × price × multiplier (KRW value of the fill)
+            fill_quote = delta * avg_price * multiplier
             fee = TradeFeeBase.new_perpetual_fee(
                 fee_schema=self.trade_fee_schema(),
                 position_action=PositionAction.OPEN,
@@ -805,7 +901,18 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
         return abs(pos.amount) if pos else Decimal("0")
 
     def _pair_for_code(self, code: str) -> Optional[str]:
+        """Return the trading pair for a contract short code.
+
+        Checks the active map first, then the previous-contract map so that
+        fills and positions arriving on the old contract code after a roll
+        are still resolved correctly.  The prev entry is retained until the
+        old code is confirmed flat (see _resolve_front_months).
+        """
         for pair, fc in self._contract_by_pair.items():
+            if fc.short_code == code:
+                return pair
+        # Fall back to prev-contract map (post-roll stale fills/positions).
+        for pair, fc in self._prev_contract_by_pair.items():
             if fc.short_code == code:
                 return pair
         return None
@@ -841,43 +948,75 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
 
         Fail-closed: if download raises, the caller (typically _update_trading_rules)
         catches and warns, keeping the prior _contract_by_pair map intact.
+
+        Atomic rollover:
+        - _roll_lock serialises the contract-map swap with _place_order reads of
+          fc.short_code, preventing interleave races.
+        - When a roll IS applied, the outgoing contract is moved to
+          _prev_contract_by_pair[pair] so that stale fills and positions on the
+          old code are still resolved correctly by _pair_for_code.
+        - The prev entry is cleared only once the old code is flat (no position
+          + no open orders on it).
         """
         import aiohttp
         async with aiohttp.ClientSession() as session:
             raw = await download_master(session)
         contracts = parse_master_bytes(raw)
-        for pair in self._trading_pairs:
-            underlying = pair.split("-")[0]
-            fc = resolve_front_month(contracts, underlying)
-            if fc is None:
-                continue
-            cur = self._contract_by_pair.get(pair)
-            if cur is None:
-                self._contract_by_pair[pair] = fc
-                self._roll_pending[pair] = False
-                continue
-            if fc.short_code != cur.short_code:
-                has_open = any(
-                    o.trading_pair == pair
-                    for o in self._order_tracker.active_orders.values()
-                )
-                # Fail-closed: do NOT auto-switch until at least one _update_positions
-                # poll has confirmed the cached position state.  On fresh start the
-                # positions cache is empty and looks flat — switching here could drop
-                # an existing old-contract position silently.
-                if self._positions_polled_once and RemapGuard().can_remap(has_open, self._position_amount(pair)):
+        async with self._roll_lock:
+            for pair in self._trading_pairs:
+                underlying = pair.split("-")[0]
+                fc = resolve_front_month(contracts, underlying)
+                if fc is None:
+                    continue
+                cur = self._contract_by_pair.get(pair)
+                if cur is None:
                     self._contract_by_pair[pair] = fc
                     self._roll_pending[pair] = False
-                    self._pending_front.pop(pair, None)
+                    continue
+                if fc.short_code != cur.short_code:
+                    has_open = any(
+                        o.trading_pair == pair
+                        for o in self._order_tracker.active_orders.values()
+                    )
+                    # Fail-closed: do NOT auto-switch until at least one _update_positions
+                    # poll has confirmed the cached position state.  On fresh start the
+                    # positions cache is empty and looks flat — switching here could drop
+                    # an existing old-contract position silently.
+                    if self._positions_polled_once and RemapGuard().can_remap(has_open, self._position_amount(pair)):
+                        # Atomic swap: retain old contract for stale-fill resolution.
+                        self._prev_contract_by_pair[pair] = cur
+                        self._contract_by_pair[pair] = fc
+                        self._roll_pending[pair] = False
+                        self._pending_front.pop(pair, None)
+                        self.logger().info(
+                            f"[kis_futures] rolled {pair}: "
+                            f"{cur.short_code} → {fc.short_code}; "
+                            f"prev retained for stale-fill resolution."
+                        )
+                    else:
+                        self._roll_pending[pair] = True
+                        self._pending_front[pair] = fc
+                        reason = (
+                            "positions not yet polled — deferring roll until first _update_positions"
+                            if not self._positions_polled_once
+                            else "open orders or non-zero position — flatten to roll"
+                        )
+                        self.logger().warning(
+                            f"[kis_futures] roll pending {pair}: "
+                            f"{cur.short_code}->{fc.short_code}; {reason}."
+                        )
                 else:
-                    self._roll_pending[pair] = True
-                    self._pending_front[pair] = fc
-                    reason = (
-                        "positions not yet polled — deferring roll until first _update_positions"
-                        if not self._positions_polled_once
-                        else "open orders or non-zero position — flatten to roll"
-                    )
-                    self.logger().warning(
-                        f"[kis_futures] roll pending {pair}: "
-                        f"{cur.short_code}->{fc.short_code}; {reason}."
-                    )
+                    # Same contract; check if prev entry can now be cleared.
+                    prev = self._prev_contract_by_pair.get(pair)
+                    if prev is not None:
+                        old_has_open = any(
+                            o.trading_pair == pair and o.exchange_order_id is not None
+                            for o in self._order_tracker.active_orders.values()
+                        )
+                        old_pos_flat = self._position_amount(pair) == Decimal("0")
+                        if old_pos_flat and not old_has_open:
+                            del self._prev_contract_by_pair[pair]
+                            self.logger().info(
+                                f"[kis_futures] cleared prev contract for {pair} "
+                                f"(old code {prev.short_code} confirmed flat)."
+                            )

@@ -94,6 +94,12 @@ class KisFuturesAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 await self._sleep(3600)
 
         while True:
+            # Clear per-connect AES key state so stale keys from a previous
+            # connection are never reused on a fresh reconnect.  The exchange
+            # sends new key/iv in the subscription response for each connect.
+            self._encryption_keys = {}
+            self._subscribe_succeeded = False
+
             try:
                 approval_key = await self._auth.get_ws_approval_key()
                 ws_url = web_utils.ws_url(self._domain)
@@ -105,7 +111,9 @@ class KisFuturesAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                await self._process_ws_message(ws, msg.data, output)
+                                if not await self._process_ws_message(ws, msg.data, output):
+                                    # Subscribe failure: break to trigger reconnect.
+                                    break
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 break
             except asyncio.CancelledError:
@@ -160,15 +168,25 @@ class KisFuturesAPIUserStreamDataSource(UserStreamTrackerDataSource):
         ws: aiohttp.ClientWebSocketResponse,
         raw: str,
         output: asyncio.Queue,
-    ):
-        """Route incoming WS frame to data or control handler."""
+    ) -> bool:
+        """Route incoming WS frame to data or control handler.
+
+        Returns False if the caller should break and reconnect (subscribe failure).
+        """
         if raw and raw[0] in ("0", "1"):
             await self._handle_data_message(raw, output)
+            return True
         else:
-            await self._handle_control_message(ws, raw)
+            return await self._handle_control_message(ws, raw)
 
     async def _handle_data_message(self, raw: str, output: asyncio.Queue):
-        """Decrypt and parse an exec-notice data frame, then enqueue."""
+        """Decrypt and parse an exec-notice data frame, then enqueue.
+
+        Key-before-parse guard: if a data frame arrives for a tr_id whose AES key
+        has not yet been received (i.e. the subscription response hasn't come back),
+        the frame MUST NOT be parsed as plaintext — it is dropped with a warning.
+        Parsing encrypted ciphertext as plaintext would corrupt order state.
+        """
         parts = raw.split("|")
         if len(parts) < 4:
             self.logger().warning(f"[kis_futures] short user stream frame: {raw[:80]}")
@@ -184,6 +202,13 @@ class KisFuturesAPIUserStreamDataSource(UserStreamTrackerDataSource):
             except Exception:
                 self.logger().exception("[kis_futures] AES decrypt failed — dropping frame")
                 return
+        else:
+            # Key not yet received: drop the frame rather than parsing ciphertext as plaintext.
+            self.logger().warning(
+                f"[kis_futures] encrypted frame received for tr_id={tr_id} before AES key "
+                f"was stored — dropping (expected during subscription race; normal on first connect)."
+            )
+            return
 
         fields = data_str.split("^")
         columns = CONSTANTS.WS_EXEC_NOTICE_COLUMNS
@@ -201,22 +226,26 @@ class KisFuturesAPIUserStreamDataSource(UserStreamTrackerDataSource):
             "data": parsed,
         })
 
-    async def _handle_control_message(self, ws: aiohttp.ClientWebSocketResponse, raw: str):
-        """Handle JSON control frames: PINGPONG echo + store AES key/iv."""
+    async def _handle_control_message(self, ws: aiohttp.ClientWebSocketResponse, raw: str) -> bool:
+        """Handle JSON control frames: PINGPONG echo + store AES key/iv.
+
+        Returns False if a subscribe failure is detected (rt_cd != "0") so the
+        caller can break and reconnect rather than silently continuing.
+        """
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
             self.logger().warning(f"[kis_futures] invalid JSON user stream frame: {raw[:80]}")
-            return
+            return True
 
         header = data.get("header", {})
         tr_id = header.get("tr_id", "")
 
         if tr_id == "PINGPONG":
             await ws.send_str(raw)
-            return
+            return True
 
-        # Store AES key/iv on first subscription response.
+        # Store AES key/iv on subscription response.
         body = data.get("body", {})
         if header.get("encrypt", "N") == "Y":
             output_data = body.get("output", {})
@@ -228,10 +257,14 @@ class KisFuturesAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     f"[kis_futures] stored AES key for tr_id={tr_id}"
                 )
 
-        if body.get("rt_cd", "0") != "0":
+        rt_cd = body.get("rt_cd", "0")
+        if rt_cd != "0":
             self.logger().warning(
-                f"[kis_futures] user stream subscription error: {body.get('msg1')}"
+                f"[kis_futures] subscribe failed rt_cd={rt_cd} msg={body.get('msg1')} "
+                f"— will reconnect."
             )
+            return False  # signal caller to break + reconnect
+        return True
 
     # ------------------------------------------------------------------
     # Base-abstract no-ops (custom WS loop above replaces the framework)
