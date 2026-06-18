@@ -128,26 +128,40 @@ def test_signflip_adopt_no_wrong_direction():
     assert h._pending_hedge_signed == expected
 
 
-def test_watermark_popped_on_terminal():
+def test_watermark_retained_on_terminal_until_evicted():
     h = _Harness()
     h._hedge_credited_base = {"h0": Decimal("1")}
     h.hedge_orders["h0"] = _Tracked("h0")
     h.process_order_completed_event(None, None, _Ev("h0", "1"))
-    assert "h0" not in h._hedge_credited_base
+    assert "h0" in h._hedge_terminal_ids
+    assert h._hedge_credited_base["h0"] == Decimal("1")
 
     h._hedge_credited_base["h0"] = Decimal("1")
     h.hedge_orders["h0"] = _Tracked("h0")
     h.process_order_canceled_event(None, None, _Ev("h0", "0"))
-    assert "h0" not in h._hedge_credited_base
+    assert "h0" in h._hedge_terminal_ids
+    assert h._hedge_credited_base["h0"] == Decimal("1")
 
     h._hedge_credited_base["h0"] = Decimal("1")
     h.hedge_orders["h0"] = _Tracked("h0")
     h.process_order_failed_event(None, None, _Ev("h0", "0"))
-    assert "h0" not in h._hedge_credited_base
+    assert "h0" in h._hedge_terminal_ids
+    assert h._hedge_credited_base["h0"] == Decimal("1")
 
     h.hedge_orders["h1"] = _Tracked("h1")
     h._hedge_order_side["h1"] = (TradeType.BUY, Decimal("1"))
     h._hedge_credited_base["h1"] = Decimal("1")
     _adopt_filled(h, "h1", "1")
     h._process_hedges()
-    assert "h1" not in h._hedge_credited_base
+    assert "h1" in h._hedge_terminal_ids
+    assert h._hedge_credited_base["h1"] == Decimal("1")
+
+    for i in range(h._HEDGE_TERMINAL_ID_CAP):
+        oid = f"evict-{i}"
+        h._hedge_order_side[oid] = (TradeType.BUY, Decimal("1"))
+        h._hedge_credited_base[oid] = Decimal("1")
+        h._remember_terminal_hedge_order(oid)
+
+    assert "h0" not in h._hedge_terminal_ids
+    assert "h0" not in h._hedge_order_side
+    assert "h0" not in h._hedge_credited_base

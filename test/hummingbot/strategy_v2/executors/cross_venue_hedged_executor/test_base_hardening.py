@@ -156,7 +156,7 @@ def test_completion_pops_hedge_order_so_stray_fill_is_noop():
 
     h.process_order_completed_event(None, None, _Ev("h0", "1"))
     assert "h0" not in h.hedge_orders
-    assert "h0" not in h._hedge_order_side
+    assert h._hedge_order_side["h0"] == TradeType.BUY
 
     # A stray/duplicate post-completion fill must NOT credit again at the default side.
     h.process_order_filled_event(None, None, _Ev("h0", "1"))

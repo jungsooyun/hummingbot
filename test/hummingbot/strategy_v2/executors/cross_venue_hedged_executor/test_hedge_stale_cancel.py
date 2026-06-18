@@ -62,6 +62,22 @@ def test_signflip_cancels_stale_hedge():
     assert h.placed == before
 
 
+def test_pending_zero_flip_cancels_stale_hedge():
+    h = _H2Harness()
+    _maker_fill(h, "open-1", "2", TradeType.SELL)
+    h._process_hedges()
+    _created(h, "h0")
+    assert h.placed == [("h0", TradeType.BUY, Decimal("2"))]
+
+    _maker_fill(h, "close-1", "2", TradeType.BUY)
+    before = list(h.placed)
+    h._process_hedges()
+
+    assert h._pending_hedge_signed == Decimal("0")
+    assert _cancelled_ids(h) == ["h0"]
+    assert h.placed == before
+
+
 def test_same_direction_hedge_not_cancelled():
     h = _H2Harness()
     _maker_fill(h, "open-1", "2", TradeType.SELL)

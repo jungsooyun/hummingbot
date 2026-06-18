@@ -66,6 +66,7 @@ import inspect
 import logging
 import time
 from abc import abstractmethod
+from collections import OrderedDict
 from decimal import Decimal
 from typing import Dict, List, Optional, Union
 
@@ -105,6 +106,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
     # Past this multiple of max_retries consecutive hedge failures, the hedge kill-switch
     # escalates from "hold + keep retrying" to a hard FAILED stop (dead-venue backstop).
     _HEDGE_HARD_STOP_FACTOR = 3
+    _HEDGE_TERMINAL_ID_CAP = 128
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -167,6 +169,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         self._hedge_sell_base = ZERO
         self._hedge_order_side: Dict[str, Union[TradeType, tuple[TradeType, Decimal]]] = {}
         self._hedge_credited_base: Dict[str, Decimal] = {}
+        self._hedge_terminal_ids = OrderedDict()
         self._maker_placed_edge_bps: Dict[str, Decimal] = {}
         self._open_edge_base = ZERO
         self._open_edge_notional_bps = ZERO
@@ -353,8 +356,19 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self._hedge_order_side = {}
         if not hasattr(self, "_hedge_credited_base"):
             self._hedge_credited_base = {}
+        if not hasattr(self, "_hedge_terminal_ids"):
+            self._hedge_terminal_ids = OrderedDict()
         if not hasattr(self, "_maker_placed_edge_bps"):
             self._maker_placed_edge_bps = {}
+
+    def _remember_terminal_hedge_order(self, order_id: str, allow_event_delta_fallback: bool = False) -> None:
+        self._ensure_direction_accounting()
+        self._hedge_terminal_ids.pop(order_id, None)
+        self._hedge_terminal_ids[order_id] = allow_event_delta_fallback
+        while len(self._hedge_terminal_ids) > self._HEDGE_TERMINAL_ID_CAP:
+            oldest_order_id, _ = self._hedge_terminal_ids.popitem(last=False)
+            self._hedge_order_side.pop(oldest_order_id, None)
+            self._hedge_credited_base.pop(oldest_order_id, None)
 
     @staticmethod
     def _signed_base(side: TradeType, amount: Decimal) -> Decimal:
@@ -531,8 +545,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                 # (for a still-open order the normal completion event credits them instead).
                 self._hedge_fees_quote += in_flight.cumulative_fee_paid(in_flight.quote_asset)
                 self.hedge_orders.pop(order_id, None)
-                self._hedge_order_side.pop(order_id, None)
-                self._hedge_credited_base.pop(order_id, None)
+                self._remember_terminal_hedge_order(order_id)
                 if not in_flight.is_filled:
                     # Terminated without completing the hedge (lost cancel/failure): count
                     # it toward max_retries so a persistently failing hedge cannot loop.
@@ -548,13 +561,16 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             # executor has been terminated, including during _control_shutdown.
             return
         if self._pending_hedge_signed == ZERO:
-            return
-        needed_side = TradeType.BUY if self._pending_hedge_signed < ZERO else TradeType.SELL
+            needed_side = None
+        else:
+            needed_side = TradeType.BUY if self._pending_hedge_signed < ZERO else TradeType.SELL
         for oid, rec in list(self._hedge_order_side.items()):
             tracked = self.hedge_orders.get(oid)
             side = rec[0] if isinstance(rec, tuple) else rec
             if tracked is not None and tracked.order is not None and side != needed_side:
                 self._strategy.cancel(self.hedge_connector, self.hedge_trading_pair, oid)
+        if self._pending_hedge_signed == ZERO:
+            return
         if self._hedge_in_flight():
             return
         pending_base = self._pending_hedge_base
@@ -663,6 +679,32 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             # A successful hedge fill proves the venue is responding: reset the consecutive
             # failure counter so the kill-switch only trips on a *persistent* streak.
             self._current_retries = 0
+        elif event.order_id in self._hedge_terminal_ids:
+            in_flight = self.get_in_flight_order(self.hedge_connector, event.order_id)
+            observed = getattr(in_flight, "executed_amount_base", None)
+            if observed is None:
+                already = self._hedge_credited_base.get(event.order_id, ZERO)
+                if self._hedge_terminal_ids[event.order_id]:
+                    observed = already + amount
+                else:
+                    observed = already
+            observed = Decimal(observed)
+            already = self._hedge_credited_base.get(event.order_id, ZERO)
+            if observed > already:
+                self.logger().warning(
+                    "Crediting post-optimistic-cancel cross fill on terminal hedge order %s: "
+                    "observed cumulative %s, prior credited %s.",
+                    event.order_id,
+                    observed,
+                    already,
+                )
+                self._credit_hedge_fill(event.order_id, observed, Decimal(event.price))
+                self._current_retries = 0
+        else:
+            self.logger().warning(
+                "Ignoring fill for unknown order %s: not tracked as maker, active hedge, or terminal hedge.",
+                event.order_id,
+            )
 
     def process_order_completed_event(
         self, _, market, event: Union[BuyOrderCompletedEvent, SellOrderCompletedEvent]
@@ -678,17 +720,16 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             # while popping its recorded side let a stray post-completion fill credit at the
             # default self.hedge_side (wrong after a two-sided sign flip) and leaked the dict.
             self.hedge_orders.pop(event.order_id, None)
-            self._hedge_order_side.pop(event.order_id, None)
-            self._hedge_credited_base.pop(event.order_id, None)
+            self._remember_terminal_hedge_order(event.order_id)
 
     def process_order_canceled_event(self, _, market, event: OrderCancelledEvent):
         self._ensure_direction_accounting()
         self.maker_orders.pop(event.order_id, None)
         # Pop a cancelled hedge too (no leak / no stale in-flight block). Its unfilled
         # base stays in _pending_hedge_base and is re-hedged on the next tick.
-        self.hedge_orders.pop(event.order_id, None)
-        self._hedge_order_side.pop(event.order_id, None)
-        self._hedge_credited_base.pop(event.order_id, None)
+        if event.order_id in self.hedge_orders:
+            self.hedge_orders.pop(event.order_id, None)
+            self._remember_terminal_hedge_order(event.order_id, allow_event_delta_fallback=True)
 
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
         self._ensure_direction_accounting()
@@ -696,8 +737,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self.maker_orders.pop(event.order_id, None)
         elif event.order_id in self.hedge_orders:
             self.hedge_orders.pop(event.order_id, None)
-            self._hedge_order_side.pop(event.order_id, None)
-            self._hedge_credited_base.pop(event.order_id, None)
+            self._remember_terminal_hedge_order(event.order_id, allow_event_delta_fallback=True)
             self._current_retries += 1
             self.evaluate_max_retries()
 
