@@ -66,6 +66,13 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
     # but never call place_order (no real orders, so no fills and no hedges). For
     # safe live verification of the full decision path before enabling submission.
     observe: bool = False
+    two_sided: bool = False
+    k_open_skew_bps: Decimal = Decimal("0")
+    k_close_skew_bps: Decimal = Decimal("0")
+    eod_close_skew_bps: Decimal = Decimal("0")
+    eod_wind_minutes: int = 0
+    max_close_cost_bps: Decimal = Decimal("0")
+    wind_down: bool = False
 
     # Display / bookkeeping
     execution_purpose: str = Field(default="ladder_market_making")
