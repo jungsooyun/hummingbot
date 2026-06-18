@@ -76,4 +76,5 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
     flatten_timeout_s: float = 30.0
 
     # Display / bookkeeping
+    adopt_existing_inventory: bool = False
     execution_purpose: str = Field(default="ladder_market_making")

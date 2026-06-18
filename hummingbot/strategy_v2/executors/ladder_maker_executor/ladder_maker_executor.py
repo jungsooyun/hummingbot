@@ -136,6 +136,8 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         return total
 
     def _gates_open(self) -> bool:
+        if getattr(self, "_seed_fail_closed", False):
+            return False
         ctx = GateContext(
             now_kst=datetime.fromtimestamp(self._strategy.current_timestamp, tz=_KST),
             kis_age_s=0.0,  # feed-age gates land in JEP-133

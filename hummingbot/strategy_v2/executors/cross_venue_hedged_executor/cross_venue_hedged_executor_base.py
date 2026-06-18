@@ -61,12 +61,15 @@ This class is ABSTRACT. It is intentionally NOT registered in
 file is additive scaffolding only.
 """
 
+import asyncio
+import inspect
 import logging
+import time
 from abc import abstractmethod
 from decimal import Decimal
 from typing import Dict, List, Optional, Union
 
-from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.common import PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
@@ -170,6 +173,12 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
 
         self._current_retries = 0
         self._max_retries = max_retries
+        self._seed_adopted = False
+        self._seed_fail_closed = False
+        self._seed_adopting = False
+        self._seed_perp_basis_quote = ZERO
+        self._seed_readiness_timeout = 20.0  # HL position populate takes 5-12s (spec decision 2)
+        self._seed_readiness_interval = 0.1
 
         # Hedge kill-switch: tripped after max_retries CONSECUTIVE hedge failures (e.g. a
         # hedge-venue health failure / lost orders). When tripped, the maker gate closes
@@ -254,6 +263,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
 
     async def control_task(self):
         if self.status == RunnableStatus.RUNNING:
+            await self._seed_inventory_from_connector()
             if not self._gates_open():
                 self._cancel_all_maker()
                 self._process_hedges()
@@ -715,6 +725,131 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         if adjusted.amount == ZERO:
             self.close_type = CloseType.INSUFFICIENT_BALANCE
             self.stop()
+
+    async def _seed_inventory_from_connector(self) -> None:
+        if not getattr(self.config, "adopt_existing_inventory", False):
+            return
+        if not hasattr(self, "_seed_adopted"):
+            self._seed_adopted = False
+        if not hasattr(self, "_seed_fail_closed"):
+            self._seed_fail_closed = False
+        if not hasattr(self, "_seed_adopting"):
+            self._seed_adopting = False
+        if (
+            getattr(self, "_seed_adopted", False)
+            or getattr(self, "_seed_fail_closed", False)
+            or getattr(self, "_seed_adopting", False)
+        ):
+            return
+        self._seed_adopting = True
+        try:
+            if not await self._await_connector_readiness():
+                self._seed_fail_closed = True
+                return
+            if await self._has_resting_orders():
+                self._seed_fail_closed = True
+                return
+
+            perp_signed, perp_entry_price = self._read_perp_position_signed()
+            if getattr(self, "_seed_fail_closed", False):
+                return
+            spot_base = self._read_spot_balance_base()
+            if perp_signed == ZERO and spot_base == ZERO:
+                self._seed_fail_closed = True
+                return
+
+            self._apply_seed(perp_signed, spot_base, perp_entry_price)
+            self._seed_adopted = True
+        finally:
+            self._seed_adopting = False
+
+    def _read_perp_position_signed(self) -> tuple[Decimal, Decimal]:
+        connector = self.connectors[self.maker_connector]
+        if getattr(connector, "position_mode", PositionMode.ONEWAY) == PositionMode.HEDGE:
+            self._seed_fail_closed = True
+            return ZERO, ZERO
+
+        positions = getattr(connector, "account_positions", {}) or {}
+        iterable = positions.values() if hasattr(positions, "values") else positions
+        for position in iterable:
+            if getattr(position, "trading_pair", None) != self.maker_trading_pair:
+                continue
+            amount = Decimal(str(getattr(position, "amount", ZERO)))
+            if amount == ZERO:
+                return ZERO, ZERO
+            side = getattr(position, "position_side", None)
+            if side == PositionSide.SHORT:
+                amount = -abs(amount)
+            elif side == PositionSide.LONG:
+                amount = abs(amount)
+            entry_price = Decimal(str(getattr(position, "entry_price", ZERO)))
+            return amount, entry_price
+        return ZERO, ZERO
+
+    def _read_spot_balance_base(self) -> Decimal:
+        connector = self.connectors[self.hedge_connector]
+        base_asset = self.hedge_trading_pair.split("-", 1)[0]
+        if hasattr(connector, "get_balance"):
+            balance = connector.get_balance(base_asset)
+        elif hasattr(connector, "get_available_balance"):
+            balance = connector.get_available_balance(base_asset)
+        else:
+            balance = ZERO
+        return max(Decimal(str(balance)), ZERO)
+
+    def _apply_seed(self, perp_signed: Decimal, spot_base: Decimal, perp_entry_price: Decimal) -> None:
+        self._ensure_direction_accounting()
+        if perp_signed > ZERO:
+            self._maker_buy_base += perp_signed
+        elif perp_signed < ZERO:
+            self._maker_sell_base += -perp_signed
+        self._hedge_buy_base += self._hedge_base_to_maker_base(spot_base)
+        self._seed_perp_basis_quote = abs(perp_signed) * perp_entry_price
+
+    def _seed_snapshots_fresh(self) -> bool:
+        maker = self.connectors[self.maker_connector]
+        hedge = self.connectors[self.hedge_connector]
+        return (
+            hasattr(maker, "account_positions")
+            and (hasattr(hedge, "get_balance") or hasattr(hedge, "get_available_balance"))
+        )
+
+    async def _await_connector_readiness(
+        self,
+        timeout_s: Optional[float] = None,
+        interval_s: Optional[float] = None,
+    ) -> bool:
+        timeout = getattr(self, "_seed_readiness_timeout", 20.0) if timeout_s is None else timeout_s
+        interval = getattr(self, "_seed_readiness_interval", 0.1) if interval_s is None else interval_s
+        deadline = time.monotonic() + timeout
+
+        while True:
+            maker_ready = bool(getattr(self.connectors[self.maker_connector], "ready", False))
+            hedge_ready = bool(getattr(self.connectors[self.hedge_connector], "ready", False))
+            if maker_ready and hedge_ready and self._seed_snapshots_fresh():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(interval)
+
+    async def _has_resting_orders(self) -> bool:
+        for connector_name, trading_pair in (
+            (self.maker_connector, self.maker_trading_pair),
+            (self.hedge_connector, self.hedge_trading_pair),
+        ):
+            connector = self.connectors[connector_name]
+            get_open_orders = getattr(connector, "get_open_orders", None)
+            if get_open_orders is None:
+                continue
+            try:
+                orders = get_open_orders(trading_pair)
+                if inspect.isawaitable(orders):
+                    orders = await orders
+            except Exception:
+                return True
+            if orders:
+                return True
+        return False
 
     def get_net_pnl_quote(self) -> Decimal:
         if getattr(self.config, "two_sided", False):

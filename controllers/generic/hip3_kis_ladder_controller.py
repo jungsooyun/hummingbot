@@ -93,6 +93,7 @@ class Hip3KisLadderControllerConfig(ControllerConfigBase):
     kill_switch: bool = Field(default=False, json_schema_extra={"is_updatable": True})
     # No-submit verification: executor computes fair + logs intended quotes, no orders.
     observe: bool = Field(default=False, json_schema_extra={"is_updatable": True})
+    adopt_existing_inventory: bool = Field(default=False, json_schema_extra={"is_updatable": True})
 
     # Two-sided MM
     two_sided: bool = False
@@ -185,6 +186,7 @@ class Hip3KisLadderController(ControllerBase):
                 leverage=self.config.leverage,
                 kill_switch=self.config.kill_switch,
                 observe=self.config.observe,
+                adopt_existing_inventory=self.config.adopt_existing_inventory,
                 two_sided=self.config.two_sided,
                 k_open_skew_bps=self.config.k_open_skew_bps,
                 k_close_skew_bps=self.config.k_close_skew_bps,

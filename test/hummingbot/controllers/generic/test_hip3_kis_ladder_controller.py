@@ -123,6 +123,23 @@ class TestHip3KisLadderController(IsolatedAsyncioWrapperTestCase):
         self.assertIs(executor_config.wind_down, True)
         self.assertEqual(45.5, executor_config.flatten_timeout_s)
 
+    def test_adopt_existing_inventory_defaults_false(self):
+        self.controller.executors_info = []
+
+        actions = self.controller.determine_executor_actions()
+        executor_config = actions[0].executor_config
+
+        self.assertIs(executor_config.adopt_existing_inventory, False)
+
+    def test_adopt_existing_inventory_passthrough(self):
+        self.config.adopt_existing_inventory = True
+        self.controller.executors_info = []
+
+        actions = self.controller.determine_executor_actions()
+        executor_config = actions[0].executor_config
+
+        self.assertIs(executor_config.adopt_existing_inventory, True)
+
     def test_determine_executor_actions_filters_done_through_real_base(self):
         # One running (not-done) + one terminated (done). The not-done lambda is
         # applied through the REAL ControllerBase.filter_executors. The single
