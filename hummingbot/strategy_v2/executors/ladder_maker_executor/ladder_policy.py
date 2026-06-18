@@ -43,6 +43,12 @@ class RungTarget:
 
 
 @dataclass(frozen=True)
+class TwoSidedTargets:
+    open: list[RungTarget]
+    close: list[RungTarget]
+
+
+@dataclass(frozen=True)
 class HedgeOrder:
     side: Side
     price: Decimal
@@ -171,6 +177,74 @@ def build_ladder_targets(
         targets.append(RungTarget(side=side, price=price, size=qty, edge_bps=rung.edge_bps))
         remaining -= qty
     return targets
+
+
+def build_two_sided_targets(
+    *,
+    fair: Decimal,
+    rungs: List[RungSpec],
+    total_size_cap: Decimal,
+    net_position: Decimal,
+    open_edge_vwap: Decimal,
+    util: Decimal,
+    eod_pressure: Decimal,
+    cost_bps: Decimal,
+    k_open_skew_bps: Decimal,
+    k_close_skew_bps: Decimal,
+    eod_close_skew_bps: Decimal,
+    max_close_cost_bps: Decimal,
+    tick: Decimal,
+    buffer_ticks: Decimal,
+    wind_down: bool,
+) -> TwoSidedTargets:
+    buffer = tick * buffer_ticks
+    half_cost = cost_bps / Decimal("2")
+    break_even_buy_edge = cost_bps - open_edge_vwap - max_close_cost_bps
+
+    open_targets: List[RungTarget] = []
+    open_remaining = total_size_cap - net_position
+    if not wind_down and net_position < total_size_cap and open_remaining > ZERO:
+        for rung in rungs:
+            if not rung.enabled or open_remaining <= ZERO:
+                continue
+            qty = min(rung.size, open_remaining)
+            if qty <= ZERO:
+                continue
+            edge_sell = half_cost + rung.edge_bps + k_open_skew_bps * util
+            price_sell = ceil_to_tick(fair * (ONE + edge_sell / BPS) + buffer, tick)
+            open_targets.append(RungTarget(side=Side.SELL, price=price_sell, size=qty, edge_bps=edge_sell))
+            open_remaining -= qty
+
+    close_targets: List[RungTarget] = []
+    close_remaining = net_position
+    if close_remaining > ZERO:
+        for rung in rungs:
+            if not rung.enabled or close_remaining <= ZERO:
+                continue
+            qty = min(rung.size, close_remaining)
+            if qty <= ZERO:
+                continue
+            edge_buy = half_cost + rung.edge_bps - k_close_skew_bps * util - eod_close_skew_bps * eod_pressure
+            edge_buy = max(edge_buy, break_even_buy_edge)
+            price_buy = floor_to_tick(fair * (ONE - edge_buy / BPS) - buffer, tick)
+            close_targets.append(RungTarget(side=Side.BUY, price=price_buy, size=qty, edge_bps=edge_buy))
+            close_remaining -= qty
+
+    return TwoSidedTargets(open=open_targets, close=close_targets)
+
+
+def compute_eod_pressure(now_kst_min: int, krx_close_min: int, wind_minutes: int) -> Decimal:
+    wind_minutes_dec = Decimal(wind_minutes)
+    if wind_minutes_dec <= ZERO:
+        return ZERO
+
+    wind_start = Decimal(krx_close_min) - wind_minutes_dec
+    pressure = (Decimal(now_kst_min) - wind_start) / (Decimal(krx_close_min) - wind_start)
+    if pressure <= ZERO:
+        return ZERO
+    if pressure >= ONE:
+        return ONE
+    return pressure
 
 
 @dataclass(frozen=True)
