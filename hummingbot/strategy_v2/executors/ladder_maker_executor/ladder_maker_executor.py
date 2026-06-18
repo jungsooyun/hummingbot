@@ -132,7 +132,9 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             inventory=self._unhedged_base_signed(),
             open_order_count=len(self._open_maker_orders()),
             pending_notional=self._pending_maker_notional(),
-            kill_switch=bool(self.config.kill_switch),
+            # config kill_switch OR the auto-tripped hedge kill-switch (persistent hedge-
+            # venue failure): either closes the maker gate (halt quoting, cancel makers).
+            kill_switch=bool(self.config.kill_switch) or self._hedge_kill_switch,
         )
         if not self._gate_chain.evaluate(ctx).open:
             return False

@@ -77,6 +77,7 @@ class _Harness(CrossVenueHedgedExecutorBase):
         self._pending_hedge_base = Decimal("0")
         self._current_retries = 0
         self._max_retries = 3
+        self._hedge_kill_switch = False
         self._status = RunnableStatus.RUNNING
         self.maker_connector = "hl"
         self.maker_trading_pair = "X-USD"
@@ -95,9 +96,8 @@ class _Harness(CrossVenueHedgedExecutorBase):
     def get_in_flight_order(self, connector_name, order_id):
         return self.connector_orders.get(order_id)
 
-    def evaluate_max_retries(self):  # faithful: stop() -> TERMINATED when exceeded
-        if self._current_retries > self._max_retries:
-            self._status = RunnableStatus.TERMINATED
+    # NOTE: evaluate_max_retries is the REAL base method now (trips _hedge_kill_switch,
+    # never terminates) — intentionally NOT stubbed so the kill-switch is tested faithfully.
 
     # unused abstract hooks (needed only to make the ABC concrete)
     def _gates_open(self):
@@ -355,20 +355,62 @@ def test_unknown_to_connector_is_left_not_reaped_no_double_hedge():
     assert "h0" in h.hedge_orders and h.hedge_orders["h0"].order is None  # left in-flight
 
 
-def test_no_hedge_placed_after_reconcile_terminates_executor():
-    # FINDING #1 (round 2): a reconcile that trips max_retries -> stop() must NOT let the
-    # same _process_hedges call place another hedge afterwards (orphan order after stop).
+def test_no_hedge_placed_when_executor_already_terminated():
+    # The _process_hedges guard: if the executor has been TERMINATED by any path
+    # (early_stop / insufficient balance), no hedge is placed even with pending pending.
     h = _Harness()
-    h._max_retries = 0  # the next retry terminates the executor
+    _maker_fill(h, "m0", "2.0")
+    h._status = RunnableStatus.TERMINATED
+    h._process_hedges()
+    assert h.placed == []  # nothing placed while terminated
+
+
+# ------------------------------------------------------------------- hedge kill-switch
+# Persistent hedge failure (a hedge-venue health failure / lost orders, surfaced as
+# repeated MarketOrderFailureEvent) trips _hedge_kill_switch instead of FAILED-terminating:
+# the maker gate closes (quoting halts, makers cancelled, position held) while hedging of
+# the remaining pending continues. Native (no orchestrator POSITION_HOLD), reversible.
+
+
+def test_consecutive_hedge_failures_trip_kill_switch_without_terminating():
+    h = _Harness()  # _max_retries = 3
+    for i in range(4):  # 4 consecutive failures -> _current_retries 4 > 3 -> trip
+        h.hedge_orders[f"h{i}"] = _Tracked(f"h{i}")
+        h.process_order_failed_event(None, None, _Ev(f"h{i}", "0"))
+    assert h._current_retries == 4
+    assert h._hedge_kill_switch is True
+    assert h.status == RunnableStatus.RUNNING  # held, NOT terminated
+
+
+def test_hedge_fill_resets_consecutive_failure_streak():
+    h = _Harness()  # _max_retries = 3
+    for i in range(3):  # 3 failures (not yet > 3 -> no trip)
+        h.hedge_orders[f"h{i}"] = _Tracked(f"h{i}")
+        h.process_order_failed_event(None, None, _Ev(f"h{i}", "0"))
+    assert h._current_retries == 3 and h._hedge_kill_switch is False
+    h.hedge_orders["hf"] = _Tracked("hf")
+    h.process_order_filled_event(None, None, _Ev("hf", "1"))  # a fill -> streak resets
+    assert h._current_retries == 0
+    for i in range(3, 6):  # 3 more failures still do not trip (streak was reset)
+        h.hedge_orders[f"h{i}"] = _Tracked(f"h{i}")
+        h.process_order_failed_event(None, None, _Ev(f"h{i}", "0"))
+    assert h._current_retries == 3 and h._hedge_kill_switch is False
+
+
+def test_persistent_terminal_hedge_failure_trips_kill_switch_and_keeps_hedging():
+    # reconcile dropping a terminal-unfilled hedge past max_retries trips the kill-switch
+    # (not terminate); hedging of the still-pending base continues.
+    h = _Harness()
+    h._max_retries = 0  # first failure trips it
     _maker_fill(h, "m0", "2.0")
     h._process_hedges()  # place h0(2); order None
     cx = h.connector_orders["h0"]
     cx.executed_amount_base = Decimal("0")
-    cx.is_open = False  # terminal unfilled -> reconcile increments retry -> terminate
-    h._process_hedges()  # MUST stop before placing
-    assert h.status == RunnableStatus.TERMINATED
-    assert h._current_retries == 1
-    assert h.placed == [("h0", Decimal("2"))]  # NO hedge placed after stop
+    cx.is_open = False  # terminal unfilled -> reconcile retry -> trip
+    h._process_hedges()
+    assert h._hedge_kill_switch is True
+    assert h.status == RunnableStatus.RUNNING  # NOT terminated
+    assert h.placed[-1] == ("h1", Decimal("2"))  # keeps hedging the pending
 
 
 def test_terminal_filled_nan_price_does_not_poison_quote():

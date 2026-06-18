@@ -149,6 +149,13 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         self._current_retries = 0
         self._max_retries = max_retries
 
+        # Hedge kill-switch: tripped after max_retries CONSECUTIVE hedge failures (e.g. a
+        # hedge-venue health failure / lost orders). When tripped, the maker gate closes
+        # (stop quoting + cancel resting makers every tick + hold position, no liquidation)
+        # while hedging of the remaining pending continues, so it recovers in place when the
+        # venue returns. Reversible (an operator can clear it) -> a false trip is conservative.
+        self._hedge_kill_switch = False
+
         subscribed = [self.maker_connector, self.hedge_connector]
         for extra in connectors or []:
             if extra and extra not in subscribed:
@@ -438,6 +445,9 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self._pending_hedge_base -= Decimal(event.amount)
             if self._pending_hedge_base < ZERO:
                 self._pending_hedge_base = ZERO
+            # A successful hedge fill proves the venue is responding: reset the consecutive
+            # failure counter so the kill-switch only trips on a *persistent* streak.
+            self._current_retries = 0
 
     def process_order_completed_event(
         self, _, market, event: Union[BuyOrderCompletedEvent, SellOrderCompletedEvent]
@@ -462,6 +472,32 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self.hedge_orders.pop(event.order_id, None)
             self._current_retries += 1
             self.evaluate_max_retries()
+
+    def evaluate_max_retries(self):
+        """Trip the hedge kill-switch instead of terminating on repeated hedge failure.
+
+        A hedge that fails more than ``max_retries`` CONSECUTIVE times signals a hedge-venue
+        health failure (e.g. KIS lost orders / persistent REST errors — both surface as a
+        ``MarketOrderFailureEvent`` and increment ``_current_retries``). Rather than the base
+        ``CloseType.FAILED`` terminate (which abandons the unhedged position and stops hedging
+        entirely), trip ``_hedge_kill_switch``: the maker gate closes so quoting halts and
+        resting makers are cancelled every tick (capping the naked exposure the maker leg
+        would otherwise keep accumulating), the position is HELD (no market-close), and
+        hedging of the outstanding pending keeps retrying so it completes in place once the
+        venue recovers. This avoids the orchestrator's POSITION_HOLD hand-off (which the
+        ladder config shape does not support) and never terminates, so there is no
+        place-after-stop window. Reversible (an operator clears the flag) -> a false trip is
+        conservative, not destructive.
+        """
+        if self._current_retries > self._max_retries and not self._hedge_kill_switch:
+            self._hedge_kill_switch = True
+            self.logger().error(
+                "Hedge failed %s consecutive times (> max_retries=%s): tripping the hedge "
+                "kill-switch. Maker quoting halts and resting makers are cancelled; the "
+                "position is held and hedging continues for the remaining pending (%s). "
+                "Clear _hedge_kill_switch once the hedge venue recovers.",
+                self._current_retries, self._max_retries, self._pending_hedge_base,
+            )
 
     # ============================================================ balance / pnl
 
@@ -515,4 +551,5 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             "pending_hedge_base": self._pending_hedge_base,
             "open_maker_orders": len(self._open_maker_orders()),
             "open_hedge_orders": len(self._open_hedge_orders()),
+            "hedge_kill_switch": self._hedge_kill_switch,
         }
