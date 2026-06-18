@@ -75,7 +75,7 @@ class _Harness(CrossVenueHedgedExecutorBase):
         self._hedge_executed_quote = Decimal("0")
         self._maker_fees_quote = Decimal("0")
         self._hedge_fees_quote = Decimal("0")
-        self._pending_hedge_base = Decimal("0")
+        self._pending_hedge_signed = Decimal("0")
         self._current_retries = 0
         self._max_retries = 3
         self._hedge_kill_switch = False
