@@ -309,9 +309,16 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
 
     @property
     def expected_fill_fee(self) -> TradeFeeBase:
-        return AddedToCostTradeFee(
+        # KIS inquire-daily-ccld returns no per-fill commission, so the connector derives the
+        # fill fee from the fee schema (percent, no flat fees) via new_spot_fee. Mirror that
+        # exact construction here (framework fill tests use BUY orders) so the assertion checks
+        # the real behavior instead of a flat fee KIS never reports.
+        return TradeFeeBase.new_spot_fee(
+            fee_schema=self.exchange.trade_fee_schema(),
+            trade_type=TradeType.BUY,
             percent_token=self.quote_asset,
-            flat_fees=[TokenAmount(token=self.quote_asset, amount=Decimal("30"))])
+            flat_fees=[],
+        )
 
     @property
     def expected_fill_trade_id(self) -> str:
@@ -1444,6 +1451,97 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         pass
 
     # ------------------------------------------------------------------
+    # Regression: REST fill detection must parse the REAL KIS
+    # inquire-daily-ccld response shape (output1 list + output2 + lowercase fields).
+    #
+    # The live KIS hedge (JEP-162, 2026-06-18) FILLED on the exchange, but the
+    # connector never detected it and the order stayed OPEN forever. Root cause:
+    # the parser read container "output" + UPPERCASE keys (CCLD_QTY/ORD_QTY/
+    # CNCL_YN/ODNO/AVG_PRVS/TOT_CCLD_AMT), while KIS returns "output1" (+ "output2")
+    # with lowercase tot_ccld_qty/ord_qty/cncl_yn/odno/avg_prvs/tot_ccld_amt. The
+    # whole prior mock suite used the fictional shape, so every fill test was GREEN
+    # against a response KIS never sends (confirmed vs the stratops nautilus KIS
+    # adapter). These pin the real shape so the bug cannot return.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _real_daily_ccld_filled_response(odno: str, ord_qty: int, fill_price: int) -> dict:
+        """Real KIS inquire-daily-ccld (TTTC8001R) FULL-fill shape: output1 list of
+        order rows (lowercase fields) + output2 summary."""
+        return {
+            "rt_cd": "0",
+            "msg_cd": "MCA00000",
+            "msg1": "정상처리 되었습니다.",
+            "output1": [
+                {
+                    "ord_dt": "20260618",
+                    "odno": odno,
+                    "orgn_odno": "",
+                    "pdno": "005930",
+                    "ord_qty": str(ord_qty),
+                    "ord_unpr": str(fill_price),
+                    "tot_ccld_qty": str(ord_qty),
+                    "avg_prvs": str(fill_price),
+                    "cncl_yn": "N",
+                    "tot_ccld_amt": str(ord_qty * fill_price),
+                    "rmn_qty": "0",
+                    "sll_buy_dvsn_cd": "02",
+                }
+            ],
+            "output2": {
+                "tot_ord_qty": str(ord_qty),
+                "tot_ccld_qty": str(ord_qty),
+                "tot_ccld_amt": str(ord_qty * fill_price),
+                "pchs_avg_pric": str(fill_price),
+                "prsm_tlex_smtl": "0",
+            },
+        }
+
+    def _make_kis_order(self, odno="0000111122223333", amount="1", executed="0",
+                        trade_type=TradeType.BUY):
+        from unittest.mock import MagicMock
+        order = MagicMock()
+        order.client_order_id = "CID-hedge-1"
+        order.exchange_order_id = odno
+        order.trading_pair = self.trading_pair
+        order.trade_type = trade_type
+        order.base_asset = self.base_asset
+        order.quote_asset = self.quote_asset
+        order.amount = Decimal(amount)
+        order.executed_amount_base = Decimal(executed)
+        return order
+
+    def test_rest_fill_updates_parse_real_daily_ccld_shape(self):
+        # RED before fix: parser read container "output" + UPPERCASE keys, so a real
+        # output1/lowercase response yielded ZERO fills -> live hedge stayed OPEN.
+        order = self._make_kis_order(odno="ODNO-REAL-1", amount="1", executed="0")
+        resp = self._real_daily_ccld_filled_response(odno="ODNO-REAL-1", ord_qty=1, fill_price=360000)
+        updates = self.exchange._create_order_fill_updates(order=order, fill_data=resp)
+        self.assertEqual(1, len(updates), "real KIS output1 full fill must yield exactly one TradeUpdate")
+        self.assertEqual(Decimal("1"), updates[0].fill_base_amount)
+        self.assertEqual(Decimal("360000"), updates[0].fill_price)
+
+    def test_rest_order_state_infers_filled_from_real_row(self):
+        # RED before fix: _infer_order_state read UPPERCASE CCLD_QTY/ORD_QTY -> 0 -> OPEN forever.
+        order = self._make_kis_order(odno="ODNO-REAL-2", amount="1")
+        row = self._real_daily_ccld_filled_response(odno="ODNO-REAL-2", ord_qty=1, fill_price=360000)["output1"][0]
+        self.assertEqual(OrderState.FILLED, self.exchange._infer_order_state(row, order))
+
+    def test_rest_fill_updates_emit_delta_not_cumulative(self):
+        # tot_ccld_qty is CUMULATIVE per order; the connector must emit the INCREMENT vs the
+        # order's already-executed base so re-polling never double-counts and partial->full is correct.
+        order = self._make_kis_order(odno="ODNO-REAL-3", amount="2", executed="1")
+        resp = self._real_daily_ccld_filled_response(odno="ODNO-REAL-3", ord_qty=2, fill_price=100)
+        updates = self.exchange._create_order_fill_updates(order=order, fill_data=resp)
+        self.assertEqual(1, len(updates))
+        self.assertEqual(Decimal("1"), updates[0].fill_base_amount, "delta = 2 cumulative - 1 already executed")
+
+    def test_rest_order_state_infers_canceled_from_real_row(self):
+        order = self._make_kis_order(odno="ODNO-REAL-4", amount="1")
+        row = {"odno": "ODNO-REAL-4", "ord_qty": "1", "tot_ccld_qty": "0", "cncl_yn": "Y", "rmn_qty": "1"}
+        self.assertEqual(OrderState.CANCELED, self.exchange._infer_order_state(row, order))
+
+    # ------------------------------------------------------------------
     # Private helpers: KIS-formatted mock responses
     # ------------------------------------------------------------------
 
@@ -1458,144 +1556,88 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
             }
         }
 
-    def _order_status_request_completely_filled_mock_response(self, order: InFlightOrder) -> Any:
-        exchange_order_id = order.exchange_order_id or self.expected_exchange_order_id
+    def _kis_ccld_response(self, order: InFlightOrder, *, filled_qty, cncl: str = "N",
+                           price=None, ord_qty=None) -> dict:
+        """Build a REAL KIS inquire-daily-ccld response: output1 (list of order rows,
+        lowercase fields) + output2 (summary). KIS uses the same endpoint for status and
+        fills, and reports cumulative tot_ccld_qty per order (no per-fill commission).
+        ``ord_qty`` defaults to the order amount; partial-fill fixtures pass a larger
+        ord_qty so tot_ccld_qty < ord_qty reads as PARTIALLY_FILLED (state is inferred,
+        not parsed — KIS has no explicit status field on this endpoint)."""
+        odno = str(order.exchange_order_id or self.expected_exchange_order_id)
+        fq = int(filled_qty)
+        px = int(price) if price is not None else int(order.price)
+        ord_qty = int(ord_qty) if ord_qty is not None else int(order.amount)
         return {
             "rt_cd": "0",
             "msg_cd": "MCA00000",
             "msg1": "\uc815\uc0c1\ucc98\ub9ac \ub418\uc5c8\uc2b5\ub2c8\ub2e4.",
-            "output": {
-                "ODNO": exchange_order_id,
-                "ORD_QTY": str(int(order.amount)),
-                "CCLD_QTY": str(int(order.amount)),
-                "ORD_UNPR": str(int(order.price)),
-                "AVG_PRVS": str(int(order.price + Decimal(2))),
-                "SLL_BUY_DVSN_CD": "02" if order.trade_type == TradeType.BUY else "01",
-                "ORD_DVSN_CD": "00",
-                "CNCL_YN": "N",
-                "TOT_CCLD_AMT": str(int(order.amount * (order.price + Decimal(2)))),
-                "state": "filled",
-                "clientOrderId": order.client_order_id,
-            }
+            "output1": [
+                {
+                    "ord_dt": "20260618",
+                    "odno": odno,
+                    "orgn_odno": "",
+                    "pdno": self.exchange_symbol_for_tokens(order.base_asset, order.quote_asset),
+                    "sll_buy_dvsn_cd": "02" if order.trade_type == TradeType.BUY else "01",
+                    "ord_qty": str(ord_qty),
+                    "ord_unpr": str(int(order.price)),
+                    "tot_ccld_qty": str(fq),
+                    "avg_prvs": str(px) if fq > 0 else "0",
+                    "cncl_yn": cncl,
+                    "tot_ccld_amt": str(fq * px),
+                    "rmn_qty": str(ord_qty - fq),
+                }
+            ],
+            "output2": {
+                "tot_ord_qty": str(ord_qty),
+                "tot_ccld_qty": str(fq),
+                "tot_ccld_amt": str(fq * px),
+                "pchs_avg_pric": str(px) if fq > 0 else "0",
+                "prsm_tlex_smtl": "0",
+            },
         }
+
+    def _order_status_request_completely_filled_mock_response(self, order: InFlightOrder) -> Any:
+        # Real shape: full fill -> tot_ccld_qty == ord_qty, avg_prvs == order.price so the
+        # framework's fill_event.price == order.price assertion holds.
+        return self._kis_ccld_response(order, filled_qty=int(order.amount), price=int(order.price))
 
     def _order_status_request_canceled_mock_response(self, order: InFlightOrder) -> Any:
-        exchange_order_id = order.exchange_order_id or self.expected_exchange_order_id
-        return {
-            "rt_cd": "0",
-            "msg_cd": "MCA00000",
-            "msg1": "\uc815\uc0c1\ucc98\ub9ac \ub418\uc5c8\uc2b5\ub2c8\ub2e4.",
-            "output": {
-                "ODNO": exchange_order_id,
-                "ORD_QTY": str(int(order.amount)),
-                "CCLD_QTY": "0",
-                "ORD_UNPR": str(int(order.price)),
-                "AVG_PRVS": "0",
-                "SLL_BUY_DVSN_CD": "02" if order.trade_type == TradeType.BUY else "01",
-                "ORD_DVSN_CD": "00",
-                "CNCL_YN": "Y",
-                "TOT_CCLD_AMT": "0",
-                "state": "canceled",
-                "clientOrderId": order.client_order_id,
-            }
-        }
+        return self._kis_ccld_response(order, filled_qty=0, cncl="Y")
 
     def _order_status_request_open_mock_response(self, order: InFlightOrder) -> Any:
-        exchange_order_id = order.exchange_order_id or self.expected_exchange_order_id
-        return {
-            "rt_cd": "0",
-            "msg_cd": "MCA00000",
-            "msg1": "\uc815\uc0c1\ucc98\ub9ac \ub418\uc5c8\uc2b5\ub2c8\ub2e4.",
-            "output": {
-                "ODNO": exchange_order_id,
-                "ORD_QTY": str(int(order.amount)),
-                "CCLD_QTY": "0",
-                "ORD_UNPR": str(int(order.price)),
-                "AVG_PRVS": "0",
-                "SLL_BUY_DVSN_CD": "02" if order.trade_type == TradeType.BUY else "01",
-                "ORD_DVSN_CD": "00",
-                "CNCL_YN": "N",
-                "TOT_CCLD_AMT": "0",
-                "state": "new",
-                "clientOrderId": order.client_order_id,
-            }
-        }
+        return self._kis_ccld_response(order, filled_qty=0, cncl="N")
 
     def _order_status_request_partially_filled_mock_response(self, order: InFlightOrder) -> Any:
-        exchange_order_id = order.exchange_order_id or self.expected_exchange_order_id
-        return {
-            "rt_cd": "0",
-            "msg_cd": "MCA00000",
-            "msg1": "\uc815\uc0c1\ucc98\ub9ac \ub418\uc5c8\uc2b5\ub2c8\ub2e4.",
-            "output": {
-                "ODNO": exchange_order_id,
-                "ORD_QTY": str(int(order.amount)),
-                "CCLD_QTY": str(int(self.expected_partial_fill_amount)),
-                "ORD_UNPR": str(int(order.price)),
-                "AVG_PRVS": str(int(self.expected_partial_fill_price)),
-                "SLL_BUY_DVSN_CD": "02" if order.trade_type == TradeType.BUY else "01",
-                "ORD_DVSN_CD": "00",
-                "CNCL_YN": "N",
-                "TOT_CCLD_AMT": str(int(self.expected_partial_fill_amount * self.expected_partial_fill_price)),
-                "state": "partially_filled",
-                "clientOrderId": order.client_order_id,
-            }
-        }
+        partial = int(self.expected_partial_fill_amount)
+        return self._kis_ccld_response(
+            order,
+            filled_qty=partial,
+            price=int(self.expected_partial_fill_price),
+            ord_qty=partial * 2,  # real partial: filled < ordered -> PARTIALLY_FILLED
+        )
 
     def _order_fills_request_full_fill_mock_response(self, order: InFlightOrder) -> Any:
-        exchange_order_id = order.exchange_order_id or self.expected_exchange_order_id
-        return {
-            "rt_cd": "0",
-            "msg_cd": "MCA00000",
-            "msg1": "\uc815\uc0c1\ucc98\ub9ac \ub418\uc5c8\uc2b5\ub2c8\ub2e4.",
-            "output": [
-                {
-                    "tradeId": self.expected_fill_trade_id,
-                    "ODNO": exchange_order_id,
-                    "PDNO": self.exchange_symbol_for_tokens(order.base_asset, order.quote_asset),
-                    "SLL_BUY_DVSN_CD": "02" if order.trade_type == TradeType.BUY else "01",
-                    "ORD_QTY": str(int(order.amount)),
-                    "CCLD_QTY": str(int(order.amount)),
-                    "ORD_UNPR": str(int(order.price)),
-                    "AVG_PRVS": str(int(order.price)),
-                    "TOT_CCLD_AMT": str(int(order.amount * order.price)),
-                    "fee": str(self.expected_fill_fee.flat_fees[0].amount),
-                    "feeCoinName": self.expected_fill_fee.flat_fees[0].token,
-                    "clientOrderId": order.client_order_id,
-                }
-            ]
-        }
+        return self._kis_ccld_response(order, filled_qty=int(order.amount), price=int(order.price))
 
-    @staticmethod
-    def _empty_fill_mock_response() -> dict:
-        """Return an empty fill list response consumed by _all_trade_updates_for_order."""
+    def _empty_fill_mock_response(self) -> dict:
+        """No-fill inquire-daily-ccld response (empty output1) for _all_trade_updates_for_order."""
         return {
             "rt_cd": "0",
             "msg_cd": "MCA00000",
             "msg1": "\uc815\uc0c1\ucc98\ub9ac \ub418\uc5c8\uc2b5\ub2c8\ub2e4.",
-            "output": []
+            "output1": [],
+            "output2": {
+                "tot_ord_qty": "0", "tot_ccld_qty": "0", "tot_ccld_amt": "0",
+                "pchs_avg_pric": "0", "prsm_tlex_smtl": "0",
+            },
         }
 
     def _order_fills_request_partial_fill_mock_response(self, order: InFlightOrder) -> Any:
-        exchange_order_id = order.exchange_order_id or self.expected_exchange_order_id
-        return {
-            "rt_cd": "0",
-            "msg_cd": "MCA00000",
-            "msg1": "\uc815\uc0c1\ucc98\ub9ac \ub418\uc5c8\uc2b5\ub2c8\ub2e4.",
-            "output": [
-                {
-                    "tradeId": self.expected_fill_trade_id,
-                    "ODNO": exchange_order_id,
-                    "PDNO": self.exchange_symbol_for_tokens(order.base_asset, order.quote_asset),
-                    "SLL_BUY_DVSN_CD": "02" if order.trade_type == TradeType.BUY else "01",
-                    "ORD_QTY": str(int(order.amount)),
-                    "CCLD_QTY": str(int(self.expected_partial_fill_amount)),
-                    "ORD_UNPR": str(int(self.expected_partial_fill_price)),
-                    "AVG_PRVS": str(int(self.expected_partial_fill_price)),
-                    "TOT_CCLD_AMT": str(int(self.expected_partial_fill_amount * self.expected_partial_fill_price)),
-                    "fee": str(self.expected_fill_fee.flat_fees[0].amount),
-                    "feeCoinName": self.expected_fill_fee.flat_fees[0].token,
-                    "clientOrderId": order.client_order_id,
-                }
-            ]
-        }
+        partial = int(self.expected_partial_fill_amount)
+        return self._kis_ccld_response(
+            order,
+            filled_qty=partial,
+            price=int(self.expected_partial_fill_price),
+            ord_qty=partial * 2,  # real partial: filled < ordered -> PARTIALLY_FILLED
+        )

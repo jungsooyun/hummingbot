@@ -1,5 +1,6 @@
 import asyncio
-from decimal import Decimal
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 from bidict import bidict
@@ -479,27 +480,16 @@ class KisExchange(ExchangePyBase):
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         result = await self._request_kis_order_detail(tracked_order)
 
-        # Process any fill data embedded in the response
-        fill_updates = self._create_order_fill_updates(order=tracked_order, fill_data=result)
-        for fill_update in fill_updates:
-            self._order_tracker.process_trade_update(fill_update)
-
-        output = result.get("output", {})
-        # When output is a list (fill response format), extract status from first element
-        if isinstance(output, list):
-            output = output[0] if output else {}
-
-        # Determine order state from response
-        state_str = output.get("state")
-        if state_str:
-            new_state = CONSTANTS.ORDER_STATE.get(state_str, OrderState.OPEN)
-        else:
-            # Infer state from fill data when explicit state is absent
-            new_state = self._infer_order_state(output, tracked_order)
+        # State only. Fills are emitted by _all_trade_updates_for_order (the dedicated
+        # trade-update path), so that a failed fill fetch never double-emits a fill the
+        # status path would have surfaced. KIS inquire-daily-ccld has no explicit status
+        # field; derive state from the matched row's cumulative tot_ccld_qty vs ord_qty + cncl_yn.
+        row = self._match_ccld_row(result, tracked_order)
+        new_state = self._infer_order_state(row, tracked_order)
 
         order_update = OrderUpdate(
             client_order_id=tracked_order.client_order_id,
-            exchange_order_id=str(output.get("ODNO", tracked_order.exchange_order_id or "")),
+            exchange_order_id=str(row.get("odno", tracked_order.exchange_order_id or "")),
             trading_pair=tracked_order.trading_pair,
             update_timestamp=self.current_timestamp,
             new_state=new_state,
@@ -507,19 +497,30 @@ class KisExchange(ExchangePyBase):
         return order_update
 
     @staticmethod
-    def _infer_order_state(output: Dict[str, Any], order: InFlightOrder) -> OrderState:
-        """Infer order state from KIS fill data when explicit 'state' field is missing."""
-        ccld_qty_str = output.get("CCLD_QTY", "0")
-        ord_qty_str = output.get("ORD_QTY", "0")
-        cncl_yn = output.get("CNCL_YN", "N")
+    def _match_ccld_row(result: Dict[str, Any], order: InFlightOrder) -> Dict[str, Any]:
+        """Return this order's inquire-daily-ccld output1 row (matched by odno), else the
+        first row, else {} — KIS returns output1 (list) + output2 (summary), NOT 'output'."""
+        rows = result.get("output1", [])
+        if not isinstance(rows, list) or not rows:
+            return {}
+        eoid = str(order.exchange_order_id) if order.exchange_order_id else ""
+        if eoid:
+            for row in rows:
+                if str(row.get("odno", "")) == eoid:
+                    return row
+        return rows[0]
 
+    @staticmethod
+    def _infer_order_state(row: Dict[str, Any], order: InFlightOrder) -> OrderState:
+        """Infer state from a KIS inquire-daily-ccld output1 row (lowercase fields:
+        tot_ccld_qty cumulative filled / ord_qty / cncl_yn cancel flag)."""
         try:
-            ccld_qty = int(ccld_qty_str)
-            ord_qty = int(ord_qty_str)
-        except (ValueError, TypeError):
+            ccld_qty = Decimal(str(row.get("tot_ccld_qty", "0") or "0"))
+            ord_qty = Decimal(str(row.get("ord_qty", "0") or "0"))
+        except (InvalidOperation, ValueError, TypeError):
             return OrderState.OPEN
 
-        if cncl_yn == "Y":
+        if str(row.get("cncl_yn", "N")).upper() == "Y":
             return OrderState.CANCELED
         if ord_qty > 0 and ccld_qty >= ord_qty:
             return OrderState.FILLED
@@ -527,17 +528,25 @@ class KisExchange(ExchangePyBase):
             return OrderState.PARTIALLY_FILLED
         return OrderState.OPEN
 
+    @staticmethod
+    def _kst_today() -> str:
+        """KIS inquire-daily-ccld requires a YYYYMMDD date range; same-day fills live under
+        today's KST date. The engine host runs UTC, so derive KST (UTC+9) explicitly —
+        an empty date range returns no rows, so the order would never reconcile (JEP-162)."""
+        return datetime.now(timezone(timedelta(hours=9))).strftime("%Y%m%d")
+
     async def _request_kis_order_detail(self, order: InFlightOrder) -> Dict[str, Any]:
-        """Shared method to query KIS order detail endpoint."""
+        """Shared method to query KIS order detail endpoint (inquire-daily-ccld)."""
         tr_id = CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_TR_ID
         if self._sandbox:
             tr_id = self._sandbox_tr_id(tr_id)
 
+        today = self._kst_today()
         params = {
             "CANO": self._cano,
             "ACNT_PRDT_CD": self._acnt_prdt_cd,
-            "INQR_STRT_DT": "",
-            "INQR_END_DT": "",
+            "INQR_STRT_DT": today,
+            "INQR_END_DT": today,
             "SLL_BUY_DVSN_CD": "00",
             "INQR_DVSN": "00",
             "PDNO": "",
@@ -568,36 +577,56 @@ class KisExchange(ExchangePyBase):
         return trade_updates
 
     def _create_order_fill_updates(self, order: InFlightOrder, fill_data: Dict[str, Any]) -> List[TradeUpdate]:
-        updates = []
-        output = fill_data.get("output", [])
+        """Build TradeUpdates from a KIS inquire-daily-ccld response.
 
-        # output can be a list (fill responses) or a dict (order status responses)
-        if isinstance(output, dict):
-            # Single order status response, not a fills list
+        KIS returns ``output1`` (a list of order rows, lowercase fields) — NOT ``output``.
+        Each row's ``tot_ccld_qty`` is the CUMULATIVE filled quantity for that order, so we
+        emit the INCREMENT versus the order's already-executed base: re-polling the same
+        cumulative never double-counts, and a partial -> full transition is reported as the
+        remaining delta. KIS does not return a per-fill commission on this endpoint, so the
+        fee is taken from the connector fee schema (computed, not parsed)."""
+        updates: List[TradeUpdate] = []
+        rows = fill_data.get("output1", [])
+        if not isinstance(rows, list):
             return updates
 
-        for fill in output:
+        eoid = str(order.exchange_order_id) if order.exchange_order_id else ""
+        for row in rows:
+            odno = str(row.get("odno", "") or "")
+            if eoid and odno and odno != eoid:
+                continue
+            try:
+                cum_filled = Decimal(str(row.get("tot_ccld_qty", "0") or "0"))
+                avg_price = Decimal(str(row.get("avg_prvs", "0") or "0"))
+                cum_amount = Decimal(str(row.get("tot_ccld_amt", "0") or "0"))
+            except (InvalidOperation, ValueError, TypeError):
+                continue
+            if cum_filled <= Decimal("0"):
+                continue
+            already = order.executed_amount_base or Decimal("0")
+            delta = cum_filled - already
+            if delta <= Decimal("0"):
+                continue
+            fill_quote = cum_amount - (already * avg_price) if cum_amount > Decimal("0") else delta * avg_price
+            if fill_quote <= Decimal("0"):
+                fill_quote = delta * avg_price
             fee = TradeFeeBase.new_spot_fee(
                 fee_schema=self.trade_fee_schema(),
                 trade_type=order.trade_type,
-                percent_token=fill.get("feeCoinName", order.quote_asset),
-                flat_fees=[TokenAmount(
-                    amount=Decimal(str(fill.get("fee", "0"))),
-                    token=fill.get("feeCoinName", order.quote_asset),
-                )],
+                percent_token=order.quote_asset,
+                flat_fees=[],
             )
-            trade_update = TradeUpdate(
-                trade_id=str(fill.get("tradeId", fill.get("ODNO", ""))),
+            updates.append(TradeUpdate(
+                trade_id=f"{odno or order.client_order_id}-{cum_filled}",
                 client_order_id=order.client_order_id,
-                exchange_order_id=str(fill.get("ODNO", order.exchange_order_id or "")),
+                exchange_order_id=odno or eoid,
                 trading_pair=order.trading_pair,
                 fee=fee,
-                fill_base_amount=Decimal(str(fill.get("CCLD_QTY", "0"))),
-                fill_quote_amount=Decimal(str(fill.get("TOT_CCLD_AMT", "0"))),
-                fill_price=Decimal(str(fill.get("AVG_PRVS", "0"))),
+                fill_base_amount=delta,
+                fill_quote_amount=fill_quote,
+                fill_price=avg_price,
                 fill_timestamp=self.current_timestamp,
-            )
-            updates.append(trade_update)
+            ))
 
         return updates
 
