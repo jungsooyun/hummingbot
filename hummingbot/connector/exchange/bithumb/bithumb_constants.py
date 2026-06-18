@@ -18,6 +18,8 @@ PRIVATE_ASSET_CHANNEL_NAME = "myAsset"
 DEFAULT_DOMAIN = ""
 MAX_ORDER_ID_LEN = 40
 HBOT_ORDER_ID_PREFIX = ""
+# Bithumb KRW market minimum order value (documented floor 5,000 KRW). VERIFY current venue minimum at implementation.
+MIN_NOTIONAL_KRW = 5000
 
 CHECK_NETWORK_PATH_URL = "v1/market/all"
 GET_TRADING_RULES_PATH_URL = "v1/market/all"
