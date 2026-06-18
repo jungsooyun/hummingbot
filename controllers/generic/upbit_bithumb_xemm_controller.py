@@ -441,7 +441,7 @@ class UpbitBithumbXemmController(ControllerBase):
 
         now = self.market_data_provider.time()
         is_stale = self._refresh_market_data_health(now=now)
-        active_executors = self.filter_executors(self.executors_info, lambda executor: not executor.is_done)
+        active_executors = self.filter_executors(self.executors_info, filter_func=lambda executor: not executor.is_done)
         if is_stale:
             return self._stale_stop_actions(active_executors=active_executors)
 
@@ -1395,7 +1395,7 @@ class UpbitBithumbXemmController(ControllerBase):
     def get_custom_info(self) -> dict:
         inventory_delta = self._inventory_delta()
         allow_buy, allow_sell = self._allowed_sides(inventory_delta)
-        active_executors = self.filter_executors(self.executors_info, lambda executor: not executor.is_done)
+        active_executors = self.filter_executors(self.executors_info, filter_func=lambda executor: not executor.is_done)
         maker_available_base = self._available_base_balance(self.config.maker_connector)
         taker_available_base = self._available_base_balance(self.config.taker_connector)
         active_buy = len([executor for executor in active_executors if executor.side == TradeType.BUY])
