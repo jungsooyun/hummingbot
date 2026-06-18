@@ -483,16 +483,19 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
     @aioresponses()
     def test_request_order_book_snapshot_market_div_code_follows_routing(self, mock_api):
         """The REST orderbook snapshot must derive FID_COND_MRKT_DIV_CODE from
-        kis_market_routing (J=KRX / NX=NXT / UN=통합 per the official KIS
-        inquire-asking-price-exp-ccn contract), NOT hardcode KRX 'J'. With the
-        hardcode, after the KRX regular session closes (15:30 KST) the KRX book
-        freezes while the NXT after-market keeps trading, so the bot reads a stale
-        spot and quotes off a stale fair — a JEP-148 go-live blocker. SOR routing
-        (the default) must read the unified KRX+NXT book ('UN')."""
+        kis_market_routing (J=KRX / NX=NXT), NOT hardcode it.
+
+        SOR maps to 'J' (KRX), NOT 'UN' (통합): although 'UN' is the documented unified
+        code, live verification (JEP-162) showed it times out with NO response on the
+        inquire-asking-price-exp-ccn endpoint, so the KIS order book never bootstraps and
+        the connector stays permanently not-ready. 'J' returns KRX quotes reliably.
+        Tradeoff: 'J' freezes after the KRX regular close (15:30 KST) — restoring unified
+        NXT after-market quotes needs a separate KIS-API investigation (go-live blocker).
+        This test pins the outgoing code so a regression back to 'UN' fails here, not live."""
         expected = {
             CONSTANTS.MARKET_ROUTING_KRX: "J",
             CONSTANTS.MARKET_ROUTING_NXT: "NX",
-            CONSTANTS.MARKET_ROUTING_SOR: "UN",
+            CONSTANTS.MARKET_ROUTING_SOR: "J",
         }
         regex_url = re.compile(
             f"{CONSTANTS.REST_URL}/{CONSTANTS.DOMESTIC_STOCK_ORDERBOOK_PATH}"
