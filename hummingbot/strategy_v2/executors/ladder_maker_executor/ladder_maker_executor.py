@@ -38,6 +38,7 @@ from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import
     apply_inventory_skew,
     build_ladder_targets,
     build_two_sided_targets,
+    compute_eod_pressure,
     compute_fair_price,
     compute_hedge_order,
 )
@@ -46,6 +47,7 @@ from hummingbot.strategy_v2.models.executors import TrackedOrder
 
 ZERO = Decimal("0")
 _KST = timezone(timedelta(hours=9))
+_KRX_CLOSE_MIN = 15 * 60 + 30  # 15:30 KST
 
 
 def _fmt_num(x) -> Optional[str]:
@@ -198,6 +200,14 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
     def _is_two_sided(self) -> bool:
         return getattr(self.config, "two_sided", False) is True
 
+    def _compute_eod_pressure(self) -> Decimal:
+        wind = getattr(self.config, "eod_wind_minutes", 0)
+        if not wind or wind <= 0:
+            return ZERO
+        now = datetime.fromtimestamp(self._strategy.current_timestamp, tz=_KST)
+        now_kst_min = now.hour * 60 + now.minute
+        return compute_eod_pressure(now_kst_min, _KRX_CLOSE_MIN, wind)
+
     def _compute_targets(self) -> List:
         side = self._policy_side()
         fair = self._compute_fair(side)
@@ -248,7 +258,7 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             "Q": q,
             "U": abs(self._unhedged_base_signed()),
             "util": util,
-            "eod": ZERO,
+            "eod": self._compute_eod_pressure(),
             "pending_signed": self._pending_hedge_signed,
         }
 

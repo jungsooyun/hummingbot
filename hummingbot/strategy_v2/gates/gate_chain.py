@@ -130,6 +130,19 @@ class SessionWindow:
         e = self.end[0] * 3600 + self.end[1] * 60
         return s <= t < e
 
+    def seconds_to_end(self, hour: int, minute: int, second: int) -> Optional[float]:
+        """Remaining seconds until the window's end, or None if outside [start, end)."""
+        if not self.contains(hour, minute, second):
+            return None
+        t = hour * 3600 + minute * 60 + second
+        e = self.end[0] * 3600 + self.end[1] * 60
+        return float(e - t)
+
+    def minutes_to_end(self, hour: int, minute: int, second: int) -> Optional[float]:
+        """Remaining minutes until the window's end, or None if outside [start, end)."""
+        secs = self.seconds_to_end(hour, minute, second)
+        return None if secs is None else secs / 60.0
+
 
 # ---------------------------------------------------------------------------
 # Concrete gates
