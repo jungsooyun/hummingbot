@@ -22,6 +22,10 @@ from hummingbot.connector.derivative.kis_futures.kis_futures_master import (
     parse_master_bytes,
     resolve_front_month,
 )
+from hummingbot.connector.derivative.kis_futures.kis_futures_tick import (
+    floor_to_tick,
+    tick_size_for_price,
+)
 from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, TradeType
@@ -97,6 +101,10 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
         self._pending_front: Dict = {}
         self._roll_pending: Dict = {}
         self._order_acks: Dict = {}
+
+        # Last successfully-resolved tick per pair (sticky fallback when a fresh
+        # reference price cannot be fetched during a trading-rules refresh).
+        self._last_tick_by_pair: Dict[str, Decimal] = {}
 
         # Per-pair roll guard: prevents _resolve_front_months swap from interleaving
         # with _place_order reading fc.short_code.
@@ -290,12 +298,26 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
                 mapping[base] = tp
         self._set_trading_pair_symbol_map(mapping)
 
+    # Fallback tick used only on the very first rules build when no reference
+    # price is yet available (off-hours / pre-warmup). _format_price re-floors
+    # every order price to the exact per-price KRX tier, so this value only
+    # affects pre-floor strategy quote spacing until a live price arrives.
+    _DEFAULT_TICK = Decimal("50")
+
     async def _update_trading_rules(self):
-        """Build stub trading rules and also trigger front-month resolution."""
+        """Resolve front-month contracts first, then build per-pair trading rules
+        with a price-tiered min_price_increment (KRX 호가가격단위)."""
+        # Resolve/refresh front-months FIRST so contract codes exist for the
+        # reference-price lookups below; fail-closed on download error.
+        try:
+            await self._resolve_front_months()
+        except Exception as e:
+            self.logger().warning(
+                f"[kis_futures] front-month resolution failed (using prior map): {e}"
+            )
         self._trading_rules.clear()
         for tp in self._trading_pairs:
-            fc = self._contract_by_pair.get(tp)
-            tick = self._tick_size_for(fc)
+            tick = await self._resolve_pair_tick(tp)
             self._trading_rules[tp] = TradingRule(
                 trading_pair=tp,
                 min_order_size=Decimal("1"),
@@ -304,21 +326,29 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
                 buy_order_collateral_token="KRW",
                 sell_order_collateral_token="KRW",
             )
-        # Attempt to resolve/refresh front-month contracts; fail-closed on download error.
-        try:
-            await self._resolve_front_months()
-        except Exception as e:
-            self.logger().warning(
-                f"[kis_futures] front-month resolution failed (using prior map): {e}"
-            )
 
-    @staticmethod
-    def _tick_size_for(fc) -> Decimal:
-        """Conservative default tick for KRX stock futures (5 KRW).
-        Exact 호가단위 table (size-tier) is a later refinement.
+    async def _resolve_pair_tick(self, trading_pair: str) -> Decimal:
+        """Best-effort KRX tick (호가가격단위) for the pair's current price tier.
+
+        Fetches the last traded price and maps it to the KRX tier. Fail-soft:
+        on any error, reuse the last good tick, else the default — never block
+        rule-building (which would halt trading). Order-price correctness is
+        independently guaranteed by _format_price's per-price tiered floor.
         """
-        # Placeholder: KRX 호가단위 for all individual stock futures ≥ 5 KRW
-        return Decimal("5")
+        try:
+            ref = Decimal(str(await self._get_last_traded_price(trading_pair)))
+            tick = tick_size_for_price(ref)
+            self._last_tick_by_pair[trading_pair] = tick
+            return tick
+        except Exception as e:
+            prior = self._last_tick_by_pair.get(trading_pair)
+            if prior is not None:
+                return prior
+            self.logger().warning(
+                f"[kis_futures] tick reference price unavailable for {trading_pair} "
+                f"({e}); using default tick {self._DEFAULT_TICK}"
+            )
+            return self._DEFAULT_TICK
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict):
         # KIS futures has no symbols-list API; symbol map is built from configured pairs.
@@ -443,15 +473,26 @@ class KisFuturesDerivative(PerpetualDerivativePyBase):
         return int(amount)
 
     def _format_price(self, price: Decimal, trading_pair: str) -> str:
-        """Format price as a plain integer string aligned to tick; raise if misaligned or non-positive."""
+        """Format an order price as a plain integer string, floored to the exact
+        KRX 호가가격단위 (호가단위) for the price's own tier.
+
+        Authoritative tick gate: the tick is derived from the order price itself
+        (price-tiered, per KRX 2026 rule) rather than the static per-pair
+        min_price_increment, so the result is always a KRX-valid price regardless
+        of where the price sits relative to the rule tick. Mirrors the
+        live-verified nautilus gate5c floor_to_tick.
+
+        Fail-closed: raises ValueError for non-positive prices (or prices that
+        floor to <= 0).
+        """
         if price <= 0:
             raise ValueError(f"kis_futures price must be positive: {price}")
-        tick = self._trading_rules[trading_pair].min_price_increment
-        if (price % tick) != 0:
+        aligned = floor_to_tick(price)
+        if aligned <= 0:
             raise ValueError(
-                f"kis_futures price {price} is not aligned to tick size {tick} for {trading_pair}"
+                f"kis_futures price {price} floored to non-positive tick boundary"
             )
-        text = format(Decimal(price), "f")
+        text = format(aligned, "f")
         # Strip trailing decimal zeros (e.g. "50000.0" → "50000")
         if "." in text:
             text = text.rstrip("0").rstrip(".")

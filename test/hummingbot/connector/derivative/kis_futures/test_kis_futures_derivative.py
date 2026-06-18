@@ -176,24 +176,28 @@ def test_validate_contract_qty_rejects_zero_and_negative():
 
 def test_format_price_aligned_tick():
     c = _make_connector()
-    _patch_trading_rule(c, tick=Decimal("5"))
+    # _format_price now derives the tick from the price's own KRX tier
+    # (50,000 -> tier [50k,200k) -> tick 100), independent of the rule tick.
     assert c._format_price(Decimal("50000"), "005930-KRW") == "50000"
-    assert c._format_price(Decimal("50005"), "005930-KRW") == "50005"
+    # 50,005 floors to the 100-tier boundary 50,000.
+    assert c._format_price(Decimal("50005"), "005930-KRW") == "50000"
 
 
 def test_format_price_strips_trailing_zeros():
     c = _make_connector()
-    _patch_trading_rule(c, tick=Decimal("5"))
     result = c._format_price(Decimal("50000"), "005930-KRW")
     # Must not contain a trailing decimal zero
     assert "." not in result or not result.endswith("0")
 
 
-def test_format_price_misaligned_raises():
+def test_format_price_floors_to_krx_tier():
+    """Misaligned prices are floored to the exact KRX tier, never sent raw."""
     c = _make_connector()
-    _patch_trading_rule(c, tick=Decimal("5"))
-    with pytest.raises(ValueError):
-        c._format_price(Decimal("50001"), "005930-KRW")
+    # 50,001 -> tier 100 -> 50,000 (no raise; floored)
+    assert c._format_price(Decimal("50001"), "005930-KRW") == "50000"
+    # Samsung futures observed live: 363,005 -> tier 500 -> 363,000
+    assert c._format_price(Decimal("363005"), "005930-KRW") == "363000"
+    assert c._format_price(Decimal("363500"), "005930-KRW") == "363500"
 
 
 # ---------------------------------------------------------------------------
@@ -1077,6 +1081,61 @@ def test_get_last_traded_price_returns_correct_value():
     price = loop.run_until_complete(_run())
     loop.close()
     assert price == 294500.0
+
+
+# I8 — _resolve_pair_tick: price-tiered min_price_increment with fail-soft fallback
+
+def test_resolve_pair_tick_maps_price_to_krx_tier_and_caches():
+    """Last price 363,000 -> KRX tier 500; result is cached for sticky fallback."""
+    c = _make_connector()
+    _inject_contract(c)
+    ok_resp = {"rt_cd": "0", "msg1": "OK", "output": {"futs_prpr": "363000"}}
+
+    async def _run():
+        with aioresponses() as m:
+            m.get(_re(CONSTANTS.FUT_TICKER_PATH), payload=ok_resp)
+            return await c._resolve_pair_tick("005930-KRW")
+
+    loop = asyncio.new_event_loop()
+    tick = loop.run_until_complete(_run())
+    loop.close()
+    assert tick == Decimal("500")
+    assert c._last_tick_by_pair["005930-KRW"] == Decimal("500")
+
+
+def test_resolve_pair_tick_reuses_prior_on_fetch_failure():
+    """On reference-price failure, reuse the last good tick (sticky fallback)."""
+    c = _make_connector()
+    _inject_contract(c)
+    c._last_tick_by_pair["005930-KRW"] = Decimal("100")
+    bad_resp = {"rt_cd": "1", "msg1": "FAIL"}
+
+    async def _run():
+        with aioresponses() as m:
+            m.get(_re(CONSTANTS.FUT_TICKER_PATH), payload=bad_resp)
+            return await c._resolve_pair_tick("005930-KRW")
+
+    loop = asyncio.new_event_loop()
+    tick = loop.run_until_complete(_run())
+    loop.close()
+    assert tick == Decimal("100")
+
+
+def test_resolve_pair_tick_defaults_when_no_prior():
+    """On failure with no cached tick, fall back to the documented default."""
+    c = _make_connector()
+    _inject_contract(c)
+    bad_resp = {"rt_cd": "1", "msg1": "FAIL"}
+
+    async def _run():
+        with aioresponses() as m:
+            m.get(_re(CONSTANTS.FUT_TICKER_PATH), payload=bad_resp)
+            return await c._resolve_pair_tick("005930-KRW")
+
+    loop = asyncio.new_event_loop()
+    tick = loop.run_until_complete(_run())
+    loop.close()
+    assert tick == c._DEFAULT_TICK
 
 
 # B2 — _update_positions atomicity (parse-then-apply)
