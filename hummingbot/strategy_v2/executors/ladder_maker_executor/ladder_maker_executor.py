@@ -339,7 +339,19 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         if self.config.observe:
             self._place_targets(targets)
             return
+        if hasattr(self, "_maker_placed_rung"):
+            live_order_ids = set(self.maker_orders)
+            self._maker_placed_rung = {
+                oid: rung for oid, rung in self._maker_placed_rung.items() if oid in live_order_ids
+            }
+        inflight_ids = {oid for oid, o in self.maker_orders.items() if o.order is None}
         resting = self._resting_maker_orders()
+        for oid in inflight_ids:
+            rung = getattr(self, "_maker_placed_rung", {}).get(oid)
+            if rung is None:
+                continue
+            side, price, size = rung
+            resting.append(RestingOrder(order_id=oid, side=side, price=price, size=size))
         diff = diff_ladder_targets(
             resting,
             targets,
@@ -347,6 +359,8 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             self.config.min_reprice_delta_ticks,
         )
         for oid in diff.to_cancel:
+            if oid in inflight_ids:
+                continue
             self._strategy.cancel(self.maker_connector, self.maker_trading_pair, oid)
         self._place_targets_subset(diff.to_place)
         self._last_reprice_ts = self._strategy.current_timestamp
@@ -483,6 +497,14 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             metadata={"order_role": "maker", "edge_bps": str(edge_bps)},
         )
         self.maker_orders[order_id] = TrackedOrder(order_id=order_id)
+        if self._is_two_sided():
+            # Only the two-sided diff path reads _maker_placed_rung (and prunes it to
+            # live orders each reconcile). Recording it on the single-sided path would
+            # leak, since base _reconcile_maker never prunes it.
+            if not hasattr(self, "_maker_placed_rung"):
+                self._maker_placed_rung = {}
+            policy_side = Side.BUY if side == TradeType.BUY else Side.SELL
+            self._maker_placed_rung[order_id] = (policy_side, q_price, q_amount)
         if position_action == PositionAction.OPEN:
             if not hasattr(self, "_maker_placed_edge_bps"):
                 self._maker_placed_edge_bps = {}

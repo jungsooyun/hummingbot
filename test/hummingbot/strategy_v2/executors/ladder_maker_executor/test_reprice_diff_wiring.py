@@ -124,6 +124,18 @@ def test_no_live_orders_places_all():
     assert ex.place_order.call_count == 2
 
 
+def test_inflight_maker_rung_not_double_placed():
+    ex = _make_executor([_target(Side.BUY, "50.10")])
+
+    ex._reconcile_maker()
+    ex._reconcile_maker()
+
+    ex._strategy.cancel.assert_not_called()
+    ex.place_order.assert_called_once()
+    assert list(ex.maker_orders) == ["OID-0"]
+    assert ex.maker_orders["OID-0"].order is None
+
+
 def test_untracked_maker_not_cancelled():
     ex = _make_executor([])
     ex.maker_orders["a"] = _Tracked("a", None)
