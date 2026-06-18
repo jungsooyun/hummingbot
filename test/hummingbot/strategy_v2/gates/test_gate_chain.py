@@ -19,6 +19,7 @@ from hummingbot.strategy_v2.gates.gate_chain import (
     TradingHoursGate,
     StalenessGate,
     OrderCapGate,
+    InventoryGate,
     SessionWindow,
 )
 
@@ -292,6 +293,32 @@ class TestOrderCapGate:
         r = self.gate.evaluate(_ctx(open_order_count=0, pending_notional=Decimal("1001")))
         assert r.open is False
 
+class TestInventoryGate:
+    gate = InventoryGate(max_inventory=Decimal("8"))
+
+    def test_open_below_cap(self):
+        assert self.gate.evaluate(_ctx(inventory=Decimal("7"))).open is True
+
+    def test_open_below_cap_short(self):
+        assert self.gate.evaluate(_ctx(inventory=Decimal("-7"))).open is True
+
+    def test_closed_at_cap_long(self):
+        r = self.gate.evaluate(_ctx(inventory=Decimal("8")))
+        assert r.open is False and r.reason != ""
+
+    def test_closed_at_cap_short(self):
+        r = self.gate.evaluate(_ctx(inventory=Decimal("-8")))
+        assert r.open is False and r.reason != ""
+
+    def test_closed_over_cap(self):
+        assert self.gate.evaluate(_ctx(inventory=Decimal("12"))).open is False
+
+    def test_none_disables(self):
+        gate = InventoryGate(max_inventory=None)
+        assert gate.evaluate(_ctx(inventory=Decimal("999999"))).open is True
+
+
+class TestOrderCapGateExtra:
     def test_count_only_cap(self):
         gate = OrderCapGate(max_open_orders=2, max_pending_notional=None)
         r = gate.evaluate(_ctx(open_order_count=2, pending_notional=Decimal("999999")))

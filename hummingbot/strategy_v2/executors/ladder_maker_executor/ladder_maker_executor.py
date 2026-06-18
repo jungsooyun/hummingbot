@@ -39,7 +39,7 @@ from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import
     compute_fair_price,
     compute_hedge_order,
 )
-from hummingbot.strategy_v2.gates.gate_chain import GateChain, GateContext, KillSwitchGate
+from hummingbot.strategy_v2.gates.gate_chain import GateChain, GateContext, InventoryGate, KillSwitchGate
 from hummingbot.strategy_v2.models.executors import TrackedOrder
 
 ZERO = Decimal("0")
@@ -98,7 +98,12 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         self._last_observe: Optional[Dict] = None
         # Kill-switch flows through the composable chain; JEP-133 appends the
         # staleness / trading-hours / order-cap gates to this same chain.
-        self._gate_chain = GateChain([KillSwitchGate()])
+        # KillSwitchGate (manual + auto hedge kill-switch) AND a HARD inventory cap:
+        # InventoryGate halts quoting once |unhedged| reaches max_inventory, so naked
+        # exposure cannot grow past the config's "safety pin" (it previously only drove
+        # price skew, never a hard stop). config.max_inventory <= 0 disables the hard cap.
+        _max_inv = self.config.max_inventory if self.config.max_inventory and self.config.max_inventory > ZERO else None
+        self._gate_chain = GateChain([KillSwitchGate(), InventoryGate(_max_inv)])
         super().__init__(
             strategy=strategy,
             config=config,

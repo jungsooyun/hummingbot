@@ -258,6 +258,39 @@ class OrderCapGate:
         return _OPEN
 
 
+class InventoryGate:
+    """Closes when the absolute net inventory reaches its cap (inclusive: >= closes).
+
+    A HARD unhedged-exposure safety pin. With a single-direction maker ladder, every
+    maker fill grows the unhedged (naked) inventory until it is hedged; nothing else
+    hard-stops quoting on inventory (inventory only drives price skew). This gate halts
+    quoting once ``|inventory|`` reaches ``max_inventory``, so naked exposure cannot grow
+    past it — independent of, and faster than, the hedge kill-switch (which only trips
+    after a streak of hedge failures). As the position is hedged back below the cap the
+    gate reopens. ``None`` disables the check.
+
+    Parameters
+    ----------
+    max_inventory:
+        Maximum absolute net inventory allowed (inclusive cap: >= closes). ``None``
+        disables this check.
+    """
+
+    def __init__(self, max_inventory: Optional[Decimal]) -> None:
+        self._max_inventory = max_inventory
+
+    def evaluate(self, ctx: GateContext) -> GateResult:
+        if self._max_inventory is not None and abs(ctx.inventory) >= self._max_inventory:
+            return GateResult(
+                open=False,
+                reason=(
+                    f"inventory_cap: |inventory|={abs(ctx.inventory)}"
+                    f" >= max={self._max_inventory}"
+                ),
+            )
+        return _OPEN
+
+
 # ---------------------------------------------------------------------------
 # GateChain
 # ---------------------------------------------------------------------------
