@@ -43,6 +43,8 @@ from hummingbot.strategy_v2.models.executor_actions import (
 )
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
+from hummingbot.connector.perpetual_connector_allowlist import PERPETUAL_CONNECTOR_ALLOWLIST
+
 lsb_logger = None
 s_decimal_nan = Decimal("NaN")
 
@@ -725,7 +727,7 @@ class StrategyV2Base(StrategyPyBase):
 
     @staticmethod
     def is_perpetual(connector: str) -> bool:
-        return "perpetual" in connector
+        return "perpetual" in connector or connector in PERPETUAL_CONNECTOR_ALLOWLIST
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
         """

@@ -3,6 +3,8 @@ from decimal import Decimal
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple, Union
 
+from hummingbot.connector.perpetual_connector_allowlist import PERPETUAL_CONNECTOR_ALLOWLIST
+
 from hummingbot.client.settings import AllConnectorSettings
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.trading_rule import TradingRule
@@ -174,7 +176,7 @@ class ExecutorBase(RunnableBase):
         :param connector_name: The name of the connector.
         :return: True if the connector is a perpetual connector, False otherwise.
         """
-        return "perpetual" in connector_name.lower()
+        return "perpetual" in connector_name.lower() or connector_name in PERPETUAL_CONNECTOR_ALLOWLIST
 
     @staticmethod
     @lru_cache(maxsize=10)
