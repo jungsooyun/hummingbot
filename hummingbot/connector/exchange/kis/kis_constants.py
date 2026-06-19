@@ -135,15 +135,16 @@ WS_TRADE_TR_ID_BY_ROUTING = {
 # 호가(inquire-asking-price-exp-ccn) / 틱커(inquire-price) 등 domestic-stock quotation
 # REST 엔드포인트의 "조건 시장 분류 코드".
 #
-# SOR → 'J' (NOT 'UN'): 라이브 검증(JEP-162, EC2 observe 2026-06-18)에서 'UN'(통합)이 호가
-# REST 엔드포인트에서 **응답 없이 타임아웃**(요청은 전송되나 aiohttp resp.start에서 행) →
-# KIS가 영구 not-ready. KRX 정규장 시세는 'J'로 정상 조회되므로 SOR도 'J'로 매핑한다.
-# 한계: 'J'는 KRX 정규장 마감(15:30 KST) 후 동결됨 — NXT 애프터마켓 통합 시세('UN')는 별도
-# KIS API 조사 필요(go-live 블로커, 별도 이슈). 주문 라우팅(EXCG_BY_ROUTING)은 SOR 그대로.
+# SOR → 'UN' (통합): EC2 라이브 프로브(JEP-180, 2026-06-19)에서 'UN'(통합)이 호가
+# REST(inquire-asking-price-exp-ccn)에서 KRX 정규장 마감(15:30 KST)을 넘겨 NXT
+# 애프터마켓(15:40-20:00 KST)까지 실시간 시세를 정상 스트리밍함을 확인. 이전 'UN
+# 타임아웃' 관찰(JEP-162, 2026-06-18)은 재현되지 않음. 'J'(KRX)는 정규장 마감 후
+# 동결되어 NXT 시간대에 fair가 stale → SOR은 'UN'으로 매핑. 주문 라우팅
+# (EXCG_BY_ROUTING)은 SOR 그대로(EXCG_ID_DVSN_CD=SOR), 시세 READ 경로만 변경.
 REST_QUOTE_MRKT_DIV_BY_ROUTING = {
     MARKET_ROUTING_KRX: "J",
     MARKET_ROUTING_NXT: "NX",
-    MARKET_ROUTING_SOR: "J",
+    MARKET_ROUTING_SOR: "UN",
 }
 
 # --------------------------------------------------------------------------- #

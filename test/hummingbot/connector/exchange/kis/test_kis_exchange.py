@@ -539,16 +539,18 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
     @aioresponses()
     async def test_get_last_traded_price_market_div_code_follows_routing(self, mock_api):
         """The last-traded-price (ticker) REST call must derive FID_COND_MRKT_DIV_CODE
-        from kis_market_routing (J:KRX / NX:NXT), exactly like the orderbook snapshot.
+        from kis_market_routing (J:KRX / NX:NXT / UN:통합), exactly like the orderbook
+        snapshot.
 
-        SOR maps to 'J' (KRX), NOT 'UN' (통합): live verification (JEP-162) showed 'UN'
-        times out with no response on the quote REST endpoints, leaving KIS permanently
-        not-ready. This test pins the outgoing code so a regression back to 'UN' fails
-        here instead of only in live."""
+        SOR maps to 'UN' (통합/unified): the EC2 live probe (JEP-180, 2026-06-19)
+        confirmed unified quotes stream across the KRX close into the NXT after-market;
+        the earlier 'UN times out' observation (JEP-162) did NOT reproduce. This test
+        pins the outgoing code so a regression back to 'J' (which freezes after 15:30
+        KST) fails here instead of only in live."""
         expected = {
             CONSTANTS.MARKET_ROUTING_KRX: "J",
             CONSTANTS.MARKET_ROUTING_NXT: "NX",
-            CONSTANTS.MARKET_ROUTING_SOR: "J",
+            CONSTANTS.MARKET_ROUTING_SOR: "UN",
         }
         symbol = self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)
         regex_url = re.compile(

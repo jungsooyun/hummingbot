@@ -68,8 +68,9 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._ob_tr_id = CONSTANTS.WS_ORDERBOOK_TR_ID_BY_ROUTING[market_routing]
         self._trade_tr_id = CONSTANTS.WS_TRADE_TR_ID_BY_ROUTING[market_routing]
         # REST snapshot market-division code, routing-aware like the WS TR_IDs above.
-        # NB: sor now maps to 'J' (KRX) — 'UN' (통합) times out on this endpoint; see
-        # REST_QUOTE_MRKT_DIV_BY_ROUTING in kis_constants.py (JEP-162).
+        # NB: sor maps to 'UN' (통합) — unified KRX+NXT quotes stay live across the KRX
+        # close into the NXT after-market (JEP-180). See REST_QUOTE_MRKT_DIV_BY_ROUTING
+        # in kis_constants.py for the rationale and the live-probe evidence.
         self._rest_ob_mrkt_div = CONSTANTS.REST_QUOTE_MRKT_DIV_BY_ROUTING[market_routing]
         # All market-data TR_IDs across routing modes — used to detect channel drift
         self._known_market_tr_ids = (
