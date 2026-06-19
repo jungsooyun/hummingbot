@@ -33,7 +33,6 @@ from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.cross_venue_he
 from hummingbot.strategy_v2.executors.ladder_maker_executor.data_types import LadderMakerExecutorConfig
 from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import (
     RestingOrder,
-    RungTarget,
     RungSpec,
     Side,
     TwoSidedTargets,
@@ -202,8 +201,10 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
 
     # ------------------------------------------------------------------ ladder hooks
 
-    def _is_two_sided(self) -> bool:
-        return getattr(self.config, "two_sided", False) is True
+    # _is_two_sided / _resting_maker_orders / _place_target_one / _place_targets_subset are
+    # inherited from CrossVenueHedgedExecutorBase (lifted in JEP-145). Only _place_maker (the
+    # placement hook, with observe no-submit + rung recording) and _place_targets (the
+    # observe-summary full placement) remain ladder-specific below.
 
     def _compute_eod_pressure(self) -> Decimal:
         wind = getattr(self.config, "eod_wind_minutes", 0)
@@ -330,9 +331,20 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
 
     def _reconcile_maker(self) -> None:
         if not self._is_two_sided():
+            # Single-sided: inherit the base generic partial-diff (selective cancel/replace).
             return super()._reconcile_maker()
         if getattr(self.config, "wind_down", False):
-            return super()._reconcile_maker()
+            # Wind_down cancels ALL makers then re-places close-only — deliberately NOT a
+            # partial-diff. Pinned to explicit cancel-all (this was super(), but the base
+            # now partial-diffs, which would leave a matching close order resting instead of
+            # the wind_down cancel-then-replace, stranding open-side makers). Byte-identical
+            # to the pre-JEP-145 base cancel-all: compute -> reprice guard -> cancel_all -> place.
+            targets = self._compute_targets()
+            if not self._should_reprice(targets):
+                return
+            self._cancel_all_maker()
+            self._place_targets(targets)
+            return
         targets = self._compute_targets()
         if not self._should_reprice(targets):
             return
@@ -340,9 +352,12 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             self._place_targets(targets)
             return
         if hasattr(self, "_maker_placed_rung"):
-            live_order_ids = set(self.maker_orders)
+            # Bound to ACTIVE makers only (mirrors base _reconcile_maker): a filled maker
+            # stays in maker_orders but its rung is never read again, so dropping it caps
+            # _maker_placed_rung at the live+inflight count (JEP-145 adversarial review).
+            active_ids = {oid for oid, o in self.maker_orders.items() if o.order is None or o.order.is_open}
             self._maker_placed_rung = {
-                oid: rung for oid, rung in self._maker_placed_rung.items() if oid in live_order_ids
+                oid: rung for oid, rung in self._maker_placed_rung.items() if oid in active_ids
             }
         inflight_ids = {oid for oid, o in self.maker_orders.items() if o.order is None}
         resting = self._resting_maker_orders()
@@ -371,43 +386,6 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
                 continue
             self._strategy.cancel(self.maker_connector, self.maker_trading_pair, oid)
         self._place_targets_subset(to_place)
-        self._last_reprice_ts = self._strategy.current_timestamp
-
-    def _resting_maker_orders(self) -> List[RestingOrder]:
-        conn = self.connectors[self.maker_connector]
-        pair = self.maker_trading_pair
-        out: List[RestingOrder] = []
-        for o in self._open_maker_orders():
-            if o.order is None:
-                continue
-            side = Side.BUY if o.order.trade_type == TradeType.BUY else Side.SELL
-            out.append(
-                RestingOrder(
-                    order_id=o.order_id,
-                    side=side,
-                    price=conn.quantize_order_price(pair, o.order.price),
-                    size=conn.quantize_order_amount(pair, o.order.amount),
-                )
-            )
-        return out
-
-    def _place_target_one(self, target: RungTarget) -> None:
-        if self._is_two_sided():
-            side = TradeType.SELL if target.side == Side.SELL else TradeType.BUY
-            position_action = PositionAction.OPEN if side == self.entry_side else PositionAction.CLOSE
-            self._place_maker(
-                target.price,
-                target.size,
-                target.edge_bps,
-                side=side,
-                position_action=position_action,
-            )
-        else:
-            self._place_maker(target.price, target.size, target.edge_bps)
-
-    def _place_targets_subset(self, targets: List[RungTarget]) -> None:
-        for target in targets:
-            self._place_target_one(target)
         self._last_reprice_ts = self._strategy.current_timestamp
 
     def _place_targets(self, targets: List) -> None:
@@ -484,7 +462,7 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         edge_bps: Decimal,
         side: Optional[TradeType] = None,
         position_action: PositionAction = PositionAction.OPEN,
-    ) -> None:
+    ) -> Optional[str]:
         side = side if side is not None else self.entry_side
         connector = self.connectors[self.maker_connector]
         q_amount = connector.quantize_order_amount(self.maker_trading_pair, amount)
@@ -493,7 +471,8 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             # No-submit: nothing is tracked, so _open_maker_orders stays empty (cancel
             # path no-ops) and no fills occur (so the hedge path never fires). Zero real
             # orders. The intended quote is surfaced by the _place_targets summary line.
-            return
+            # Return None so the base records no _maker_placed_rung for a phantom order.
+            return None
         order_id = self.place_order(
             connector_name=self.maker_connector,
             trading_pair=self.maker_trading_pair,
@@ -505,18 +484,15 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             metadata={"order_role": "maker", "edge_bps": str(edge_bps)},
         )
         self.maker_orders[order_id] = TrackedOrder(order_id=order_id)
-        if self._is_two_sided():
-            # Only the two-sided diff path reads _maker_placed_rung (and prunes it to
-            # live orders each reconcile). Recording it on the single-sided path would
-            # leak, since base _reconcile_maker never prunes it.
-            if not hasattr(self, "_maker_placed_rung"):
-                self._maker_placed_rung = {}
-            policy_side = Side.BUY if side == TradeType.BUY else Side.SELL
-            self._maker_placed_rung[order_id] = (policy_side, q_price, q_amount)
+        # NB: _maker_placed_rung (the inflight double-place guard) is recorded by the BASE
+        # from this returned id (CrossVenueHedgedExecutorBase._record_placed_rung), so it is
+        # populated identically on both the single- and two-sided paths. This hook only owns
+        # the order submission + the open-edge basis below.
         if position_action == PositionAction.OPEN:
             if not hasattr(self, "_maker_placed_edge_bps"):
                 self._maker_placed_edge_bps = {}
             self._maker_placed_edge_bps[order_id] = Decimal(edge_bps)
+        return order_id
 
     # ------------------------------------------------------------------ observe
 

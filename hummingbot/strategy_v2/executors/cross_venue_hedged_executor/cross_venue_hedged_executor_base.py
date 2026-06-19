@@ -70,7 +70,7 @@ from collections import OrderedDict
 from decimal import Decimal
 from typing import Dict, List, Optional, Union
 
-from hummingbot.core.data_type.common import PositionMode, PositionSide, TradeType
+from hummingbot.core.data_type.common import PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
@@ -83,6 +83,12 @@ from hummingbot.core.event.events import (
 )
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
+from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.maker_reconcile import (
+    RestingOrder,
+    RungTarget,
+    Side,
+    diff_ladder_targets,
+)
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair, ExecutorConfigBase
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
 from hummingbot.strategy_v2.models.base import RunnableStatus
@@ -310,12 +316,149 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
 
     # ============================================================ maker reconcile
 
+    def _is_two_sided(self) -> bool:
+        return getattr(self.config, "two_sided", False) is True
+
     def _reconcile_maker(self) -> None:
+        """Selective cancel/replace: reprice only the rungs that actually changed.
+
+        Generic partial-diff shared by every hedge executor (JEP-145). Builds the live
+        resting ladder (incl. just-placed inflight orders via ``_maker_placed_rung`` so
+        they are not double-placed), diffs it against this tick's targets, cancels only
+        the unmatched LIVE orders (never an inflight one — its create task may still be
+        racing to the exchange), and places only the unmatched targets. A side with an
+        unmatched inflight order is withheld this tick (that inflight order may still be
+        the side's rung). ``observe`` short-circuits to a no-submit full-ladder snapshot.
+
+        Cancel-all is retained on ``_cancel_all_maker`` for the gates-closed (kill-switch)
+        and wind_down paths, which deliberately do NOT partial-diff.
+        """
         targets = self._compute_targets()
         if not self._should_reprice(targets):
             return
-        self._cancel_all_maker()
-        self._place_targets(targets)
+        if getattr(self.config, "observe", False):
+            self._place_targets(targets)
+            return
+        if hasattr(self, "_maker_placed_rung"):
+            # Bound to ACTIVE makers only (inflight: order is None, or open). A filled maker
+            # stays in maker_orders (pre-existing retention), but its rung is never read again
+            # — only inflight rungs are injected into the diff — so dropping it here caps
+            # _maker_placed_rung at the live+inflight order count instead of tracking the
+            # unbounded maker_orders retention (JEP-145 adversarial review, MEDIUM).
+            active_ids = {oid for oid, o in self.maker_orders.items() if o.order is None or o.order.is_open}
+            self._maker_placed_rung = {
+                oid: rung for oid, rung in self._maker_placed_rung.items() if oid in active_ids
+            }
+        inflight_ids = {oid for oid, o in self.maker_orders.items() if o.order is None}
+        resting = self._resting_maker_orders()
+        for oid in inflight_ids:
+            rung = getattr(self, "_maker_placed_rung", {}).get(oid)
+            if rung is None:
+                continue
+            side, price, size = rung
+            resting.append(RestingOrder(order_id=oid, side=side, price=price, size=size))
+        diff = diff_ladder_targets(
+            resting,
+            targets,
+            self.config.maker_tick,
+            self.config.min_reprice_delta_ticks,
+        )
+        unmatched_inflight = [oid for oid in diff.to_cancel if oid in inflight_ids]
+        placed_rung = getattr(self, "_maker_placed_rung", {})
+        blocked_sides = {
+            placed_rung[oid][0]
+            for oid in unmatched_inflight
+            if oid in placed_rung
+        }
+        to_place = [target for target in diff.to_place if target.side not in blocked_sides]
+        for oid in diff.to_cancel:
+            if oid in inflight_ids:
+                continue
+            self._strategy.cancel(self.maker_connector, self.maker_trading_pair, oid)
+        self._place_targets_subset(to_place)
+        self._last_reprice_ts = self._strategy.current_timestamp
+
+    def _resting_maker_orders(self) -> List[RestingOrder]:
+        conn = self.connectors[self.maker_connector]
+        pair = self.maker_trading_pair
+        out: List[RestingOrder] = []
+        for o in self._open_maker_orders():
+            if o.order is None:
+                continue
+            side = Side.BUY if o.order.trade_type == TradeType.BUY else Side.SELL
+            out.append(
+                RestingOrder(
+                    order_id=o.order_id,
+                    side=side,
+                    price=conn.quantize_order_price(pair, o.order.price),
+                    size=conn.quantize_order_amount(pair, o.order.amount),
+                )
+            )
+        return out
+
+    def _place_maker(
+        self,
+        price: Decimal,
+        amount: Decimal,
+        edge_bps: Decimal,
+        side: Optional[TradeType] = None,
+        position_action: PositionAction = PositionAction.OPEN,
+    ) -> Optional[str]:
+        """Placement hook: submit one maker order, track it in ``maker_orders``, return its id.
+
+        Soft hook (raises ``NotImplementedError`` if unimplemented) rather than
+        ``@abstractmethod`` so the accounting-only test harnesses that subclass this base but
+        never quote do not have to implement it. Concrete executors override it (the ladder
+        records ``_maker_placed_edge_bps`` and honors observe-mode no-submit here).
+
+        Contract: return the placed order's client id, or ``None`` if no order was submitted
+        (observe-mode no-submit, sub-minimum size, etc.). The BASE — not the subclass —
+        records ``_maker_placed_rung`` from this id (see ``_place_target_one`` /
+        ``_record_placed_rung``), so the inflight double-place guard holds for ANY subclass
+        that merely returns its placed id.
+        """
+        raise NotImplementedError
+
+    def _place_target_one(self, target: RungTarget) -> None:
+        if self._is_two_sided():
+            side = TradeType.SELL if target.side == Side.SELL else TradeType.BUY
+            position_action = PositionAction.OPEN if side == self.entry_side else PositionAction.CLOSE
+            order_id = self._place_maker(
+                target.price,
+                target.size,
+                target.edge_bps,
+                side=side,
+                position_action=position_action,
+            )
+        else:
+            order_id = self._place_maker(target.price, target.size, target.edge_bps)
+        self._record_placed_rung(order_id, target)
+
+    def _record_placed_rung(self, order_id: Optional[str], target: RungTarget) -> None:
+        """Record a just-placed rung so the next reconcile's partial-diff sees it while inflight.
+
+        Recorded in the BASE (not the subclass ``_place_maker``) so EVERY hedge executor's
+        partial-diff is double-place-safe by construction — a subclass only has to return the
+        order id it placed. Quantized with the maker connector so the recorded rung matches the
+        resting-order representation built by ``_resting_maker_orders``. ``order_id is None``
+        (no submit / observe / sub-min) records nothing.
+        """
+        if order_id is None:
+            return
+        conn = self.connectors[self.maker_connector]
+        pair = self.maker_trading_pair
+        if not hasattr(self, "_maker_placed_rung"):
+            self._maker_placed_rung = {}
+        self._maker_placed_rung[order_id] = (
+            target.side,
+            conn.quantize_order_price(pair, target.price),
+            conn.quantize_order_amount(pair, target.size),
+        )
+
+    def _place_targets_subset(self, targets: List[RungTarget]) -> None:
+        for target in targets:
+            self._place_target_one(target)
+        self._last_reprice_ts = self._strategy.current_timestamp
 
     def _cancel_all_maker(self) -> None:
         for order in self._open_maker_orders():

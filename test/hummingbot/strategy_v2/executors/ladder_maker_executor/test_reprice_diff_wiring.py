@@ -194,6 +194,22 @@ def test_single_sided_reprice_set_unchanged():
     assert ex.place_order.call_count == 2
 
 
+def test_single_sided_inflight_rung_not_double_placed():
+    # The single-sided path now inherits the base generic partial-diff (JEP-145). A
+    # just-placed rung is inflight (order is None) until its created event; the ladder's
+    # _place_maker must record it in _maker_placed_rung on the single-sided path too, so the
+    # next tick's diff sees it and does NOT double-place (money-path over-exposure guard).
+    ex = _make_executor([_target(Side.SELL, "50.10")], two_sided=False)
+
+    ex._reconcile_maker()
+    ex._reconcile_maker()
+
+    ex._strategy.cancel.assert_not_called()
+    ex.place_order.assert_called_once()
+    assert list(ex.maker_orders) == ["OID-0"]
+    assert ex.maker_orders["OID-0"].order is None
+
+
 def test_opposite_side_same_price_size_not_matched():
     ex = _make_executor([_target(Side.BUY, "50.10")])
     _live(ex, "sell-open", "50.10", trade_type=TradeType.SELL)
