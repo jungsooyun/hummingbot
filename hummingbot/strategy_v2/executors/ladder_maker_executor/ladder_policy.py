@@ -2,7 +2,8 @@
 
 Ported from stratops ``korea_hip3`` policy/target.py + policy/ladder.py so the
 core pricing/hedging math can be unit-tested locally WITHOUT the hummingbot
-Cython runtime. No I/O, no hummingbot imports — only the stdlib.
+Cython runtime. No I/O and no hummingbot *runtime* (Cython) imports — only the
+stdlib, plus the pure shared ``maker_reconcile`` value types relocated in JEP-145.
 
 The executor layer adapts these pure results to hummingbot order placement
 (TradeType, place_order, TrackedOrder).
@@ -11,17 +12,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
-from enum import Enum
 from typing import List, Optional
+
+from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.maker_reconcile import (
+    LadderDiff,
+    RestingOrder,
+    RungTarget,
+    Side,
+    diff_ladder_targets,
+)
 
 ZERO = Decimal("0")
 ONE = Decimal("1")
 BPS = Decimal("10000")
-
-
-class Side(Enum):
-    BUY = "BUY"
-    SELL = "SELL"
 
 
 @dataclass(frozen=True)
@@ -32,14 +35,6 @@ class RungSpec:
     size: Decimal
     min_edge_bps: Decimal = ZERO
     enabled: bool = True
-
-
-@dataclass(frozen=True)
-class RungTarget:
-    side: Side
-    price: Decimal
-    size: Decimal
-    edge_bps: Decimal
 
 
 @dataclass(frozen=True)
@@ -246,69 +241,6 @@ def compute_eod_pressure(now_kst_min: int, krx_close_min: int, wind_minutes: int
     if pressure >= ONE:
         return ONE
     return pressure
-
-
-@dataclass(frozen=True)
-class RestingOrder:
-    """Snapshot of one live maker order, for the partial-reprice diff."""
-
-    order_id: str
-    side: Side
-    price: Decimal
-    size: Decimal
-
-
-@dataclass(frozen=True)
-class LadderDiff:
-    """Result of diffing live maker orders against this tick's targets.
-
-    ``to_cancel`` holds the order ids to cancel; ``to_place`` holds the targets
-    with no acceptable live match. Orders that match a target within the reprice
-    threshold (same size, price drift < threshold) are left untouched.
-    """
-
-    to_cancel: List[str]
-    to_place: List[RungTarget]
-
-
-def diff_ladder_targets(
-    current: List[RestingOrder],
-    targets: List[RungTarget],
-    tick: Decimal,
-    reprice_threshold_ticks: Decimal,
-) -> LadderDiff:
-    """Partial reprice: cancel/replace only the rungs that actually changed.
-
-    A live order *matches* a target when it has the SAME size and its price is
-    within ``reprice_threshold_ticks * tick`` of the target price (strictly less
-    than the threshold — at/over the threshold is a reprice, mirroring the
-    executor's ``min_reprice_delta_ticks`` guard). Matching is greedy per target,
-    preferring the closest price then the lowest order id, so the result is
-    deterministic.
-
-    Unmatched targets are placed; unmatched live orders are cancelled. With no
-    live orders this places everything; with empty targets it cancels everything.
-    """
-    threshold = reprice_threshold_ticks * tick
-    unmatched = list(current)
-    to_place: List[RungTarget] = []
-    matched_ids: set[str] = set()
-
-    for target in targets:
-        candidates = [
-            o
-            for o in unmatched
-            if o.side == target.side and o.size == target.size and abs(o.price - target.price) < threshold
-        ]
-        if not candidates:
-            to_place.append(target)
-            continue
-        best = min(candidates, key=lambda o: (abs(o.price - target.price), o.order_id))
-        matched_ids.add(best.order_id)
-        unmatched = [o for o in unmatched if o.order_id != best.order_id]
-
-    to_cancel = [o.order_id for o in current if o.order_id not in matched_ids]
-    return LadderDiff(to_cancel=to_cancel, to_place=to_place)
 
 
 def compute_hedge_order(
