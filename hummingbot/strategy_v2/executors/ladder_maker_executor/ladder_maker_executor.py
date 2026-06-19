@@ -32,7 +32,6 @@ from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.cross_venue_he
 )
 from hummingbot.strategy_v2.executors.ladder_maker_executor.data_types import LadderMakerExecutorConfig
 from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import (
-    RestingOrder,
     RungSpec,
     Side,
     TwoSidedTargets,
@@ -42,7 +41,6 @@ from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import
     compute_eod_pressure,
     compute_fair_price,
     compute_hedge_order,
-    diff_ladder_targets,
 )
 from hummingbot.strategy_v2.gates.gate_chain import GateChain, GateContext, InventoryGate, KillSwitchGate
 from hummingbot.strategy_v2.models.executors import TrackedOrder
@@ -330,63 +328,27 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         return False
 
     def _reconcile_maker(self) -> None:
-        if not self._is_two_sided():
-            # Single-sided: inherit the base generic partial-diff (selective cancel/replace).
-            return super()._reconcile_maker()
-        if getattr(self.config, "wind_down", False):
-            # Wind_down cancels ALL makers then re-places close-only — deliberately NOT a
-            # partial-diff. Pinned to explicit cancel-all (this was super(), but the base
-            # now partial-diffs, which would leave a matching close order resting instead of
-            # the wind_down cancel-then-replace, stranding open-side makers). Byte-identical
-            # to the pre-JEP-145 base cancel-all: compute -> reprice guard -> cancel_all -> place.
+        # JEP-145 Phase 2: the partial-diff (selective cancel/replace) is the base generic for
+        # BOTH the single- and two-sided paths. The two-sided body that used to live here was
+        # behaviorally equivalent to CrossVenueHedgedExecutorBase._reconcile_maker for every
+        # production config (same prune -> inflight-injection -> diff_ladder_targets ->
+        # blocked_sides -> cancel/place), so it is deduped onto super(). The lone textual
+        # difference was the observe guard — the old inline `if self.config.observe` vs the base's
+        # more-defensive `getattr(self.config, "observe", False)`; these diverge ONLY for a config
+        # missing the attribute, which LadderMakerExecutorConfig cannot be (it declares observe).
+        # The ONLY ladder-specific divergence is two-sided wind_down, which must cancel ALL makers
+        # then re-place close-only — deliberately NOT a partial-diff (a partial-diff would leave a
+        # matching close order resting instead of the wind_down cancel-then-replace, stranding
+        # open-side makers). Single-sided wind_down was never special-cased (it fell through to the
+        # base generic) and still isn't.
+        if self._is_two_sided() and getattr(self.config, "wind_down", False):
             targets = self._compute_targets()
             if not self._should_reprice(targets):
                 return
             self._cancel_all_maker()
             self._place_targets(targets)
             return
-        targets = self._compute_targets()
-        if not self._should_reprice(targets):
-            return
-        if self.config.observe:
-            self._place_targets(targets)
-            return
-        if hasattr(self, "_maker_placed_rung"):
-            # Bound to ACTIVE makers only (mirrors base _reconcile_maker): a filled maker
-            # stays in maker_orders but its rung is never read again, so dropping it caps
-            # _maker_placed_rung at the live+inflight count (JEP-145 adversarial review).
-            active_ids = {oid for oid, o in self.maker_orders.items() if o.order is None or o.order.is_open}
-            self._maker_placed_rung = {
-                oid: rung for oid, rung in self._maker_placed_rung.items() if oid in active_ids
-            }
-        inflight_ids = {oid for oid, o in self.maker_orders.items() if o.order is None}
-        resting = self._resting_maker_orders()
-        for oid in inflight_ids:
-            rung = getattr(self, "_maker_placed_rung", {}).get(oid)
-            if rung is None:
-                continue
-            side, price, size = rung
-            resting.append(RestingOrder(order_id=oid, side=side, price=price, size=size))
-        diff = diff_ladder_targets(
-            resting,
-            targets,
-            self.config.maker_tick,
-            self.config.min_reprice_delta_ticks,
-        )
-        unmatched_inflight = [oid for oid in diff.to_cancel if oid in inflight_ids]
-        placed_rung = getattr(self, "_maker_placed_rung", {})
-        blocked_sides = {
-            placed_rung[oid][0]
-            for oid in unmatched_inflight
-            if oid in placed_rung
-        }
-        to_place = [target for target in diff.to_place if target.side not in blocked_sides]
-        for oid in diff.to_cancel:
-            if oid in inflight_ids:
-                continue
-            self._strategy.cancel(self.maker_connector, self.maker_trading_pair, oid)
-        self._place_targets_subset(to_place)
-        self._last_reprice_ts = self._strategy.current_timestamp
+        return super()._reconcile_maker()
 
     def _place_targets(self, targets: List) -> None:
         if self.config.observe:
