@@ -317,6 +317,15 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
         """Build an OrderBookMessage from a KIS REST orderbook response."""
         snapshot_response = await self._request_order_book_snapshot(trading_pair)
+
+        # Fail closed: KIS returns HTTP 200 with rt_cd != "0" on logical errors. Parsing
+        # the missing output1 (-> {}) would publish an empty book and silently poison the
+        # fair-price source. Raise instead (JEP-161, mirrors _get_last_traded_price).
+        if snapshot_response.get("rt_cd") != "0":
+            raise IOError(
+                f"KIS orderbook snapshot failed for {trading_pair}: "
+                f"rt_cd={snapshot_response.get('rt_cd')} msg={snapshot_response.get('msg1')}"
+            )
         output = snapshot_response.get("output1", {})
 
         timestamp = time.time()
@@ -330,6 +339,17 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
             bid_price_templates=["bidp{idx}"],
             bid_size_templates=["bidp_rsqn{idx}"],
         )
+
+        # Fail closed unless BOTH sides have a valid level. A one-sided book is unusable as
+        # a two-sided fair source: get_price_by_type on the empty side returns float NaN,
+        # which slips past _compute_fair's `not px / px<=0` guard (NaN comparison raises
+        # InvalidOperation) and either fakes readiness with a NaN fair or crashes the
+        # control loop. Refuse to publish and let the tracker retry (JEP-161; codex 2026-06-19).
+        if not asks or not bids:
+            raise IOError(
+                f"KIS orderbook snapshot for {trading_pair} is one-sided/empty "
+                f"(asks={len(asks)} bids={len(bids)}) — refusing to publish an unusable book"
+            )
 
         content = {
             "trading_pair": trading_pair,

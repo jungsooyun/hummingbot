@@ -236,15 +236,43 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
     @staticmethod
     def _empty_orderbook_response() -> Dict[str, Any]:
-        """KIS response with zero-sized levels."""
+        """KIS response mixing zero-sized levels with valid ones. askp1 (size 0) and bidp1
+        (size 0) are filtered; askp2/bidp2 survive so BOTH sides keep a valid level."""
         return {
             "rt_cd": "0",
             "msg1": "정상처리 되었습니다.",
             "output1": {
                 "askp1": "72100", "askp_rsqn1": "0",
-                "askp2": "0", "askp_rsqn2": "300",
+                "askp2": "72200", "askp_rsqn2": "300",
                 "bidp1": "71900", "bidp_rsqn1": "0",
                 "bidp2": "71800", "bidp_rsqn2": "600",
+            },
+        }
+
+    @staticmethod
+    def _all_zero_orderbook_response() -> Dict[str, Any]:
+        """KIS HTTP-200 response where every level is zero/invalid -> both sides empty
+        after filtering. Unusable as a fair source; must fail closed (JEP-161)."""
+        return {
+            "rt_cd": "0",
+            "msg1": "정상처리 되었습니다.",
+            "output1": {
+                "askp1": "0", "askp_rsqn1": "0",
+                "bidp1": "0", "bidp_rsqn1": "0",
+            },
+        }
+
+    @staticmethod
+    def _one_sided_orderbook_response() -> Dict[str, Any]:
+        """Valid asks but every bid zero -> bids empty after filter (one-sided book).
+        Unusable as a two-sided fair source -> must fail closed (JEP-161)."""
+        return {
+            "rt_cd": "0",
+            "msg1": "정상처리 되었습니다.",
+            "output1": {
+                "askp1": "72100", "askp_rsqn1": "500",
+                "askp2": "72200", "askp_rsqn2": "300",
+                "bidp1": "0", "bidp_rsqn1": "0",
             },
         }
 
@@ -427,12 +455,54 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         bids = snapshot_msg.bids
         asks = snapshot_msg.asks
 
-        # askp1 has size 0 -> filtered out, askp2 has price 0 -> filtered out
-        self.assertEqual(0, len(asks))
-        # bidp1 has size 0 -> filtered out, bidp2 has valid data
+        # askp1 (size 0) and bidp1 (size 0) filtered out; askp2/bidp2 survive on BOTH sides
+        self.assertEqual(1, len(asks))
+        self.assertEqual(72200.0, asks[0].price)
+        self.assertEqual(300.0, asks[0].amount)
         self.assertEqual(1, len(bids))
         self.assertEqual(71800.0, bids[0].price)
         self.assertEqual(600.0, bids[0].amount)
+
+    @aioresponses()
+    def test_order_book_snapshot_fails_closed_on_rt_cd_error(self, mock_api):
+        """KIS returns HTTP 200 with rt_cd != '0' on logical errors. The REST snapshot
+        must raise (fail closed), never publish an empty/garbage book that would silently
+        poison the fair-price source (JEP-161, mirrors _get_last_traded_price)."""
+        regex_url = re.compile(
+            f"{CONSTANTS.REST_URL}/{CONSTANTS.DOMESTIC_STOCK_ORDERBOOK_PATH}"
+        )
+        mock_api.get(regex_url, body=json.dumps({"rt_cd": "1", "msg1": "no data", "output1": {}}))
+        with self.assertRaisesRegex(IOError, "rt_cd"):
+            self.local_event_loop.run_until_complete(
+                self.data_source._order_book_snapshot(self.trading_pair)
+            )
+
+    @aioresponses()
+    def test_order_book_snapshot_fails_closed_on_empty_book(self, mock_api):
+        """rt_cd '0' but every level zero/invalid (both sides empty after filter) -> raise:
+        an empty book is unusable as a fair source (JEP-161)."""
+        regex_url = re.compile(
+            f"{CONSTANTS.REST_URL}/{CONSTANTS.DOMESTIC_STOCK_ORDERBOOK_PATH}"
+        )
+        mock_api.get(regex_url, body=json.dumps(self._all_zero_orderbook_response()))
+        with self.assertRaisesRegex(IOError, "one-sided/empty|unusable"):
+            self.local_event_loop.run_until_complete(
+                self.data_source._order_book_snapshot(self.trading_pair)
+            )
+
+    @aioresponses()
+    def test_order_book_snapshot_fails_closed_on_one_sided_book(self, mock_api):
+        """Valid asks but all bids zero -> bids empty after filter. A one-sided book makes
+        best-bid NaN downstream (poisons the two-sided fair / raises InvalidOperation in
+        _compute_fair), so it must fail closed, not publish (JEP-161, codex review)."""
+        regex_url = re.compile(
+            f"{CONSTANTS.REST_URL}/{CONSTANTS.DOMESTIC_STOCK_ORDERBOOK_PATH}"
+        )
+        mock_api.get(regex_url, body=json.dumps(self._one_sided_orderbook_response()))
+        with self.assertRaisesRegex(IOError, "one-sided/empty|unusable"):
+            self.local_event_loop.run_until_complete(
+                self.data_source._order_book_snapshot(self.trading_pair)
+            )
 
     # ------------------------------------------------------------------
     # Test: _request_order_book_snapshot (raw REST response)

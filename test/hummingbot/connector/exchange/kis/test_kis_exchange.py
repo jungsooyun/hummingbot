@@ -593,6 +593,22 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         with self.assertRaises(IOError):
             await ex._get_last_traded_price(self.trading_pair)
 
+    @aioresponses()
+    async def test_update_balances_fails_closed_on_rt_cd_error(self, mock_api):
+        """KIS returns HTTP 200 with rt_cd != '0' on logical errors (e.g. EGW00304).
+        _update_balances must raise (fail closed) rather than accept the empty output1/
+        output2 and silently zero out holdings + cash — a money-path input (JEP-161)."""
+        regex_url = re.compile(f"{self.balance_url}.*")
+        ex = self._make_exchange()
+        ex._auth._access_token = "test_access_token"
+        ex._auth._token_expires_at = time.time() + 86400
+        ex._set_trading_pair_symbol_map(
+            bidict({self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset): self.trading_pair})
+        )
+        mock_api.get(regex_url, body=json.dumps({"rt_cd": "1", "msg1": "no data", "output1": [], "output2": []}))
+        with self.assertRaisesRegex(IOError, "rt_cd"):
+            await ex._update_balances()
+
     def test_ws_enabled_default_true(self):
         self.assertTrue(self._make_exchange()._ws_enabled)
 

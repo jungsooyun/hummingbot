@@ -448,6 +448,16 @@ class KisExchange(ExchangePyBase):
             headers={"tr_id": tr_id},
         )
 
+        # Fail closed: KIS returns HTTP 200 with rt_cd != "0" on logical errors (e.g.
+        # EGW00304). Parsing the empty output1/output2 would silently zero out holdings +
+        # cash — a money-path input to fair/hedge/readiness. Raise instead (JEP-161,
+        # mirrors _get_last_traded_price).
+        if result.get("rt_cd") != "0":
+            raise IOError(
+                f"KIS balance request failed: "
+                f"rt_cd={result.get('rt_cd')} msg={result.get('msg1')}"
+            )
+
         # Parse stock holdings from output1
         for holding in result.get("output1", []):
             asset_name = holding["pdno"]
