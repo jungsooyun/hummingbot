@@ -15,6 +15,7 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount, TradeFeeBase
+from hummingbot.core.network_iterator import NetworkStatus
 
 
 class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
@@ -608,6 +609,104 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         mock_api.get(regex_url, body=json.dumps({"rt_cd": "1", "msg1": "no data", "output1": [], "output2": []}))
         with self.assertRaisesRegex(IOError, "rt_cd"):
             await ex._update_balances()
+
+    # ------------------------------------------------------------------
+    # JEP-182: remaining KIS REST fail-open surfaces (rt_cd not inspected)
+    # ------------------------------------------------------------------
+
+    def _order_detail_url_regex(self):
+        url = web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH)
+        return re.compile(f"^{re.escape(url)}.*")
+
+    def _authed_exchange(self):
+        ex = self._make_exchange()
+        ex._auth._access_token = "test_access_token"
+        ex._auth._token_expires_at = time.time() + 86400
+        return ex
+
+    def _tracked_limit_buy(self, eoid="0000123456", initial_state=OrderState.OPEN):
+        return InFlightOrder(
+            client_order_id="OID-jep182",
+            exchange_order_id=eoid,
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("10"),
+            price=Decimal("70000"),
+            creation_timestamp=time.time(),
+            initial_state=initial_state,
+        )
+
+    @aioresponses()
+    async def test_check_network_fails_closed_on_rt_cd_error(self, mock_api):
+        """check_network probes the balance endpoint. KIS returns HTTP 200 with rt_cd != '0' on
+        logical auth/account errors; _make_network_check_request must raise so check_network reports
+        NOT_CONNECTED. Otherwise the readiness probe marks a broken account healthy while
+        _update_balances (fail-closed since JEP-161) raises — an inconsistency that hides it (JEP-182)."""
+        regex_url = re.compile(f"{self.balance_url}.*")
+        ex = self._authed_exchange()
+        mock_api.get(regex_url, body=json.dumps({"rt_cd": "1", "msg1": "EGW00304", "output1": [], "output2": []}))
+        self.assertEqual(NetworkStatus.NOT_CONNECTED, await ex.check_network())
+
+    @aioresponses()
+    async def test_check_network_connected_on_healthy_balance(self, mock_api):
+        """Companion: a healthy rt_cd == '0' balance response keeps check_network CONNECTED — the
+        fail-closed guard must not break the normal readiness path (JEP-182)."""
+        regex_url = re.compile(f"{self.balance_url}.*")
+        ex = self._authed_exchange()
+        mock_api.get(regex_url, body=json.dumps({"rt_cd": "0", "msg1": "ok", "output1": [], "output2": {}}))
+        self.assertEqual(NetworkStatus.CONNECTED, await ex.check_network())
+
+    @aioresponses()
+    async def test_request_order_status_no_op_on_rt_cd_error(self, mock_api):
+        """Order-status path: a logical fetch error (HTTP 200 + rt_cd != '0') carries no state info.
+        It must NOT infer OPEN from the empty output1 (the pre-JEP-182 bug) AND must NOT raise — a
+        raised status exception would let the base escalate to process_order_not_found() and mark a
+        live order FAILED after a few transient errors (codex challenge). So the update leaves the
+        state UNCHANGED: a PARTIALLY_FILLED order stays PARTIALLY_FILLED, not flipped to OPEN and not
+        raised (JEP-182)."""
+        ex = self._authed_exchange()
+        order = self._tracked_limit_buy(initial_state=OrderState.PARTIALLY_FILLED)
+        mock_api.get(self._order_detail_url_regex(),
+                     body=json.dumps({"rt_cd": "1", "msg1": "token expired", "output1": []}))
+        update = await ex._request_order_status(order)
+        self.assertEqual(OrderState.PARTIALLY_FILLED, update.new_state)
+
+    @aioresponses()
+    async def test_all_trade_updates_fails_closed_on_rt_cd_error(self, mock_api):
+        """Same shared fetch on the fills path: rt_cd != '0' yields an empty output1 and
+        _create_order_fill_updates returns [] — a fill would silently vanish. Must fail closed (JEP-182)."""
+        ex = self._authed_exchange()
+        mock_api.get(self._order_detail_url_regex(),
+                     body=json.dumps({"rt_cd": "1", "msg1": "token expired", "output1": []}))
+        with self.assertRaisesRegex(IOError, "rt_cd"):
+            await ex._all_trade_updates_for_order(self._tracked_limit_buy())
+
+    @aioresponses()
+    async def test_order_detail_empty_but_ok_does_not_raise(self, mock_api):
+        """no-data-vs-error: a legitimate 'no fills yet' poll carries rt_cd == '0' with output1 == [].
+        The guard keys ONLY on rt_cd, so a successful-empty response must NOT raise — trade-updates
+        stays [] and order-status stays OPEN (JEP-182)."""
+        ex = self._authed_exchange()
+        mock_api.get(self._order_detail_url_regex(), body=json.dumps(self._empty_fill_mock_response()))
+        self.assertEqual([], await ex._all_trade_updates_for_order(self._tracked_limit_buy()))
+        mock_api.get(self._order_detail_url_regex(), body=json.dumps(self._empty_fill_mock_response()))
+        update = await ex._request_order_status(self._tracked_limit_buy())
+        self.assertEqual(OrderState.OPEN, update.new_state)
+
+    @aioresponses()
+    async def test_get_open_orders_fails_closed_on_rt_cd_error(self, mock_api):
+        """get_open_orders paginates inquire-daily-ccld with its own fetch. On rt_cd != '0' the empty
+        output1 would make it report ZERO resting orders — fatal to reconcile/seed (it would conclude
+        the account is flat and skip cancel-all). Must fail closed (JEP-182). The rt_cd == '0' + []
+        no-raise case is already covered by test_get_open_orders_empty_returns_empty_list."""
+        symbol = self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)
+        ex = self._authed_exchange()
+        ex._set_trading_pair_symbol_map(bidict({symbol: self.trading_pair}))
+        mock_api.get(self._order_detail_url_regex(),
+                     body=json.dumps({"rt_cd": "1", "msg1": "EGW00121", "output1": []}))
+        with self.assertRaisesRegex(IOError, "rt_cd"):
+            await ex.get_open_orders()
 
     def test_ws_enabled_default_true(self):
         self.assertTrue(self._make_exchange()._ws_enabled)

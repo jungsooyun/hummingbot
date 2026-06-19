@@ -171,12 +171,22 @@ class KisExchange(ExchangePyBase):
         # KIS requires auth + account params + a TR_ID header. A successful balance
         # inquiry proves network + auth + account are all healthy.
         tr_id, params = self._balance_request_args()
-        await self._api_get(
+        result = await self._api_get(
             path_url=CONSTANTS.DOMESTIC_STOCK_BALANCE_PATH,
             params=params,
             is_auth_required=True,
             headers={"tr_id": tr_id},
         )
+        # Fail closed: KIS returns HTTP 200 with rt_cd != "0" on logical auth/account errors.
+        # The base check_network() treats a non-exception as CONNECTED, so an un-inspected
+        # logical error would mark the connector healthy while _update_balances (fail-closed
+        # since JEP-161) raises — a readiness/balance inconsistency that hides a broken account.
+        # Raise so check_network() reports NOT_CONNECTED instead (JEP-182).
+        if result.get("rt_cd") != "0":
+            raise IOError(
+                f"KIS network check failed: "
+                f"rt_cd={result.get('rt_cd')} msg={result.get('msg1')}"
+            )
 
     @property
     def trading_pairs(self):
@@ -494,6 +504,29 @@ class KisExchange(ExchangePyBase):
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         result = await self._request_kis_order_detail(tracked_order)
 
+        # Fail closed WITHOUT escalating: a logical fetch error (HTTP 200 + rt_cd != "0") carries
+        # no order-state information. Do NOT infer OPEN from the empty output1 (the pre-JEP-182
+        # bug — _match_ccld_row returns {} and _infer_order_state falls through to OPEN), and do
+        # NOT raise: the base _handle_update_error_for_active_order routes ANY raised status
+        # exception to process_order_not_found(), which marks a still-live order FAILED after
+        # _lost_order_count_limit consecutive errors (e.g. a transient token/account rt_cd error
+        # spanning a few polls). Return a no-op update (state unchanged) so the order keeps polling;
+        # check_network independently reports NOT_CONNECTED on the same condition. Transport errors
+        # from _api_get still propagate (they raise before this check), preserving the framework
+        # "request fails -> not found" contract. (JEP-182; codex challenge 2026-06-19.)
+        if result.get("rt_cd") != "0":
+            self.logger().debug(
+                f"KIS order-status fetch for {tracked_order.client_order_id} returned "
+                f"rt_cd={result.get('rt_cd')} ({result.get('msg1')}); leaving state unchanged."
+            )
+            return OrderUpdate(
+                client_order_id=tracked_order.client_order_id,
+                exchange_order_id=tracked_order.exchange_order_id,
+                trading_pair=tracked_order.trading_pair,
+                update_timestamp=self.current_timestamp,
+                new_state=tracked_order.current_state,
+            )
+
         # State only. Fills are emitted by _all_trade_updates_for_order (the dedicated
         # trade-update path), so that a failed fill fetch never double-emits a fill the
         # status path would have surfaced. KIS inquire-daily-ccld has no explicit status
@@ -574,6 +607,13 @@ class KisExchange(ExchangePyBase):
             "CTX_AREA_NK100": "",
         }
 
+        # NOTE: rt_cd is intentionally NOT inspected here. The two consumers must treat a logical
+        # error (HTTP 200 + rt_cd != "0") differently: _all_trade_updates_for_order RAISES (safe —
+        # _update_orders_fills logs and retries it without touching order state), while
+        # _request_order_status returns a NO-OP update — raising on the status path would let the
+        # base _handle_update_error_for_active_order escalate to process_order_not_found() and
+        # wrongly mark a live order FAILED after a few transient errors (JEP-182; codex challenge
+        # 2026-06-19).
         return await self._api_get(
             path_url=CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH,
             params=params,
@@ -617,6 +657,16 @@ class KisExchange(ExchangePyBase):
                 is_auth_required=True,
                 headers={"tr_id": tr_id},
             )
+            # Fail closed: a logical error (rt_cd != "0") must not be read as "no open orders" —
+            # that would mis-seed reconcile (JEP-170/171), which would then wrongly conclude the
+            # account is flat and skip cancel-all, leaking resting orders. A genuine "no open orders"
+            # response carries rt_cd == "0", so this never blocks the empty-but-valid case. Guard
+            # per page so an error on any page (not only page 1) fails closed (JEP-182).
+            if result.get("rt_cd") != "0":
+                raise IOError(
+                    f"KIS open-orders request failed: "
+                    f"rt_cd={result.get('rt_cd')} msg={result.get('msg1')}"
+                )
             for row in result.get("output1", []) or []:
                 if str(row.get("cncl_yn", "N")).upper() == "Y":
                     continue
@@ -660,6 +710,16 @@ class KisExchange(ExchangePyBase):
 
         if order.exchange_order_id is not None:
             result = await self._request_kis_order_detail(order)
+            # Fail closed: rt_cd != "0" (HTTP 200 logical error) yields an empty output1; without
+            # this guard _create_order_fill_updates would return [] and a real fill would silently
+            # vanish. A genuine "no fills yet" poll carries rt_cd == "0" with an empty output1, so
+            # this never blocks valid polling. Raising here is safe — _update_orders_fills logs and
+            # retries it without escalating order state (unlike the status path) (JEP-182).
+            if result.get("rt_cd") != "0":
+                raise IOError(
+                    f"KIS order-detail (fills) request failed for {order.client_order_id}: "
+                    f"rt_cd={result.get('rt_cd')} msg={result.get('msg1')}"
+                )
             trade_updates = self._create_order_fill_updates(order=order, fill_data=result)
 
         return trade_updates
