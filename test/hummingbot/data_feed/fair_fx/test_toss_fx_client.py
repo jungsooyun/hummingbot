@@ -111,6 +111,34 @@ class TossFxClientTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TossFxError):
             await c.fetch_exchange_rate()
 
+    async def test_rate_401_invalidates_token_and_retries(self):
+        # Toss can expire a token EARLIER than the issued `expires_in` claims. When the
+        # rate GET 401s with a token our cache still considers valid, the client must
+        # invalidate the cached token, re-issue, and retry ONCE -> success.
+        class FlakySession(FakeSession):
+            def get(self, url, params=None, headers=None):
+                self.get_calls += 1
+                self.last_get_headers = headers
+                status = 401 if self.get_calls == 1 else 200
+                return FakeResp(status, self.rate_payload, text="invalid-token")
+
+        sess = FlakySession()
+        c = TossFxClient("id", "sec", http_factory=lambda: sess)
+        rate = await c.fetch_exchange_rate()
+        self.assertEqual(rate, Decimal("1375"))
+        self.assertEqual(sess.get_calls, 2)    # first 401, retried 200
+        self.assertEqual(sess.post_calls, 2)   # token re-issued after invalidation
+
+    async def test_rate_persistent_401_raises_after_single_retry(self):
+        # A genuinely bad credential 401s on every attempt — retry ONCE then surface
+        # the error (no infinite loop).
+        sess = FakeSession(rate_status=401)
+        c = TossFxClient("id", "sec", http_factory=lambda: sess)
+        with self.assertRaises(TossFxError):
+            await c.fetch_exchange_rate()
+        self.assertEqual(sess.get_calls, 2)    # one retry, then give up
+        self.assertEqual(sess.post_calls, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

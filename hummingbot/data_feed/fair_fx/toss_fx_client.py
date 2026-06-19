@@ -87,18 +87,35 @@ class TossFxClient:
             self._token_expiry = self._now() + max(0.0, expires_in - self._buffer)
             return self._token
 
+    def _invalidate_token(self) -> None:
+        """Drop the cached token so the next _get_token() re-issues. Used when the
+        rate endpoint rejects a token our cache still believed valid."""
+        self._token = None
+        self._token_expiry = 0.0
+
     async def fetch_exchange_rate(self) -> Decimal:
-        """Return the bank mid rate (KRW per USD) as Decimal. Non-200 -> TossFxError."""
-        token = await self._get_token()
-        session = self._ensure_session()
+        """Return the bank mid rate (KRW per USD) as Decimal. Non-200 -> TossFxError.
+
+        Toss can revoke a token EARLIER than the issued `expires_in` claims (or rotate
+        keys), so a rate GET can 401 with a token our cache still considers valid. On a
+        401 we invalidate the cache, re-issue once, and retry — converting the ~25-min
+        FX outage (token-expiry-without-refresh) into a transparent refresh. A second
+        401 surfaces the error (bad credential), with no infinite loop.
+        """
         params = {"baseCurrency": "USD", "quoteCurrency": "KRW"}
-        headers = {**self._DEFAULT_HEADERS, "Authorization": f"Bearer {token}"}
-        async with session.get(self.BASE + self.RATE_PATH, params=params, headers=headers) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise TossFxError(f"exchange-rate request failed: {resp.status} {body}")
-            payload = await resp.json()
-        return self._parse_rate(payload)
+        for attempt in (0, 1):
+            token = await self._get_token()
+            session = self._ensure_session()
+            headers = {**self._DEFAULT_HEADERS, "Authorization": f"Bearer {token}"}
+            async with session.get(self.BASE + self.RATE_PATH, params=params, headers=headers) as resp:
+                if resp.status == 401 and attempt == 0:
+                    self._invalidate_token()
+                    continue
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise TossFxError(f"exchange-rate request failed: {resp.status} {body}")
+                payload = await resp.json()
+                return self._parse_rate(payload)
 
     @staticmethod
     def _parse_rate(payload: dict) -> Decimal:
