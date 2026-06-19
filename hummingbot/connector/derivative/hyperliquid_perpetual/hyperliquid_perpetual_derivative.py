@@ -335,6 +335,27 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
                     continue
                 yield {**perp_meta, **asset_ctx}
 
+    def _configured_hip3_dex_names(self) -> set:
+        """HIP-3 builder DEX names referenced by configured trading pairs (the prefix
+        before ':' in e.g. 'XYZ:SMSN-USD', lowercased). Empty if no HIP-3 pairs are
+        configured (then the original all-DEX behavior is preserved)."""
+        names = set()
+        for tp in (getattr(self, "_trading_pairs", None) or []):
+            base = str(tp).split("-")[0]
+            if ":" in base:
+                names.add(base.split(":", 1)[0].lower())
+        return names
+
+    def _filter_dex_markets_to_configured(self, dex_markets):
+        """Restrict HIP-3 asset-context hydration to the DEX(es) of configured trading
+        pairs. Polling every builder DEX (xyz + km/abcd/cash/para/…) is a request-volume
+        blowup that saturates a rate-limited RPC and starves balance/position calls; we
+        only need our own DEX's contexts. No-op when no HIP-3 pairs are configured."""
+        needed = self._configured_hip3_dex_names()
+        if not needed:
+            return dex_markets
+        return [d for d in dex_markets if str(d.get("name", "")).lower() in needed]
+
     async def _fetch_and_cache_hip3_market_data(self):
         self._dex_markets = []
 
@@ -354,6 +375,9 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         # allPerpMetas may return either meta-only entries or [[meta, assetCtxs], ...] entries.
         if self._is_all_perp_metas_response(exchange_info_dex):
             dex_markets = self._parse_all_perp_metas_response(exchange_info_dex)
+            # Only hydrate asset contexts for the DEX(es) we actually trade — avoids
+            # polling/retrying every builder DEX, which saturates a rate-limited RPC.
+            dex_markets = self._filter_dex_markets_to_configured(dex_markets)
             dex_markets = await self._hydrate_dex_markets_asset_ctxs(dex_markets)
             self._dex_markets = dex_markets
             return dex_markets

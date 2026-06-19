@@ -1,3 +1,5 @@
+import os
+
 from hummingbot.core.api_throttler.data_types import LinkedLimitWeightPair, RateLimit
 from hummingbot.core.data_type.in_flight_order import OrderState
 
@@ -27,11 +29,13 @@ MARKET_ORDER_SLIPPAGE = 0.05
 DOMAIN = EXCHANGE_NAME
 TESTNET_DOMAIN = "hyperliquid_perpetual_testnet"
 
-PERPETUAL_BASE_URL = "https://api.hyperliquid.xyz"
+# Env-overridable for a dedicated RPC/proxy (e.g. QuikNode raw-HL base). The key-bearing
+# URL stays in the runtime env_file (HYPERLIQUID_PERP_BASE_URL), never baked into the image.
+PERPETUAL_BASE_URL = os.environ.get("HYPERLIQUID_PERP_BASE_URL", "https://api.hyperliquid.xyz")
 
 TESTNET_BASE_URL = "https://api.hyperliquid-testnet.xyz"
 
-PERPETUAL_WS_URL = "wss://api.hyperliquid.xyz/ws"
+PERPETUAL_WS_URL = os.environ.get("HYPERLIQUID_PERP_WS_URL", "wss://api.hyperliquid.xyz/ws")
 
 TESTNET_WS_URL = "wss://api.hyperliquid-testnet.xyz/ws"
 
@@ -115,8 +119,16 @@ WS_MESSAGE_TIMEOUT = 60.0
 MAX_REQUEST = 1_200
 ALL_ENDPOINTS_LIMIT = "All"
 
+# Optional per-SECOND global request cap for a rate-limited dedicated RPC/proxy (e.g.
+# QuikNode free tier = 15/s; HL native is MAX_REQUEST/60s = 20/s and allows bursts that
+# trip a 15/s proxy at HIP-3 startup). When HYPERLIQUID_PERP_RATE_LIMIT_PER_S > 0 the
+# global pool caps at that many requests/second; otherwise the native per-minute limit
+# applies. Env-overridable so the cap can be raised on a plan upgrade without a rebuild.
+_HL_RPS = int(os.environ.get("HYPERLIQUID_PERP_RATE_LIMIT_PER_S", "0") or "0")
+_ALL_PER_S = _HL_RPS > 0
+
 RATE_LIMITS = [
-    RateLimit(ALL_ENDPOINTS_LIMIT, limit=MAX_REQUEST, time_interval=60),
+    RateLimit(ALL_ENDPOINTS_LIMIT, limit=(_HL_RPS if _ALL_PER_S else MAX_REQUEST), time_interval=(1 if _ALL_PER_S else 60)),
 
     # Weight Limits for individual endpoints
     RateLimit(limit_id=SNAPSHOT_REST_URL, limit=MAX_REQUEST, time_interval=60,
