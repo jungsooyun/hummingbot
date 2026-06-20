@@ -118,6 +118,12 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             update_interval=update_interval,
             max_retries=max_retries,
         )
+        # Seam objects are built AFTER super() (they read self.config). The provider
+        # SNAPSHOTS side_aware_fx/static_fx_rate at construction; this is behavior-neutral
+        # only because neither field is hot-updatable (no is_updatable in the controller),
+        # so the executor config is created once and never mutated. If either field is
+        # ever made updatable, rebuild self._fair on update (else the cached FX behavior
+        # would diverge from config — a JEP-185-class money risk).
         self._calendar = KrxSessionCalendar()
         self._fair = FxBridgedFairSource(
             getattr(self.config, "side_aware_fx", True),
