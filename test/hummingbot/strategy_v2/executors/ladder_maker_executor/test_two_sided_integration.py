@@ -53,11 +53,14 @@ class LadderMakerTwoSidedIntegrationTest(unittest.TestCase):
         eod_close_skew_bps: Decimal = Decimal("0"),
         max_close_cost_bps: Decimal = Decimal("0"),
         open_edge_vwap: Decimal = Decimal("8"),
+        fx: tuple = (Decimal("1"), Decimal("1")),
+        side_aware_fx: bool = True,
+        two_sided: bool = True,
     ) -> "LadderMakerExecutor":
         ex = LadderMakerExecutor.__new__(LadderMakerExecutor)
         ex.config = SimpleNamespace(
             observe=False,
-            two_sided=True,
+            two_sided=two_sided,
             total_size_cap=Decimal("2"),
             rungs=[
                 SimpleNamespace(
@@ -80,6 +83,8 @@ class LadderMakerTwoSidedIntegrationTest(unittest.TestCase):
             flatten_timeout_s=30.0,
             max_inventory=None,
             share_per_unit=Decimal("1"),
+            side_aware_fx=side_aware_fx,
+            static_fx_rate=None,
             hedge_max_slippage_bps=Decimal("30"),
             hedge_order_type=OrderType.LIMIT,
             min_reprice_interval_s=0.0,
@@ -117,6 +122,7 @@ class LadderMakerTwoSidedIntegrationTest(unittest.TestCase):
             side_effect=lambda side: FAIR_OPEN if side is Side.SELL else FAIR_CLOSE
         )
         ex._policy_side = MagicMock(return_value=Side.SELL)
+        ex._get_fx = MagicMock(return_value=fx)
         ex._strategy = SimpleNamespace(current_timestamp=current_timestamp)
         return ex
 
@@ -236,6 +242,97 @@ class LadderMakerTwoSidedIntegrationTest(unittest.TestCase):
             -eod.config.max_close_cost_bps,
             eod._open_edge_vwap + eod_close.edge_bps - eod.config.round_trip_cost_bps,
         )
+
+    def test_hedge_fill_fx_converts_krw_to_usd_in_spot_cash(self):
+        # JEP-185: a KRW hedge fill must be FX-converted before accruing _spot_cash,
+        # else _roundtrip PnL (USD _perp_cash + KRW _spot_cash) is off by ~fx (~1380x).
+        # Flat fx=1380: maker SELL 1 @ 60 USD (= 82800/1380) hedged BUY 1 @ 82800 KRW
+        # nets to exactly 0 round-trip PnL once converted.
+        ex = self._make_executor(fx=(Decimal("1380"), Decimal("1380")))
+        size = Decimal("1")
+
+        ex.maker_orders["open-1"] = _Tracked("open-1")
+        ex._maker_placed_edge_bps["open-1"] = Decimal("10")
+        ex.process_order_filled_event(None, None, _Ev("open-1", size, "60", TradeType.SELL))
+
+        ex._hedge_order_side["hedge-open-1"] = (TradeType.BUY, size)
+        ex._credit_hedge_fill("hedge-open-1", size, Decimal("82800"))
+
+        self.assertEqual(Decimal("0"), ex._unhedged_base_signed())
+        self.assertEqual(Decimal("0"), ex.get_net_pnl_quote())
+
+    def test_spot_cash_fx_is_side_aware(self):
+        # JEP-185: side-aware FX must MIRROR compute_fair_price's pairing so the
+        # round-trip nets at fair. maker SELL fair = kis_ask / fx_bid, so the paired
+        # hedge BUY (fills at kis_ask) must also divide by fx_bid (NOT fx_ask). With a
+        # bid/ask FX spread only the fx_bid choice nets to 0; fx_ask leaves a residual.
+        ex = self._make_executor(fx=(Decimal("1380"), Decimal("1392")), side_aware_fx=True)
+        size = Decimal("1")
+
+        # maker SELL fair = kis_ask / fx_bid = 82800 / 1380 = 60 (USD)
+        ex.maker_orders["open-1"] = _Tracked("open-1")
+        ex._maker_placed_edge_bps["open-1"] = Decimal("10")
+        ex.process_order_filled_event(None, None, _Ev("open-1", size, "60", TradeType.SELL))
+
+        # hedge BUY fills at kis_ask = 82800 KRW; correct conversion -> /fx_bid (1380) = 60.
+        ex._hedge_order_side["hedge-open-1"] = (TradeType.BUY, size)
+        ex._credit_hedge_fill("hedge-open-1", size, Decimal("82800"))
+
+        self.assertEqual(Decimal("0"), ex.get_net_pnl_quote())
+
+    def test_hedge_price_to_maker_quote_side_aware_both_sides(self):
+        # JEP-185 (F4): pin BOTH directions of the side-aware FX mapping.
+        # hedge BUY pairs with maker SELL (fair kis_ask/fx_bid) -> divide by fx_bid;
+        # hedge SELL pairs with maker BUY (fair kis_bid/fx_ask) -> divide by fx_ask.
+        ex = self._make_executor(fx=(Decimal("1380"), Decimal("1392")), side_aware_fx=True)
+        self.assertEqual(
+            Decimal("82800") / Decimal("1380"),
+            ex._hedge_price_to_maker_quote(Decimal("82800"), TradeType.BUY),
+        )
+        self.assertEqual(
+            Decimal("82800") / Decimal("1392"),
+            ex._hedge_price_to_maker_quote(Decimal("82800"), TradeType.SELL),
+        )
+
+    def test_hedge_price_to_maker_quote_mid_when_not_side_aware(self):
+        # side_aware_fx=False mirrors compute_fair_price: use the mid rate for both sides.
+        ex = self._make_executor(fx=(Decimal("1380"), Decimal("1392")), side_aware_fx=False)
+        mid = (Decimal("1380") + Decimal("1392")) / Decimal("2")
+        self.assertEqual(
+            Decimal("82800") / mid,
+            ex._hedge_price_to_maker_quote(Decimal("82800"), TradeType.BUY),
+        )
+        self.assertEqual(
+            Decimal("82800") / mid,
+            ex._hedge_price_to_maker_quote(Decimal("82800"), TradeType.SELL),
+        )
+
+    def test_hedge_price_to_maker_quote_skips_on_missing_fx(self):
+        # JEP-185 (F1): with NO FX (live AND static both unavailable) the override must NOT
+        # book raw KRW as USD; it returns 0 (skip the quote accrual) instead of identity.
+        ex = self._make_executor()
+        ex._get_fx = MagicMock(return_value=(None, None))
+        self.assertEqual(
+            Decimal("0"),
+            ex._hedge_price_to_maker_quote(Decimal("82800"), TradeType.BUY),
+        )
+
+    def test_single_sided_matched_pnl_fx_converts(self):
+        # JEP-185 (F2): the single-sided (two_sided=False) matched path derives hedge_avg
+        # from _hedge_executed_quote / _hedge_executed_base. Without FX-converting
+        # _hedge_executed_quote it carries KRW against the USD maker_avg (~1380x error).
+        ex = self._make_executor(two_sided=False, fx=(Decimal("1380"), Decimal("1380")))
+        size = Decimal("1")
+
+        ex.maker_orders["open-1"] = _Tracked("open-1")
+        ex._maker_placed_edge_bps["open-1"] = Decimal("10")
+        ex.process_order_filled_event(None, None, _Ev("open-1", size, "60", TradeType.SELL))
+
+        ex._hedge_order_side["hedge-open-1"] = (TradeType.BUY, size)
+        ex._credit_hedge_fill("hedge-open-1", size, Decimal("82800"))
+
+        # maker_avg = 60 (USD); hedge_avg must be 82800/1380 = 60 (USD), not 82800 (KRW).
+        self.assertEqual(Decimal("0"), ex.get_net_pnl_quote())
 
 
 if __name__ == "__main__":

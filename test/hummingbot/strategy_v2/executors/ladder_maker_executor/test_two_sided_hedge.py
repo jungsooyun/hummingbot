@@ -44,6 +44,8 @@ class LadderMakerTwoSidedHedgeTest(unittest.TestCase):
         ex = LadderMakerExecutor.__new__(LadderMakerExecutor)
         ex.config = SimpleNamespace(
             share_per_unit=share_per_unit,
+            side_aware_fx=True,
+            static_fx_rate=None,
             hedge_max_slippage_bps=Decimal("30"),
             hedge_tick=Decimal("1"),
             hedge_order_type=OrderType.LIMIT,

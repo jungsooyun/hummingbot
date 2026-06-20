@@ -569,13 +569,16 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
     def _signed_base(side: TradeType, amount: Decimal) -> Decimal:
         return amount if side == TradeType.BUY else -amount
 
-    def _hedge_price_to_maker_quote(self, price: Decimal) -> Decimal:
+    def _hedge_price_to_maker_quote(self, price: Decimal, side: TradeType) -> Decimal:
         """Convert a hedge-leg fill price into the maker-leg quote unit.
 
         Default identity: the base is a generic two-venue machine, and tests inject
         pre-converted prices. ``LadderMakerExecutor`` overrides this to divide a KRW
-        spot fill by the fill-time FX rate so ``_spot_cash`` accrues in USD (the maker
-        leg's quote), keeping the round-trip PnL single-currency.
+        spot fill by the fill-time, side-aware FX rate so ``_spot_cash`` accrues in USD
+        (the maker leg's quote), keeping the round-trip PnL single-currency. ``side`` is
+        the hedge fill side, threaded so the override can mirror ``compute_fair_price``'s
+        side-aware FX pairing (hedge BUY <-> maker SELL fx_bid; hedge SELL <-> maker BUY
+        fx_ask).
         """
         return price
 
@@ -602,9 +605,11 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         ``_pending_hedge_signed``) net against ``_perp_net`` in the SAME unit. Without this
         seam a ``share_per_unit != 1`` hedge fill would credit shares into a units-denominated
         signed pending queue and flip its sign (the old non-negative ``_pending_hedge_base``
-        masked this by clamping at 0). The notional accumulators (``_hedge_executed_*`` /
-        ``_spot_cash``) intentionally keep the RAW hedge amount — they are money, not delta
-        units — so legacy matched PnL stays byte-identical.
+        masked this by clamping at 0). The notional accumulators (``_hedge_executed_quote``
+        / ``_spot_cash``) keep the RAW hedge BASE amount but pass the PRICE through
+        ``_hedge_price_to_maker_quote`` (identity in the base; KRW->USD side-aware FX in the
+        ladder, JEP-185) — so the generic / fx=1 legacy matched PnL stays byte-identical
+        while a KRW hedge leg accrues quote in the maker leg's currency.
         """
         return amount
 
@@ -663,12 +668,14 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         # _spot_net nets against _perp_net in one unit (see _hedge_base_to_maker_base).
         self._hedge_executed_base += delta
         if price is not None and not price.is_nan():
-            self._hedge_executed_quote += delta * price
-            self._spot_cash += (
-                self._hedge_price_to_maker_quote(price)
-                * delta
-                * (ONE if side == TradeType.SELL else -ONE)
-            )
+            # JEP-185: convert the hedge fill price to the maker quote unit ONCE and use it
+            # for BOTH notional accumulators, so neither carries the hedge's native
+            # currency. Base default is identity (generic two-venue / fx=1); the ladder
+            # override divides KRW by the side-aware FX. This keeps the matched
+            # (single-sided) ``hedge_avg`` AND the two-sided ``_spot_cash`` single-currency.
+            quote_px = self._hedge_price_to_maker_quote(price, side)
+            self._hedge_executed_quote += delta * quote_px
+            self._spot_cash += quote_px * delta * (ONE if side == TradeType.SELL else -ONE)
         maker_base = self._hedge_base_to_maker_base(delta)
         self._record_hedge_fill_side(side, maker_base)
         self._pending_hedge_signed += self._signed_base(side, maker_base)
@@ -1143,6 +1150,10 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             if self._maker_executed_base > ZERO
             else ZERO
         )
+        # hedge_avg divides the (maker-quote, JEP-185) hedge notional by the RAW hedge
+        # base (e.g. KIS shares). This single-sided matched PnL therefore assumes one hedge
+        # unit == one maker unit (share_per_unit == 1), which the HIP3-KIS controller
+        # enforces via validator; share_per_unit != 1 would be unit-inconsistent here.
         hedge_avg = (
             self._hedge_executed_quote / self._hedge_executed_base
             if self._hedge_executed_base > ZERO
