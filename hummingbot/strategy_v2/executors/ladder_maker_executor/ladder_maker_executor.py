@@ -19,7 +19,6 @@ plumbed yet); for now the chain holds ``KillSwitchGate`` and the fair-price
 readiness check is kept as an explicit data gate to preserve current behavior.
 """
 import logging
-from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Dict, List, Optional
 
@@ -38,16 +37,14 @@ from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import
     apply_inventory_skew,
     build_ladder_targets,
     build_two_sided_targets,
-    compute_eod_pressure,
     compute_fair_price,
     compute_hedge_order,
 )
+from hummingbot.strategy_v2.executors.ladder_maker_executor.session_calendar import KrxSessionCalendar
 from hummingbot.strategy_v2.gates.gate_chain import GateChain, GateContext, InventoryGate, KillSwitchGate
 from hummingbot.strategy_v2.models.executors import TrackedOrder
 
 ZERO = Decimal("0")
-_KST = timezone(timedelta(hours=9))
-_KRX_CLOSE_MIN = 15 * 60 + 30  # 15:30 KST
 
 
 def _fmt_num(x) -> Optional[str]:
@@ -121,6 +118,7 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             update_interval=update_interval,
             max_retries=max_retries,
         )
+        self._calendar = KrxSessionCalendar()
 
     # ------------------------------------------------------------------ gates
 
@@ -139,7 +137,7 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         if getattr(self, "_seed_fail_closed", False):
             return False
         ctx = GateContext(
-            now_kst=datetime.fromtimestamp(self._strategy.current_timestamp, tz=_KST),
+            now_kst=self._calendar.now(self._strategy.current_timestamp),
             kis_age_s=0.0,  # feed-age gates land in JEP-133
             hl_age_s=0.0,
             fx_age_s=0.0,
@@ -206,11 +204,7 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
 
     def _compute_eod_pressure(self) -> Decimal:
         wind = getattr(self.config, "eod_wind_minutes", 0)
-        if not wind or wind <= 0:
-            return ZERO
-        now = datetime.fromtimestamp(self._strategy.current_timestamp, tz=_KST)
-        now_kst_min = now.hour * 60 + now.minute
-        return compute_eod_pressure(now_kst_min, _KRX_CLOSE_MIN, wind)
+        return self._calendar.eod_pressure(self._strategy.current_timestamp, wind)
 
     def _effective_wind_down(self) -> bool:
         return bool(getattr(self.config, "wind_down", False)) or getattr(self, "_flatten_on_stop", False)

@@ -99,6 +99,9 @@ class LadderMakerGracefulFlattenTest(unittest.TestCase):
         ex._process_hedges = MagicMock()
         ex._reconcile_maker = MagicMock()
         ex._cancel_all_maker = MagicMock()
+        from hummingbot.strategy_v2.executors.ladder_maker_executor.session_calendar import KrxSessionCalendar
+
+        ex._calendar = KrxSessionCalendar()
         return ex
 
     def _resting(self, order_id: str = "OID-OPEN", side: TradeType = TradeType.SELL):

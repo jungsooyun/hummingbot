@@ -74,6 +74,9 @@ class LadderMakerTwoSidedObserveTest(unittest.TestCase):
         ex._open_edge_vwap = Decimal("0")
         ex._pending_hedge_signed = Decimal("-0.003")
         ex._maker_executed_base = Decimal("0")
+        from hummingbot.strategy_v2.executors.ladder_maker_executor.session_calendar import KrxSessionCalendar
+
+        ex._calendar = KrxSessionCalendar()
         return ex
 
     def test_two_sided_observe_emits_open_and_close_zero_submit(self):

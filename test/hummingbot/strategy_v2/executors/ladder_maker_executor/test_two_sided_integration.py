@@ -124,6 +124,9 @@ class LadderMakerTwoSidedIntegrationTest(unittest.TestCase):
         ex._policy_side = MagicMock(return_value=Side.SELL)
         ex._get_fx = MagicMock(return_value=fx)
         ex._strategy = SimpleNamespace(current_timestamp=current_timestamp)
+        from hummingbot.strategy_v2.executors.ladder_maker_executor.session_calendar import KrxSessionCalendar
+
+        ex._calendar = KrxSessionCalendar()
         return ex
 
     def test_open_close_reopen_roundtrip(self):

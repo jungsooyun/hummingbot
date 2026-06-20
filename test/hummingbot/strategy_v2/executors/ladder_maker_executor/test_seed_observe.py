@@ -97,6 +97,9 @@ def _make_observe_executor(*, adopt: bool) -> LadderMakerExecutor:
     ex._gates_open = MagicMock(return_value=True)
     ex._should_reprice = MagicMock(return_value=True)
     ex.logger = MagicMock(return_value=MagicMock())
+    from hummingbot.strategy_v2.executors.ladder_maker_executor.session_calendar import KrxSessionCalendar
+
+    ex._calendar = KrxSessionCalendar()
     return ex
 
 
