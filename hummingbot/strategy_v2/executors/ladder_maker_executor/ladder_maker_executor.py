@@ -216,6 +216,7 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         return bool(getattr(self.config, "wind_down", False)) or getattr(self, "_flatten_on_stop", False)
 
     def _compute_targets(self) -> List:
+        rec = getattr(self, "_latency_recorder", None)
         side = self._policy_side()
         fair = self._compute_fair(side)
         if fair is None:
@@ -225,7 +226,9 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             for r in self.config.rungs
         ]
         if not self._is_two_sided():
-            return build_ladder_targets(
+            if rec is not None:
+                rec.mark("fair")
+            targets = build_ladder_targets(
                 fair=fair,
                 rungs=rungs,
                 total_size_cap=self.config.total_size_cap,
@@ -237,11 +240,16 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
                 cost_bps=self.config.round_trip_cost_bps,
                 current_position=self._maker_executed_base,
             )
+            if rec is not None:
+                rec.mark("targets")
+            return targets
         state = self._two_sided_state()
         close_side = Side.BUY if side is Side.SELL else Side.SELL
         fair_close = self._compute_fair(close_side)
         if fair_close is None:
             return []
+        if rec is not None:
+            rec.mark("fair")
         tst: TwoSidedTargets = build_two_sided_targets(
             fair_open=fair,
             fair_close=fair_close,
@@ -260,6 +268,8 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             buffer_ticks=self.config.buffer_ticks,
             wind_down=self._effective_wind_down(),
         )
+        if rec is not None:
+            rec.mark("targets")
         return list(tst.open) + list(tst.close)
 
     def _two_sided_state(self) -> Dict[str, Decimal]:
