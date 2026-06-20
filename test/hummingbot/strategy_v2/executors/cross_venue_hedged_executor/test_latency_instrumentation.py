@@ -97,3 +97,14 @@ def test_on_stop_closes_recorder():
 def test_on_stop_noop_when_recorder_absent():
     h = _Harness(recorder=None, observe=True)
     h.on_stop()                             # must not raise when profiling is off
+
+
+def test_reconcile_survives_freshness_raising():
+    out, clk = [], _Clock(0.0)
+    rec = LatencyRecorder(symbol="EWY-USD", sink=out.append, perf_counter=clk)
+    h = _Harness(recorder=rec, observe=True)
+    def boom(c, p):
+        raise RuntimeError("md broken")
+    h._strategy.market_data_provider.get_order_book_freshness_sec = boom
+    h._reconcile_maker()
+    assert h._placed == [["T"]]

@@ -352,12 +352,15 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         """
         rec = getattr(self, "_latency_recorder", None)
         if rec is not None:
-            rec.tick_start(
-                maker_freshness_ms=self._book_freshness_ms(self.maker_connector, self.maker_trading_pair),
-                fair_freshness_ms=self._book_freshness_ms(self.hedge_connector, self.hedge_trading_pair),
-                two_sided=self._is_two_sided(),
-                ts_wall=self._strategy.current_timestamp,
-            )
+            try:
+                rec.tick_start(
+                    maker_freshness_ms=self._book_freshness_ms(self.maker_connector, self.maker_trading_pair),
+                    fair_freshness_ms=self._book_freshness_ms(self.hedge_connector, self.hedge_trading_pair),
+                    two_sided=self._is_two_sided(),
+                    ts_wall=self._strategy.current_timestamp,
+                )
+            except Exception:
+                rec = None
         try:
             targets = self._compute_targets()
             if rec is not None:
@@ -417,15 +420,15 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                 rec.tick_end()
 
     def _book_freshness_ms(self, connector_name: str, trading_pair: str):
-        """Monotonic book age in ms (JEP-184); None when unavailable. Read-only."""
-        mdp = getattr(self._strategy, "market_data_provider", None)
-        if mdp is None:
-            return None
+        """Monotonic book age in ms (JEP-184); None when unavailable. Read-only, never raises."""
         try:
+            mdp = getattr(self._strategy, "market_data_provider", None)
+            if mdp is None:
+                return None
             sec = mdp.get_order_book_freshness_sec(connector_name, trading_pair)
+            return None if sec is None else float(sec) * 1000.0
         except Exception:
             return None
-        return None if sec is None else sec * 1000.0
 
     def _resting_maker_orders(self) -> List[RestingOrder]:
         conn = self.connectors[self.maker_connector]

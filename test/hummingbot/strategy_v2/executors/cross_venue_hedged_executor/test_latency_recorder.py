@@ -116,3 +116,20 @@ def test_offloop_close_drains_and_joins_under_saturation(tmp_path):
     rec.close()                                                      # must not hang
     assert not any(t.name == "mm_latency_SAT" and t.is_alive() for t in _t.enumerate())
     assert path.exists()
+
+
+def test_close_unregisters_atexit(tmp_path, monkeypatch):
+    import hummingbot.strategy_v2.executors.cross_venue_hedged_executor.latency_recorder as mod
+    registered, unregistered = [], []
+    monkeypatch.setattr(mod.atexit, "register", lambda fn: registered.append(fn))
+    monkeypatch.setattr(mod.atexit, "unregister", lambda fn: unregistered.append(fn))
+    rec = LatencyRecorder(symbol="AT", log_path=str(tmp_path / "x.jsonl"), perf_counter=_Clock(0.0))
+    assert rec.close in registered
+    rec.close()
+    assert rec.close in unregistered
+
+
+def test_default_log_path_includes_pid():
+    import os
+    from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.latency_recorder import _default_log_path
+    assert _default_log_path("EWY-USD").endswith(f"mm_latency_EWY-USD_{os.getpid()}.jsonl")

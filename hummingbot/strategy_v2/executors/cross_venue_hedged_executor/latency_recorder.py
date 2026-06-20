@@ -44,7 +44,7 @@ def _default_log_path(symbol: str) -> str:
         os.makedirs(base, exist_ok=True)
     except Exception:
         pass
-    return os.path.join(base, f"mm_latency_{safe}.jsonl")
+    return os.path.join(base, f"mm_latency_{safe}_{os.getpid()}.jsonl")
 
 
 def _make_file_sink(symbol: str, log_path: str, queue_maxsize: int = 10000):
@@ -211,6 +211,10 @@ class LatencyRecorder:
         if self._closed:                            # idempotent: on_stop + atexit may both call
             return
         self._closed = True
+        try:
+            atexit.unregister(self.close)
+        except Exception:
+            pass
         try:
             if self._closer is not None:
                 self._closer()
