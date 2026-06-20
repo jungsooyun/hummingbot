@@ -66,7 +66,14 @@ def _make_executor():
     ex.connectors = {"kis": hedge_conn, "hyperliquid_perpetual": maker_conn}
 
     # Spread FX: mocked at the CURRENT _get_fx location (Task 3 repoints to ex._fair._get_fx).
-    ex._get_fx = MagicMock(return_value=(FX_BID, FX_ASK))
+    from hummingbot.strategy_v2.executors.ladder_maker_executor.fx_bridged_fair_source import FxBridgedFairSource
+
+    ex._fair = FxBridgedFairSource(
+        getattr(ex.config, "side_aware_fx", True),
+        getattr(ex.config, "static_fx_rate", None),
+        LadderMakerExecutor.logger(),
+    )
+    ex._fair._get_fx = MagicMock(return_value=(FX_BID, FX_ASK))
     ex._unhedged_base_signed = MagicMock(return_value=Decimal("0"))
     ex._policy_side = MagicMock(return_value=Side.SELL)
     ex._maker_executed_base = Decimal("0")

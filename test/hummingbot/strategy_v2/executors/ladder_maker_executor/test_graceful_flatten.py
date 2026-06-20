@@ -99,6 +99,13 @@ class LadderMakerGracefulFlattenTest(unittest.TestCase):
         ex._process_hedges = MagicMock()
         ex._reconcile_maker = MagicMock()
         ex._cancel_all_maker = MagicMock()
+        from hummingbot.strategy_v2.executors.ladder_maker_executor.fx_bridged_fair_source import FxBridgedFairSource
+
+        ex._fair = FxBridgedFairSource(
+            getattr(ex.config, "side_aware_fx", True),
+            getattr(ex.config, "static_fx_rate", None),
+            LadderMakerExecutor.logger(),
+        )
         from hummingbot.strategy_v2.executors.ladder_maker_executor.session_calendar import KrxSessionCalendar
 
         ex._calendar = KrxSessionCalendar()

@@ -30,6 +30,7 @@ from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.cross_venue_he
     CrossVenueHedgedExecutorBase,
 )
 from hummingbot.strategy_v2.executors.ladder_maker_executor.data_types import LadderMakerExecutorConfig
+from hummingbot.strategy_v2.executors.ladder_maker_executor.fx_bridged_fair_source import FxBridgedFairSource
 from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import (
     RungSpec,
     Side,
@@ -37,7 +38,6 @@ from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import
     apply_inventory_skew,
     build_ladder_targets,
     build_two_sided_targets,
-    compute_fair_price,
     compute_hedge_order,
 )
 from hummingbot.strategy_v2.executors.ladder_maker_executor.session_calendar import KrxSessionCalendar
@@ -119,6 +119,11 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             max_retries=max_retries,
         )
         self._calendar = KrxSessionCalendar()
+        self._fair = FxBridgedFairSource(
+            getattr(self.config, "side_aware_fx", True),
+            getattr(self.config, "static_fx_rate", None),
+            self.logger(),
+        )
 
     # ------------------------------------------------------------------ gates
 
@@ -156,38 +161,15 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
 
     # ------------------------------------------------------------------ fair price
 
-    def _get_fx(self):
-        """Live blended USD/KRW from the process-wide FairFxSource (JEP-148).
-
-        Preserves the ``(Optional[Decimal], Optional[Decimal])`` contract that
-        ``_compute_fair`` unpacks: the singleton's ``None`` (stale/never-fetched
-        bank) maps to ``(None, None)`` so the fair gate closes. ``fx_connector`` /
-        ``fx_trading_pair`` still register the USDT-KRW market for subscription
-        (the source reads it via the script's getter). ``static_fx_rate`` remains a
-        guarded offline/test fallback ONLY — never the live path.
-        """
-        from hummingbot.data_feed.fair_fx.fair_fx_source import FairFxSource
-
-        quote = FairFxSource.get_instance().get_fx()
-        if quote is not None:
-            return quote
-        if self.config.static_fx_rate and self.config.static_fx_rate > ZERO:
-            rate = self.config.static_fx_rate
-            return rate, rate
-        return None, None
-
     def _compute_fair(self, side: Side) -> Optional[Decimal]:
         kis = self.connectors[self.hedge_connector]
         bid = kis.get_price_by_type(self.hedge_trading_pair, PriceType.BestBid)
         ask = kis.get_price_by_type(self.hedge_trading_pair, PriceType.BestAsk)
         if not bid or not ask or bid <= ZERO or ask <= ZERO:
             return None
-        fx_bid, fx_ask = self._get_fx()
-        if fx_bid is None or fx_ask is None:
+        fair = self._fair.fair_from_book(Decimal(str(bid)), Decimal(str(ask)), side)
+        if fair is None:
             return None
-        fair = compute_fair_price(
-            Decimal(str(bid)), Decimal(str(ask)), fx_bid, fx_ask, side, self.config.side_aware_fx
-        )
         return apply_inventory_skew(
             fair,
             self._unhedged_base_signed(),
@@ -472,7 +454,7 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         kis = self.connectors[self.hedge_connector]
         bid = kis.get_price_by_type(self.hedge_trading_pair, PriceType.BestBid)
         ask = kis.get_price_by_type(self.hedge_trading_pair, PriceType.BestAsk)
-        fx_bid, fx_ask = self._get_fx()
+        fx_bid, fx_ask = self._fair.observe_fx_legs()
         fair = self._compute_fair(self._policy_side())
         conn = self.connectors[self.maker_connector]
         if self._is_two_sided():
@@ -600,42 +582,8 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         return amount
 
     def _hedge_price_to_maker_quote(self, price: Decimal, side: TradeType) -> Decimal:
-        """Convert a KRW hedge fill price into USD (maker quote) at the fill-time FX.
-
-        JEP-185: ``_spot_cash`` accrues hedge fills; the base identity would leave KRW
-        in a USD ledger and ``_roundtrip_net_pnl_quote`` (USD ``_perp_cash`` + KRW
-        ``_spot_cash``) would be off by ~FX (~1380x). The FX MIRRORS
-        ``compute_fair_price``'s side-aware pairing so the round-trip nets at fair: a
-        hedge BUY pairs with a maker SELL (fair = kis_ask / fx_bid) -> divide by
-        ``fx_bid``; a hedge SELL pairs with a maker BUY (fair = kis_bid / fx_ask) ->
-        divide by ``fx_ask``. ``side_aware_fx=False`` uses the mid rate for both, again
-        matching ``compute_fair_price``. FX unavailable (live AND static both gone) ->
-        skip this fill's quote accrual (return 0; inventory is still tracked by the caller)
-        and log an error, never booking raw KRW as USD; unreachable when ``static_fx_rate``
-        is configured (the live KIS config sets it).
-        """
-        fx_bid, fx_ask = self._get_fx()
-        if fx_bid is None or fx_ask is None or fx_bid <= ZERO or fx_ask <= ZERO:
-            # No FX at all (live AND static both unavailable): converting is impossible. We
-            # deliberately let the caller advance the BASE/inventory ledgers (the real
-            # filled position) but skip the QUOTE accrual (return 0), rather than (a) book
-            # raw KRW as USD (the ~1380x JEP-185 corruption) or (b) refuse the credit.
-            # Refusing would desync inventory from the real position and risk a DOUBLE
-            # hedge — a money error far worse than a flagged reporting gap. The skipped
-            # quote is unrecoverable (the fill watermark is consumed), so this is ERROR.
-            # Unreachable when static_fx_rate is set (live KIS config): _get_fx then returns
-            # the static rate and never None.
-            self.logger().error(
-                "JEP-185: FX unavailable at hedge-fill credit; skipping _spot_cash/quote "
-                "accrual for this fill (inventory still tracked) to avoid KRW-as-USD "
-                "corruption. PnL under-reports this leg. Check FairFxSource/static_fx_rate."
-            )
-            return ZERO
-        if getattr(self.config, "side_aware_fx", True):
-            fx = fx_bid if side == TradeType.BUY else fx_ask
-        else:
-            fx = (fx_bid + fx_ask) / Decimal("2")
-        return price / fx
+        """JEP-185 backward bridge -> FxBridgedFairSource (forward/backward pairing kept in one file)."""
+        return self._fair.hedge_price_to_maker_quote(price, side)
 
     # ------------------------------------------------------------------ balance hook
 

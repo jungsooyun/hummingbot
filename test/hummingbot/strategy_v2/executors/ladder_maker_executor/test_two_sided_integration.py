@@ -122,7 +122,14 @@ class LadderMakerTwoSidedIntegrationTest(unittest.TestCase):
             side_effect=lambda side: FAIR_OPEN if side is Side.SELL else FAIR_CLOSE
         )
         ex._policy_side = MagicMock(return_value=Side.SELL)
-        ex._get_fx = MagicMock(return_value=fx)
+        from hummingbot.strategy_v2.executors.ladder_maker_executor.fx_bridged_fair_source import FxBridgedFairSource
+
+        ex._fair = FxBridgedFairSource(
+            getattr(ex.config, "side_aware_fx", True),
+            getattr(ex.config, "static_fx_rate", None),
+            LadderMakerExecutor.logger(),
+        )
+        ex._fair._get_fx = MagicMock(return_value=fx)
         ex._strategy = SimpleNamespace(current_timestamp=current_timestamp)
         from hummingbot.strategy_v2.executors.ladder_maker_executor.session_calendar import KrxSessionCalendar
 
@@ -314,7 +321,7 @@ class LadderMakerTwoSidedIntegrationTest(unittest.TestCase):
         # JEP-185 (F1): with NO FX (live AND static both unavailable) the override must NOT
         # book raw KRW as USD; it returns 0 (skip the quote accrual) instead of identity.
         ex = self._make_executor()
-        ex._get_fx = MagicMock(return_value=(None, None))
+        ex._fair._get_fx = MagicMock(return_value=(None, None))
         self.assertEqual(
             Decimal("0"),
             ex._hedge_price_to_maker_quote(Decimal("82800"), TradeType.BUY),

@@ -73,7 +73,14 @@ def _make_observe_executor(*, adopt: bool) -> LadderMakerExecutor:
     ex._status = RunnableStatus.RUNNING
     ex._compute_fair = MagicMock(return_value=Decimal("100"))
     ex._policy_side = MagicMock(return_value=Side.SELL)
-    ex._get_fx = MagicMock(return_value=(Decimal("1300"), Decimal("1301")))
+    from hummingbot.strategy_v2.executors.ladder_maker_executor.fx_bridged_fair_source import FxBridgedFairSource
+
+    ex._fair = FxBridgedFairSource(
+        getattr(ex.config, "side_aware_fx", True),
+        getattr(ex.config, "static_fx_rate", None),
+        LadderMakerExecutor.logger(),
+    )
+    ex._fair._get_fx = MagicMock(return_value=(Decimal("1300"), Decimal("1301")))
     ex._unhedged_base_signed = LadderMakerExecutor._unhedged_base_signed.__get__(ex, LadderMakerExecutor)
     ex._paired_oi = LadderMakerExecutor._paired_oi.__get__(ex, LadderMakerExecutor)
     ex._open_edge_vwap = Decimal("0")

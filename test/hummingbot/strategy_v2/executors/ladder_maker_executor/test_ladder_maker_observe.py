@@ -47,7 +47,14 @@ class LadderMakerObserveTest(unittest.TestCase):
         ex._strategy = SimpleNamespace(current_timestamp=1000.0)
         ex._compute_fair = MagicMock(return_value=Decimal("1595.2"))
         ex._policy_side = MagicMock(return_value=None)
-        ex._get_fx = MagicMock(return_value=(Decimal("1514.1"), Decimal("1514.2")))
+        from hummingbot.strategy_v2.executors.ladder_maker_executor.fx_bridged_fair_source import FxBridgedFairSource
+
+        ex._fair = FxBridgedFairSource(
+            getattr(ex.config, "side_aware_fx", True),
+            getattr(ex.config, "static_fx_rate", None),
+            LadderMakerExecutor.logger(),
+        )
+        ex._fair._get_fx = MagicMock(return_value=(Decimal("1514.1"), Decimal("1514.2")))
         conn.get_price_by_type.side_effect = lambda pair, ptype: Decimal("244000")
         return ex
 

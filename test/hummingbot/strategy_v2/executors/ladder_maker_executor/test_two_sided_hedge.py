@@ -78,6 +78,13 @@ class LadderMakerTwoSidedHedgeTest(unittest.TestCase):
         ex._open_edge_notional_bps = Decimal("0")
         ex._open_edge_vwap = Decimal("0")
         ex._update_tracked = MagicMock()
+        from hummingbot.strategy_v2.executors.ladder_maker_executor.fx_bridged_fair_source import FxBridgedFairSource
+
+        ex._fair = FxBridgedFairSource(
+            getattr(ex.config, "side_aware_fx", True),
+            getattr(ex.config, "static_fx_rate", None),
+            LadderMakerExecutor.logger(),
+        )
 
         kis = MagicMock()
         kis.quantize_order_amount.side_effect = lambda pair, amount: amount
