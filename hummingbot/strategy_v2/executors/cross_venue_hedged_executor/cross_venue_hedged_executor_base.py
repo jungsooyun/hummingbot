@@ -197,6 +197,17 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         # venue returns. Reversible (an operator can clear it) -> a false trip is conservative.
         self._hedge_kill_switch = False
 
+        # JEP-184: read-only per-tick latency profiling (off unless config opts in).
+        self._latency_recorder = None
+        if getattr(config, "latency_profiling", False):
+            try:
+                from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.latency_recorder import (
+                    LatencyRecorder,
+                )
+                self._latency_recorder = LatencyRecorder(symbol=maker_market.trading_pair)
+            except Exception:
+                self._latency_recorder = None
+
         subscribed = [self.maker_connector, self.hedge_connector]
         for extra in connectors or []:
             if extra and extra not in subscribed:
@@ -208,6 +219,12 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             config=config,
             update_interval=update_interval,
         )
+
+    def on_stop(self):
+        super().on_stop()
+        rec = getattr(self, "_latency_recorder", None)
+        if rec is not None:
+            rec.close()
 
     # ============================================================ abstract hooks
 
@@ -333,50 +350,82 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         Cancel-all is retained on ``_cancel_all_maker`` for the gates-closed (kill-switch)
         and wind_down paths, which deliberately do NOT partial-diff.
         """
-        targets = self._compute_targets()
-        if not self._should_reprice(targets):
-            return
-        if getattr(self.config, "observe", False):
-            self._place_targets(targets)
-            return
-        if hasattr(self, "_maker_placed_rung"):
-            # Bound to ACTIVE makers only (inflight: order is None, or open). A filled maker
-            # stays in maker_orders (pre-existing retention), but its rung is never read again
-            # — only inflight rungs are injected into the diff — so dropping it here caps
-            # _maker_placed_rung at the live+inflight order count instead of tracking the
-            # unbounded maker_orders retention (JEP-145 adversarial review, MEDIUM).
-            active_ids = {oid for oid, o in self.maker_orders.items() if o.order is None or o.order.is_open}
-            self._maker_placed_rung = {
-                oid: rung for oid, rung in self._maker_placed_rung.items() if oid in active_ids
+        rec = getattr(self, "_latency_recorder", None)
+        if rec is not None:
+            rec.tick_start(
+                maker_freshness_ms=self._book_freshness_ms(self.maker_connector, self.maker_trading_pair),
+                fair_freshness_ms=self._book_freshness_ms(self.hedge_connector, self.hedge_trading_pair),
+                two_sided=self._is_two_sided(),
+                ts_wall=self._strategy.current_timestamp,
+            )
+        try:
+            targets = self._compute_targets()
+            if rec is not None:
+                rec.mark("compute")
+            reprice = self._should_reprice(targets)
+            if rec is not None:
+                rec.mark("decision")
+            if not reprice:
+                return
+            if getattr(self.config, "observe", False):
+                self._place_targets(targets)
+                if rec is not None:
+                    rec.mark("submit")
+                return
+            if hasattr(self, "_maker_placed_rung"):
+                # Bound to ACTIVE makers only (inflight: order is None, or open). A filled maker
+                # stays in maker_orders (pre-existing retention), but its rung is never read again
+                # — only inflight rungs are injected into the diff — so dropping it here caps
+                # _maker_placed_rung at the live+inflight order count instead of tracking the
+                # unbounded maker_orders retention (JEP-145 adversarial review, MEDIUM).
+                active_ids = {oid for oid, o in self.maker_orders.items() if o.order is None or o.order.is_open}
+                self._maker_placed_rung = {
+                    oid: rung for oid, rung in self._maker_placed_rung.items() if oid in active_ids
+                }
+            inflight_ids = {oid for oid, o in self.maker_orders.items() if o.order is None}
+            resting = self._resting_maker_orders()
+            for oid in inflight_ids:
+                rung = getattr(self, "_maker_placed_rung", {}).get(oid)
+                if rung is None:
+                    continue
+                side, price, size = rung
+                resting.append(RestingOrder(order_id=oid, side=side, price=price, size=size))
+            diff = diff_ladder_targets(
+                resting,
+                targets,
+                self.config.maker_tick,
+                self.config.min_reprice_delta_ticks,
+            )
+            unmatched_inflight = [oid for oid in diff.to_cancel if oid in inflight_ids]
+            placed_rung = getattr(self, "_maker_placed_rung", {})
+            blocked_sides = {
+                placed_rung[oid][0]
+                for oid in unmatched_inflight
+                if oid in placed_rung
             }
-        inflight_ids = {oid for oid, o in self.maker_orders.items() if o.order is None}
-        resting = self._resting_maker_orders()
-        for oid in inflight_ids:
-            rung = getattr(self, "_maker_placed_rung", {}).get(oid)
-            if rung is None:
-                continue
-            side, price, size = rung
-            resting.append(RestingOrder(order_id=oid, side=side, price=price, size=size))
-        diff = diff_ladder_targets(
-            resting,
-            targets,
-            self.config.maker_tick,
-            self.config.min_reprice_delta_ticks,
-        )
-        unmatched_inflight = [oid for oid in diff.to_cancel if oid in inflight_ids]
-        placed_rung = getattr(self, "_maker_placed_rung", {})
-        blocked_sides = {
-            placed_rung[oid][0]
-            for oid in unmatched_inflight
-            if oid in placed_rung
-        }
-        to_place = [target for target in diff.to_place if target.side not in blocked_sides]
-        for oid in diff.to_cancel:
-            if oid in inflight_ids:
-                continue
-            self._strategy.cancel(self.maker_connector, self.maker_trading_pair, oid)
-        self._place_targets_subset(to_place)
-        self._last_reprice_ts = self._strategy.current_timestamp
+            to_place = [target for target in diff.to_place if target.side not in blocked_sides]
+            for oid in diff.to_cancel:
+                if oid in inflight_ids:
+                    continue
+                self._strategy.cancel(self.maker_connector, self.maker_trading_pair, oid)
+            self._place_targets_subset(to_place)
+            if rec is not None:
+                rec.mark("submit")
+            self._last_reprice_ts = self._strategy.current_timestamp
+        finally:
+            if rec is not None:
+                rec.tick_end()
+
+    def _book_freshness_ms(self, connector_name: str, trading_pair: str):
+        """Monotonic book age in ms (JEP-184); None when unavailable. Read-only."""
+        mdp = getattr(self._strategy, "market_data_provider", None)
+        if mdp is None:
+            return None
+        try:
+            sec = mdp.get_order_book_freshness_sec(connector_name, trading_pair)
+        except Exception:
+            return None
+        return None if sec is None else sec * 1000.0
 
     def _resting_maker_orders(self) -> List[RestingOrder]:
         conn = self.connectors[self.maker_connector]
