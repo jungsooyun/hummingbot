@@ -140,6 +140,19 @@ class TestHip3KisLadderController(IsolatedAsyncioWrapperTestCase):
 
         self.assertIs(executor_config.adopt_existing_inventory, True)
 
+    def test_latency_profiling_defaults_false(self):
+        self.controller.executors_info = []
+        actions = self.controller.determine_executor_actions()
+        executor_config = actions[0].executor_config
+        self.assertIs(executor_config.latency_profiling, False)
+
+    def test_latency_profiling_passthrough(self):
+        self.config.latency_profiling = True
+        self.controller.executors_info = []
+        actions = self.controller.determine_executor_actions()
+        executor_config = actions[0].executor_config
+        self.assertIs(executor_config.latency_profiling, True)
+
     def test_determine_executor_actions_filters_done_through_real_base(self):
         # One running (not-done) + one terminated (done). The not-done lambda is
         # applied through the REAL ControllerBase.filter_executors. The single

@@ -77,4 +77,6 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
 
     # Display / bookkeeping
     adopt_existing_inventory: bool = False
+    # JEP-184: per-tick decision-pipeline latency profiling (read-only, off by default).
+    latency_profiling: bool = False
     execution_purpose: str = Field(default="ladder_market_making")
