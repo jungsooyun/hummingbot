@@ -250,3 +250,40 @@ def test_config_rejects_non_unit_share_per_unit():
 def test_config_rejects_negative_round_trip_cost():
     with pytest.raises(ValueError, match="round_trip_cost_bps"):
         Hip3KisLadderControllerConfig(id="t", round_trip_cost_bps=Decimal("-1"))
+
+
+def test_get_controller_class_resolves_concrete():
+    from controllers.generic.hip3_kis_ladder_controller import Hip3KisLadderController, Hip3KisLadderControllerConfig
+    assert Hip3KisLadderControllerConfig(id="x").get_controller_class() is Hip3KisLadderController
+
+
+def test_kis_config_reproduces_current_defaults():
+    from decimal import Decimal
+    from controllers.generic.hip3_kis_ladder_controller import Hip3KisLadderControllerConfig
+    c = Hip3KisLadderControllerConfig(id="x")
+    assert c.maker_connector == "hyperliquid_perpetual"
+    assert c.hedge_connector == "kis"
+    assert c.hedge_trading_pair == "069500-KRW"
+    assert c.static_fx_rate == Decimal("1380")
+    assert c.round_trip_cost_bps == Decimal("24.32792")
+    assert c.max_inventory == Decimal("8")
+    assert c.leverage == 1
+
+
+def test_ladder_validators_fire_on_subclass():
+    import pytest
+    from decimal import Decimal
+    from controllers.generic.hip3_kis_ladder_controller import Hip3KisLadderControllerConfig
+    from hummingbot.strategy_v2.executors.ladder_maker_executor.data_types import LadderRungConfig
+    with pytest.raises(ValueError, match="round_trip_cost_bps"):
+        Hip3KisLadderControllerConfig(id="x", round_trip_cost_bps=Decimal("-1"))
+    with pytest.raises(ValueError, match="share_per_unit"):
+        Hip3KisLadderControllerConfig(id="x", share_per_unit=Decimal("2"))
+    with pytest.raises(ValueError, match="rung size"):
+        Hip3KisLadderControllerConfig(id="x", rungs=[LadderRungConfig(edge_bps=Decimal("20"), size=Decimal("0"))])
+
+
+def test_framework_base_importable():
+    from hummingbot.strategy_v2.controllers.ladder_hedge_controller_base import (  # noqa: F401
+        LadderHedgeControllerBase, LadderHedgeControllerConfigBase,
+    )

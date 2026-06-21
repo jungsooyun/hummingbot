@@ -15,16 +15,18 @@ from typing import List, Optional
 
 from pydantic import Field, model_validator
 
-from hummingbot.core.data_type.common import MarketDict, TradeType
+from hummingbot.core.data_type.common import TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
-from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
+from hummingbot.strategy_v2.controllers.ladder_hedge_controller_base import (
+    LadderHedgeControllerBase,
+    LadderHedgeControllerConfigBase,
+)
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.executors.ladder_maker_executor.data_types import (
     LadderMakerExecutorConfig,
     LadderRungConfig,
 )
 from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_cost import KisHlCostModel
-from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction
 
 
 def _default_rungs() -> List[LadderRungConfig]:
@@ -36,7 +38,7 @@ def _default_rungs() -> List[LadderRungConfig]:
     ]
 
 
-class Hip3KisLadderControllerConfig(ControllerConfigBase):
+class Hip3KisLadderControllerConfig(LadderHedgeControllerConfigBase):
     controller_name: str = "hip3_kis_ladder_controller"
     controller_type: str = "generic"
     candles_config: List[CandlesConfig] = []
@@ -66,10 +68,7 @@ class Hip3KisLadderControllerConfig(ControllerConfigBase):
     )
 
     # FX (USD/KRW). Use an FX connector pair if available, else a static rate.
-    fx_connector: Optional[str] = None
-    fx_trading_pair: Optional[str] = None
     static_fx_rate: Optional[Decimal] = Field(default=Decimal("1380"))
-    side_aware_fx: bool = True
 
     # Inventory skew / gate
     inventory_skew_bps_per_unit: Decimal = Field(default=Decimal("2"), json_schema_extra={"is_updatable": True})
@@ -80,21 +79,6 @@ class Hip3KisLadderControllerConfig(ControllerConfigBase):
     share_per_unit: Decimal = Decimal("1")
     hedge_max_slippage_bps: Decimal = Field(default=Decimal("30"), json_schema_extra={"is_updatable": True})
 
-    # Perp leverage (HIP-3: isolated only)
-    leverage: int = 1
-
-    # Reprice guards
-    min_reprice_interval_s: float = 0.75
-    min_reprice_delta_ticks: Decimal = Decimal("2")
-
-    # Safety
-    kill_switch: bool = Field(default=False, json_schema_extra={"is_updatable": True})
-    # No-submit verification: executor computes fair + logs intended quotes, no orders.
-    observe: bool = Field(default=False, json_schema_extra={"is_updatable": True})
-    adopt_existing_inventory: bool = Field(default=False, json_schema_extra={"is_updatable": True})
-    # JEP-184: hot-editable so profiling can be toggled without a rebuild.
-    latency_profiling: bool = Field(default=False, json_schema_extra={"is_updatable": True})
-
     # Two-sided MM
     two_sided: bool = False
     k_open_skew_bps: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
@@ -104,9 +88,6 @@ class Hip3KisLadderControllerConfig(ControllerConfigBase):
     max_close_cost_bps: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
     wind_down: bool = Field(default=False, json_schema_extra={"is_updatable": True})
     flatten_timeout_s: float = Field(default=30.0, json_schema_extra={"is_updatable": True})
-
-    # One executor per controller (single-direction ladder per symbol)
-    max_executors: int = Field(default=1, json_schema_extra={"is_updatable": True})
 
     @model_validator(mode="after")
     def _validate_config(self):
@@ -132,75 +113,56 @@ class Hip3KisLadderControllerConfig(ControllerConfigBase):
                 raise ValueError(f"rung size must be > 0, got {r.size}")
         return self
 
-    def update_markets(self, markets: MarketDict) -> MarketDict:
-        markets.add_or_update(self.maker_connector, self.maker_trading_pair)
-        markets.add_or_update(self.hedge_connector, self.hedge_trading_pair)
-        if self.fx_connector and self.fx_trading_pair:
-            markets.add_or_update(self.fx_connector, self.fx_trading_pair)
-        return markets
 
-
-class Hip3KisLadderController(ControllerBase):
+class Hip3KisLadderController(LadderHedgeControllerBase):
     def __init__(self, config: Hip3KisLadderControllerConfig, *args, **kwargs):
         self.config = config
         super().__init__(config, *args, **kwargs)
 
-    async def update_processed_data(self):
-        pass
-
-    def determine_executor_actions(self) -> List[ExecutorAction]:
-        actions: List[ExecutorAction] = []
-        active = self.filter_executors(self.executors_info, filter_func=lambda e: not e.is_done)
-        if len(active) >= self.config.max_executors:
-            return actions
-
-        actions.append(CreateExecutorAction(
-            executor_config=LadderMakerExecutorConfig(
-                timestamp=self.market_data_provider.time(),
-                maker_market=ConnectorPair(
-                    connector_name=self.config.maker_connector,
-                    trading_pair=self.config.maker_trading_pair,
-                ),
-                hedge_market=ConnectorPair(
-                    connector_name=self.config.hedge_connector,
-                    trading_pair=self.config.hedge_trading_pair,
-                ),
-                entry_side=self.config.entry_side,
-                total_size_cap=self.config.total_size_cap,
-                rungs=self.config.rungs,
-                round_trip_cost_bps=self.config.round_trip_cost_bps,
-                maker_tick=self.config.maker_tick,
-                hedge_tick=self.config.hedge_tick,
-                buffer_ticks=self.config.buffer_ticks,
-                fx_connector=self.config.fx_connector,
-                fx_trading_pair=self.config.fx_trading_pair,
-                static_fx_rate=self.config.static_fx_rate,
-                side_aware_fx=self.config.side_aware_fx,
-                inventory_skew_bps_per_unit=self.config.inventory_skew_bps_per_unit,
-                target_inventory=self.config.target_inventory,
-                max_inventory=self.config.max_inventory,
-                share_per_unit=self.config.share_per_unit,
-                hedge_max_slippage_bps=self.config.hedge_max_slippage_bps,
-                min_reprice_interval_s=self.config.min_reprice_interval_s,
-                min_reprice_delta_ticks=self.config.min_reprice_delta_ticks,
-                leverage=self.config.leverage,
-                kill_switch=self.config.kill_switch,
-                observe=self.config.observe,
-                adopt_existing_inventory=self.config.adopt_existing_inventory,
-                latency_profiling=self.config.latency_profiling,
-                two_sided=self.config.two_sided,
-                k_open_skew_bps=self.config.k_open_skew_bps,
-                k_close_skew_bps=self.config.k_close_skew_bps,
-                eod_close_skew_bps=self.config.eod_close_skew_bps,
-                eod_wind_minutes=self.config.eod_wind_minutes,
-                max_close_cost_bps=self.config.max_close_cost_bps,
-                wind_down=self.config.wind_down,
-                flatten_timeout_s=self.config.flatten_timeout_s,
-                controller_id=self.config.id,
+    def _build_executor_config(self):
+        return LadderMakerExecutorConfig(
+            timestamp=self.market_data_provider.time(),
+            maker_market=ConnectorPair(
+                connector_name=self.config.maker_connector,
+                trading_pair=self.config.maker_trading_pair,
             ),
+            hedge_market=ConnectorPair(
+                connector_name=self.config.hedge_connector,
+                trading_pair=self.config.hedge_trading_pair,
+            ),
+            entry_side=self.config.entry_side,
+            total_size_cap=self.config.total_size_cap,
+            rungs=self.config.rungs,
+            round_trip_cost_bps=self.config.round_trip_cost_bps,
+            maker_tick=self.config.maker_tick,
+            hedge_tick=self.config.hedge_tick,
+            buffer_ticks=self.config.buffer_ticks,
+            fx_connector=self.config.fx_connector,
+            fx_trading_pair=self.config.fx_trading_pair,
+            static_fx_rate=self.config.static_fx_rate,
+            side_aware_fx=self.config.side_aware_fx,
+            inventory_skew_bps_per_unit=self.config.inventory_skew_bps_per_unit,
+            target_inventory=self.config.target_inventory,
+            max_inventory=self.config.max_inventory,
+            share_per_unit=self.config.share_per_unit,
+            hedge_max_slippage_bps=self.config.hedge_max_slippage_bps,
+            min_reprice_interval_s=self.config.min_reprice_interval_s,
+            min_reprice_delta_ticks=self.config.min_reprice_delta_ticks,
+            leverage=self.config.leverage,
+            kill_switch=self.config.kill_switch,
+            observe=self.config.observe,
+            adopt_existing_inventory=self.config.adopt_existing_inventory,
+            latency_profiling=self.config.latency_profiling,
+            two_sided=self.config.two_sided,
+            k_open_skew_bps=self.config.k_open_skew_bps,
+            k_close_skew_bps=self.config.k_close_skew_bps,
+            eod_close_skew_bps=self.config.eod_close_skew_bps,
+            eod_wind_minutes=self.config.eod_wind_minutes,
+            max_close_cost_bps=self.config.max_close_cost_bps,
+            wind_down=self.config.wind_down,
+            flatten_timeout_s=self.config.flatten_timeout_s,
             controller_id=self.config.id,
-        ))
-        return actions
+        )
 
     def to_format_status(self) -> List[str]:
         active = self.filter_executors(self.executors_info, filter_func=lambda e: not e.is_done)
