@@ -163,6 +163,22 @@ def test_positivity_nonfinite_suppresses_whole_tick(caplog):
     assert any("finite" in r.message.lower() for r in errs)
 
 
+def test_positivity_explicit_nonfinite_quantized_branch(monkeypatch, caplog):
+    # Defense-in-depth: as_policy's _require_finite rejects a non-finite σ INPUT, but if the
+    # CONNECTOR quantization itself yields a non-finite value the executor's OWN explicit
+    # positivity branch (the post-quantization is_finite() check) must suppress the whole tick
+    # + ERROR. This drives that branch directly (σ is finite, NaN injected at quantize), which
+    # the σ-NaN test cannot reach (challenge coverage gap).
+    import logging
+    caplog.set_level(logging.ERROR)
+    ex = _make_exec(sigma=Decimal("2"))
+    conn = ex.connectors[ex.maker_connector]
+    monkeypatch.setattr(conn, "quantize_order_price", lambda pair, price: Decimal("NaN"))
+    assert ex._compute_targets() == []
+    errs = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("non-finite" in r.message.lower() for r in errs)
+
+
 def test_positivity_negative_bid_drops_bid_keeps_ask():
     ex = _make_exec(cfg_overrides={"gamma": Decimal("50"), "min_spread_pct": Decimal("0")}, sigma=Decimal("10"))
     sides = {t.side for t in ex._compute_targets()}
