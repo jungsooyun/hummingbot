@@ -17,8 +17,18 @@ NEG_ONE = Decimal("-1")
 ONE_HUNDRED = Decimal("100")
 
 
+def _require_finite(**values: Decimal) -> None:
+    """Reject non-finite (NaN / +/-Infinity) inputs up front, before any sign/range
+    check. A NaN would pass the sign guards (``NaN < 0`` is False) and an Infinity
+    would emit +/-Inf or masked output silently — this is the fail-loud guard."""
+    for name, value in values.items():
+        if not value.is_finite():
+            raise ValueError(f"{name} must be finite, got {value}")
+
+
 def normalize_inventory(net: Decimal, target: Decimal, max_inventory: Decimal) -> Decimal:
-    """q = clamp((net - target) / max_inventory, -1, 1). Requires max_inventory > 0."""
+    """q = clamp((net - target) / max_inventory, -1, 1). Requires max_inventory > 0, finite inputs."""
+    _require_finite(net=net, target=target, max_inventory=max_inventory)
     if max_inventory <= ZERO:
         raise ValueError(f"max_inventory must be > 0, got {max_inventory}")
     q = (net - target) / max_inventory
@@ -33,6 +43,7 @@ def reservation_price(
     mid: Decimal, q: Decimal, gamma: Decimal, sigma: Decimal, tau: Decimal
 ) -> Decimal:
     """r = mid - q*gamma*sigma*tau  (reference .pyx:755). sigma=tick std; q in [-1, 1]."""
+    _require_finite(mid=mid, q=q, gamma=gamma, sigma=sigma, tau=tau)
     if mid <= ZERO:
         raise ValueError(f"mid must be > 0, got {mid}")
     if not (NEG_ONE <= q <= ONE):
@@ -54,6 +65,7 @@ def optimal_spread(
     NOTE: the second term uses the reference operation order ``2 * ln(...) / gamma``
     (NOT ``(2/gamma) * ln(...)``) so Decimal rounding matches the golden parity test.
     """
+    _require_finite(gamma=gamma, sigma=sigma, tau=tau, kappa=kappa)
     if gamma <= ZERO:
         raise ValueError(f"gamma must be > 0, got {gamma}")
     if kappa <= ZERO:
@@ -69,7 +81,15 @@ def clamp_quotes(
     mid: Decimal, reservation: Decimal, spread: Decimal, min_spread_pct: Decimal
 ) -> tuple[Decimal, Decimal]:
     """Returns (bid, ask). Raw A&S quotes reservation -/+ spread/2, floored to a
-    min-spread band measured from MID (reference .pyx:760-766)."""
+    min-spread band measured from MID (reference .pyx:760-766).
+
+    NOTE: this is a pure formula — it does not enforce positive output quotes. With
+    sane normalized q and parameters that cannot occur, but the executor (3b) MUST
+    gate computed quotes positive+finite before order creation (see spec deferred-scope).
+    """
+    _require_finite(
+        mid=mid, reservation=reservation, spread=spread, min_spread_pct=min_spread_pct
+    )
     if mid <= ZERO:
         raise ValueError(f"mid must be > 0, got {mid}")
     if spread < ZERO:
@@ -89,6 +109,7 @@ def inventory_skew_sizes(
 ) -> tuple[Decimal, Decimal]:
     """Returns (bid_size, ask_size). Asymmetric eta damping (reference .pyx:1101-1112):
     q>0 shrinks buys by exp(-eta*q); q<0 shrinks sells by exp(eta*q)."""
+    _require_finite(order_amount=order_amount, q=q, eta=eta)
     if order_amount <= ZERO:
         raise ValueError(f"order_amount must be > 0, got {order_amount}")
     if not (NEG_ONE <= q <= ONE):

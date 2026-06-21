@@ -211,6 +211,68 @@ def test_golden_inventory_skew_sizes(amount, q, eta):
     assert P.inventory_skew_sizes(amount, q, eta) == (exp_bid, exp_ask)
 
 
+# ---------- non-finite rejection (adversarial-review hardening) ----------
+_NAN = Decimal("NaN")
+_INF = Decimal("Infinity")
+_NINF = Decimal("-Infinity")
+
+
+@pytest.mark.parametrize("bad", [_NAN, _INF, _NINF])
+def test_reservation_price_rejects_non_finite(bad):
+    with pytest.raises(ValueError):
+        P.reservation_price(bad, D("0"), D("0.5"), D("2"), D("1"))
+    with pytest.raises(ValueError):
+        P.reservation_price(D("100"), D("0"), bad, D("2"), D("1"))
+    with pytest.raises(ValueError):
+        P.reservation_price(D("100"), D("0"), D("0.5"), bad, D("1"))
+
+
+@pytest.mark.parametrize("bad", [_NAN, _INF, _NINF])
+def test_optimal_spread_rejects_non_finite(bad):
+    with pytest.raises(ValueError):
+        P.optimal_spread(bad, D("2"), D("1"), D("1.5"))
+    with pytest.raises(ValueError):
+        P.optimal_spread(D("0.5"), D("2"), D("1"), bad)
+
+
+@pytest.mark.parametrize("bad", [_NAN, _INF, _NINF])
+def test_clamp_quotes_rejects_non_finite(bad):
+    with pytest.raises(ValueError):
+        P.clamp_quotes(D("100"), bad, D("2"), D("1"))
+    with pytest.raises(ValueError):
+        P.clamp_quotes(D("100"), D("100"), bad, D("1"))
+
+
+@pytest.mark.parametrize("bad", [_NAN, _INF, _NINF])
+def test_inventory_skew_sizes_rejects_non_finite(bad):
+    with pytest.raises(ValueError):
+        P.inventory_skew_sizes(bad, D("0"), D("1"))
+    with pytest.raises(ValueError):
+        P.inventory_skew_sizes(D("10"), D("0"), bad)
+
+
+@pytest.mark.parametrize("bad", [_NAN, _INF, _NINF])
+def test_normalize_inventory_rejects_non_finite(bad):
+    with pytest.raises(ValueError):
+        P.normalize_inventory(bad, D("0"), D("10"))
+    with pytest.raises(ValueError):
+        P.normalize_inventory(D("1"), D("0"), bad)
+
+
+# ---------- hardcoded numeric goldens (literal expected, formula-independent) ----------
+def test_hardcoded_numeric_goldens():
+    # reservation_price: 100 - 0.5*0.5*2*1 = 99.5
+    assert P.reservation_price(D("100"), D("0.5"), D("0.5"), D("2"), D("1")) == D("99.5")
+    # reservation q==-1 boundary: 250 - (-1)*0.5*3*1 = 251.5
+    assert P.reservation_price(D("250"), D("-1"), D("0.5"), D("3"), D("1")) == D("251.5")
+    # clamp_quotes: min_spread=1 -> max_bid=99.5,min_ask=100.5; bid=min(99,99.5)=99; ask=max(101,100.5)=101
+    assert P.clamp_quotes(D("100"), D("100"), D("2"), D("1")) == (D("99"), D("101"))
+    # inventory_skew_sizes: q==0 -> both full
+    assert P.inventory_skew_sizes(D("10"), D("0"), D("1")) == (D("10"), D("10"))
+    # normalize_inventory: (3-1)/10 = 0.2
+    assert P.normalize_inventory(D("3"), D("1"), D("10")) == D("0.2")
+
+
 def test_as_policy_is_pure_stdlib_decimal_only():
     """as_policy.py must import only __future__, decimal (+ typing). No numpy/scipy/
     pandas/connector/executors-runtime imports — the purity contract (spec §3.1).
