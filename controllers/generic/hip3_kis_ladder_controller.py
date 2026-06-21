@@ -23,9 +23,7 @@ from hummingbot.strategy_v2.executors.ladder_maker_executor.data_types import (
     LadderMakerExecutorConfig,
     LadderRungConfig,
 )
-from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_cost import (
-    round_trip_cost_bps as _round_trip_cost_bps,
-)
+from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_cost import KisHlCostModel
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction
 
 
@@ -63,7 +61,7 @@ class Hip3KisLadderControllerConfig(ControllerConfigBase):
     rungs: List[LadderRungConfig] = Field(default_factory=_default_rungs)
     buffer_ticks: Decimal = Decimal("0")
     round_trip_cost_bps: Decimal = Field(
-        default_factory=lambda: _round_trip_cost_bps(),
+        default_factory=lambda: KisHlCostModel().round_trip_cost_bps(),
         json_schema_extra={"is_updatable": True},
     )
 

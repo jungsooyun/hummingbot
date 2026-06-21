@@ -51,3 +51,19 @@ def round_trip_cost_bps(routing: str = "krx", close_is_taker: bool = False) -> D
     entry = HL_HIP3_MAKER_BPS + (KIS_BROKERAGE_BPS + usage)          # buy: no tax
     exit_ = hl_close + (KIS_BROKERAGE_BPS + usage + TAX_SELL_BPS)    # sell: tax once
     return entry + exit_
+
+
+class KisHlCostModel:
+    """KIS spot + HL HIP-3 perp round-trip friction (cost-model impl #1).
+
+    Thin class wrapper over the pure ``round_trip_cost_bps`` so the controller
+    constructs cost via a named object. No Protocol (YAGNI — lane 2 folds cost into
+    the A&S optimal spread, a different shape; see JEP-188 spec §3.2).
+    """
+
+    def __init__(self, routing: str = "krx", close_is_taker: bool = False):
+        self._routing = routing
+        self._close_is_taker = close_is_taker
+
+    def round_trip_cost_bps(self) -> Decimal:
+        return round_trip_cost_bps(self._routing, self._close_is_taker)

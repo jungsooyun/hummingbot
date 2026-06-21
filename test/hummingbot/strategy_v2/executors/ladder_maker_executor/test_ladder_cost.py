@@ -47,3 +47,13 @@ def test_accepts_exactly_valid_market_routings():
         assert round_trip_cost_bps(routing) > Decimal("0")
     with pytest.raises(ValueError):
         round_trip_cost_bps("nasdaq")
+
+
+def test_kis_hl_cost_model_matches_pure_fn():
+    from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_cost import (
+        KisHlCostModel,
+        round_trip_cost_bps,
+    )
+    assert KisHlCostModel().round_trip_cost_bps() == round_trip_cost_bps("krx")
+    assert KisHlCostModel("nxt").round_trip_cost_bps() == round_trip_cost_bps("nxt")
+    assert KisHlCostModel("krx", close_is_taker=True).round_trip_cost_bps() == round_trip_cost_bps("krx", close_is_taker=True)
