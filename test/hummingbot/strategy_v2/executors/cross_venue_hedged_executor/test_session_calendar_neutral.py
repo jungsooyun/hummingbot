@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from hummingbot.strategy_v2.executors.ladder_maker_executor.session_calendar import (
+from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_calendar import (
     KrxSessionCalendar,
     TwentyFourSevenCalendar,
 )

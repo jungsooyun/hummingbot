@@ -68,7 +68,7 @@ class LadderMakerTwoSidedObserveTest(unittest.TestCase):
         ex._strategy = SimpleNamespace(current_timestamp=1000.0)
         ex._compute_fair = MagicMock(return_value=Decimal("100"))
         ex._policy_side = MagicMock(return_value=Side.SELL)
-        from hummingbot.strategy_v2.executors.ladder_maker_executor.fx_bridged_fair_source import FxBridgedFairSource
+        from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.fx_bridged_fair_source import FxBridgedFairSource
 
         ex._fair = FxBridgedFairSource(
             getattr(ex.config, "side_aware_fx", True),
@@ -81,7 +81,7 @@ class LadderMakerTwoSidedObserveTest(unittest.TestCase):
         ex._open_edge_vwap = Decimal("0")
         ex._pending_hedge_signed = Decimal("-0.003")
         ex._maker_executed_base = Decimal("0")
-        from hummingbot.strategy_v2.executors.ladder_maker_executor.session_calendar import KrxSessionCalendar
+        from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_calendar import KrxSessionCalendar
 
         ex._calendar = KrxSessionCalendar()
         return ex

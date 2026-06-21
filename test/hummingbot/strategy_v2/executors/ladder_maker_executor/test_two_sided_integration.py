@@ -122,7 +122,7 @@ class LadderMakerTwoSidedIntegrationTest(unittest.TestCase):
             side_effect=lambda side: FAIR_OPEN if side is Side.SELL else FAIR_CLOSE
         )
         ex._policy_side = MagicMock(return_value=Side.SELL)
-        from hummingbot.strategy_v2.executors.ladder_maker_executor.fx_bridged_fair_source import FxBridgedFairSource
+        from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.fx_bridged_fair_source import FxBridgedFairSource
 
         ex._fair = FxBridgedFairSource(
             getattr(ex.config, "side_aware_fx", True),
@@ -131,7 +131,7 @@ class LadderMakerTwoSidedIntegrationTest(unittest.TestCase):
         )
         ex._fair._get_fx = MagicMock(return_value=fx)
         ex._strategy = SimpleNamespace(current_timestamp=current_timestamp)
-        from hummingbot.strategy_v2.executors.ladder_maker_executor.session_calendar import KrxSessionCalendar
+        from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_calendar import KrxSessionCalendar
 
         ex._calendar = KrxSessionCalendar()
         return ex

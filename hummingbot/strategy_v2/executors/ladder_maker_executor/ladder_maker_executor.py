@@ -30,7 +30,7 @@ from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.cross_venue_he
     CrossVenueHedgedExecutorBase,
 )
 from hummingbot.strategy_v2.executors.ladder_maker_executor.data_types import LadderMakerExecutorConfig
-from hummingbot.strategy_v2.executors.ladder_maker_executor.fx_bridged_fair_source import FxBridgedFairSource
+from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.fx_bridged_fair_source import FxBridgedFairSource
 from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import (
     RungSpec,
     Side,
@@ -40,7 +40,7 @@ from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import
     build_two_sided_targets,
     compute_hedge_order,
 )
-from hummingbot.strategy_v2.executors.ladder_maker_executor.session_calendar import KrxSessionCalendar
+from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_calendar import KrxSessionCalendar
 from hummingbot.strategy_v2.gates.gate_chain import GateChain, GateContext, InventoryGate, KillSwitchGate
 from hummingbot.strategy_v2.models.executors import TrackedOrder
 

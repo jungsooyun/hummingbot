@@ -20,7 +20,7 @@ def _executor_at(hour: int, minute: int, eod_wind_minutes=None):
         ex.config = SimpleNamespace()
     else:
         ex.config = SimpleNamespace(eod_wind_minutes=eod_wind_minutes)
-    from hummingbot.strategy_v2.executors.ladder_maker_executor.session_calendar import KrxSessionCalendar
+    from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_calendar import KrxSessionCalendar
 
     ex._calendar = KrxSessionCalendar()
     return ex

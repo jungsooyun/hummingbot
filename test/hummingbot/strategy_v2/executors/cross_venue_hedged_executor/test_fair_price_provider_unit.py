@@ -4,8 +4,8 @@ from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 from hummingbot.core.data_type.common import TradeType
-from hummingbot.strategy_v2.executors.ladder_maker_executor.fair_price_provider import DirectFairSource
-from hummingbot.strategy_v2.executors.ladder_maker_executor.fx_bridged_fair_source import FxBridgedFairSource
+from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.fair_price_provider import DirectFairSource
+from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.fx_bridged_fair_source import FxBridgedFairSource
 from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import Side
 
 LOG = logging.getLogger("test")

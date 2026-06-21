@@ -73,7 +73,7 @@ def _make_observe_executor(*, adopt: bool) -> LadderMakerExecutor:
     ex._status = RunnableStatus.RUNNING
     ex._compute_fair = MagicMock(return_value=Decimal("100"))
     ex._policy_side = MagicMock(return_value=Side.SELL)
-    from hummingbot.strategy_v2.executors.ladder_maker_executor.fx_bridged_fair_source import FxBridgedFairSource
+    from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.fx_bridged_fair_source import FxBridgedFairSource
 
     ex._fair = FxBridgedFairSource(
         getattr(ex.config, "side_aware_fx", True),
@@ -104,7 +104,7 @@ def _make_observe_executor(*, adopt: bool) -> LadderMakerExecutor:
     ex._gates_open = MagicMock(return_value=True)
     ex._should_reprice = MagicMock(return_value=True)
     ex.logger = MagicMock(return_value=MagicMock())
-    from hummingbot.strategy_v2.executors.ladder_maker_executor.session_calendar import KrxSessionCalendar
+    from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_calendar import KrxSessionCalendar
 
     ex._calendar = KrxSessionCalendar()
     return ex

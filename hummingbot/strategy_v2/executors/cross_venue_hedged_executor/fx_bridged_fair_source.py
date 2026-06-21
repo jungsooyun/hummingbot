@@ -12,7 +12,8 @@ from decimal import Decimal
 from typing import Optional, Tuple
 
 from hummingbot.core.data_type.common import TradeType
-from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import Side, compute_fair_price
+from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.fair_math import compute_fair_price
+from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.maker_reconcile import Side
 
 ZERO = Decimal("0")
 

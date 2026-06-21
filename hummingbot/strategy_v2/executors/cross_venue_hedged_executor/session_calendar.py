@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Protocol
 
-from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import compute_eod_pressure
+from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.fair_math import compute_eod_pressure
 
 ZERO = Decimal("0")
 

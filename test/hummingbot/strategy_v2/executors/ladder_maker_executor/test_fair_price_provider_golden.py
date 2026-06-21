@@ -66,7 +66,7 @@ def _make_executor():
     ex.connectors = {"kis": hedge_conn, "hyperliquid_perpetual": maker_conn}
 
     # Spread FX: mocked at the CURRENT _get_fx location (Task 3 repoints to ex._fair._get_fx).
-    from hummingbot.strategy_v2.executors.ladder_maker_executor.fx_bridged_fair_source import FxBridgedFairSource
+    from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.fx_bridged_fair_source import FxBridgedFairSource
 
     ex._fair = FxBridgedFairSource(
         getattr(ex.config, "side_aware_fx", True),

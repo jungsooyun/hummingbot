@@ -12,7 +12,7 @@ from decimal import Decimal
 from typing import Optional, Protocol, Tuple
 
 from hummingbot.core.data_type.common import TradeType
-from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import Side
+from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.maker_reconcile import Side
 
 
 class FairPriceProvider(Protocol):
