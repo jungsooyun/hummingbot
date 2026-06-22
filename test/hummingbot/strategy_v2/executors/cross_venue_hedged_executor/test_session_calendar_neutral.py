@@ -41,6 +41,15 @@ def test_krx_eod_pressure_wind_nonpositive_is_zero():
     assert KrxSessionCalendar().eod_pressure(_ts(15, 20), -5) == Decimal("0")
 
 
+@pytest.mark.parametrize("hour,minute,expected", [
+    (8, 29, False), (8, 30, True), (8, 59, True), (9, 0, False),   # opening call auction [08:30,09:00)
+    (15, 19, False), (15, 20, True), (15, 29, True), (15, 30, False),  # closing call auction [15:20,15:30)
+    (12, 0, False),  # mid-session continuous
+])
+def test_krx_in_auction_window(hour, minute, expected):
+    assert KrxSessionCalendar().in_auction_window(_ts(hour, minute)) is expected
+
+
 def test_twentyfourseven_now_is_utc():
     now = TwentyFourSevenCalendar().now(_ts(15, 20))
     assert now.utcoffset() == timedelta(0)
@@ -50,3 +59,7 @@ def test_twentyfourseven_eod_pressure_always_zero():
     cal = TwentyFourSevenCalendar()
     assert cal.eod_pressure(_ts(15, 20), 20) == Decimal("0")
     assert cal.eod_pressure(_ts(16, 0), 5) == Decimal("0")
+
+
+def test_twentyfourseven_in_auction_window_always_false():
+    assert TwentyFourSevenCalendar().in_auction_window(_ts(8, 30)) is False
