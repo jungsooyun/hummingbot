@@ -402,6 +402,25 @@ class MarketDataProvider:
         freshness = self.get_order_book_freshness_sec(connector_name=connector_name, trading_pair=trading_pair)
         return freshness is not None and freshness <= max_age_sec
 
+    def get_ws_freshness_sec(self, connector_name: str, trading_pair: str) -> Optional[float]:
+        """
+        Returns the age in seconds of the latest proven WS order book frame for a trading pair.
+        """
+        connector = self.get_connector_with_fallback(connector_name)
+        tracker = getattr(connector, "order_book_tracker", None)
+        if tracker is None:
+            return None
+
+        data_source = getattr(tracker, "data_source", None)
+        if data_source is None:
+            return None
+
+        last_ws_ts = data_source.last_ws_orderbook_time(trading_pair)
+        if last_ws_ts is None:
+            return None
+
+        return max(0.0, time.perf_counter() - last_ws_ts)
+
     async def initialize_order_book(self, connector_name: str, trading_pair: str) -> bool:
         """
         Dynamically initializes order book for a trading pair on the specified connector.

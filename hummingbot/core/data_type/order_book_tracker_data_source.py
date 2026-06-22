@@ -25,6 +25,7 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
         self._order_book_create_function = lambda: OrderBook()
         self._message_queue: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
         self._ws_assistant: Optional[WSAssistant] = None
+        self._last_ws_orderbook_timestamp: Dict[str, float] = {}
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -259,6 +260,12 @@ class OrderBookTrackerDataSource(metaclass=ABCMeta):
 
     def _time(self):
         return time.time()
+
+    def _mark_ws_orderbook_frame(self, trading_pair: str):
+        self._last_ws_orderbook_timestamp[trading_pair] = time.perf_counter()
+
+    def last_ws_orderbook_time(self, trading_pair: str) -> Optional[float]:
+        return self._last_ws_orderbook_timestamp.get(trading_pair)
 
     def add_trading_pair(self, trading_pair: str):
         """

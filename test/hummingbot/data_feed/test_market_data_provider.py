@@ -9,11 +9,41 @@ import pandas as pd
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import PriceType
 from hummingbot.core.data_type.funding_info import FundingInfo
+from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.order_book_query_result import OrderBookQueryResult
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy.strategy_v2_base import MarketDataProvider
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
+
+
+class _WSFreshnessDataSource(OrderBookTrackerDataSource):
+    async def get_last_traded_prices(self, trading_pairs, domain=None):
+        return {}
+
+    async def _connected_websocket_assistant(self):
+        pass
+
+    async def _subscribe_channels(self, ws):
+        pass
+
+    async def _order_book_snapshot(self, trading_pair):
+        pass
+
+    async def _request_order_book_snapshots(self, output):
+        pass
+
+    async def _parse_order_book_snapshot_message(self, raw_message, message_queue):
+        pass
+
+    async def _parse_order_book_diff_message(self, raw_message, message_queue):
+        pass
+
+    async def subscribe_to_trading_pair(self, trading_pair):
+        return True
+
+    async def unsubscribe_from_trading_pair(self, trading_pair):
+        return True
 
 
 class TestMarketDataProvider(IsolatedAsyncioWrapperTestCase):
@@ -78,6 +108,18 @@ class TestMarketDataProvider(IsolatedAsyncioWrapperTestCase):
         self.mock_connector.order_book_tracker.metrics = MagicMock(per_pair_metrics={})
         freshness = self.provider.get_order_book_freshness_sec("mock_connector", "BTC-USDT")
         self.assertIsNone(freshness)
+
+    def test_get_ws_freshness_sec_none_until_proven_then_grows(self):
+        data_source = _WSFreshnessDataSource(["005930-KRW"])
+        self.mock_connector.order_book_tracker = MagicMock(data_source=data_source)
+
+        self.assertIsNone(self.provider.get_ws_freshness_sec("mock_connector", "005930-KRW"))
+
+        data_source._mark_ws_orderbook_frame("005930-KRW")
+        age = self.provider.get_ws_freshness_sec("mock_connector", "005930-KRW")
+
+        self.assertIsNotNone(age)
+        self.assertGreaterEqual(age, 0.0)
 
     def test_is_order_book_fresh(self):
         pair_metrics = MagicMock()
