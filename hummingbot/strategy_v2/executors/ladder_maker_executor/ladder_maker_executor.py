@@ -18,6 +18,7 @@ trading-hours / order-cap gates (those need feed-age + session inputs that are n
 plumbed yet); for now the chain holds ``KillSwitchGate`` and the fair-price
 readiness check is kept as an explicit data gate to preserve current behavior.
 """
+import math
 import logging
 from decimal import Decimal
 from typing import Dict, List, Optional
@@ -41,7 +42,18 @@ from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import
     compute_hedge_order,
 )
 from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_calendar import KrxSessionCalendar
-from hummingbot.strategy_v2.gates.gate_chain import GateChain, GateContext, InventoryGate, KillSwitchGate, WsStalenessGate
+from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_halt_source import (
+    KisSessionHaltSource,
+    NoHaltSource,
+)
+from hummingbot.strategy_v2.gates.gate_chain import (
+    GateChain,
+    GateContext,
+    InventoryGate,
+    KillSwitchGate,
+    SessionHaltGate,
+    WsStalenessGate,
+)
 from hummingbot.strategy_v2.models.executors import TrackedOrder
 
 ZERO = Decimal("0")
@@ -114,6 +126,14 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
                 max_kis_ws_age_s=getattr(config, "max_kis_ws_age_s", None),
                 max_hl_ws_age_s=getattr(config, "max_hl_ws_age_s", None),
             ))
+        _halt_on = getattr(config, "session_halt_gate_enabled", False)
+        if _halt_on:
+            _kis_age = getattr(config, "max_kis_ws_age_s", None)
+            if not getattr(config, "ws_staleness_kill_switch_enabled", False) or _kis_age is None or not math.isfinite(_kis_age):
+                raise ValueError(
+                    "session_halt_gate_enabled requires ws_staleness_kill_switch_enabled=True "
+                    "with a finite max_kis_ws_age_s (the WS-freshness floor the halt 'ready' check depends on).")
+            _gates.append(SessionHaltGate())
         self._gate_chain = GateChain(_gates)
         super().__init__(
             strategy=strategy,
@@ -132,6 +152,10 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         # ever made updatable, rebuild self._fair on update (else the cached FX behavior
         # would diverge from config — a JEP-185-class money risk).
         self._calendar = KrxSessionCalendar()
+        self._halt_source = (
+            KisSessionHaltSource(self.connectors[self.hedge_connector])
+            if getattr(self.config, "session_halt_gate_enabled", False) else NoHaltSource()
+        )
         self._fair = FxBridgedFairSource(
             getattr(self.config, "side_aware_fx", True),
             getattr(self.config, "static_fx_rate", None),
@@ -159,6 +183,12 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             return age if age is not None else float("inf")
 
         ws_on = getattr(self.config, "ws_staleness_kill_switch_enabled", False)
+        _halt_st = self._halt_source.evaluate(
+            self.hedge_trading_pair,
+            in_auction=self._calendar.in_auction_window(self._strategy.current_timestamp),
+            max_ws_age_s=getattr(self.config, "session_halt_max_ws_age_s", 3.0),
+            max_book_static_s=getattr(self.config, "session_halt_max_book_static_s", 8.0),
+        )
         ctx = GateContext(
             now_kst=self._calendar.now(self._strategy.current_timestamp),
             kis_age_s=0.0,  # REST book-age gate -> JEP-133
@@ -172,6 +202,7 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             kill_switch=bool(self.config.kill_switch) or self._hedge_kill_switch or self._staleness_kill_switch,
             kis_ws_age_s=_age_for_ctx(self._hedge_ws_age_s) if ws_on else 0.0,  # KIS = hedge leg
             hl_ws_age_s=_age_for_ctx(self._maker_ws_age_s) if ws_on else 0.0,  # HL = maker leg
+            kis_session_halted=_halt_st.halted,
         )
         if not self._gate_chain.evaluate(ctx).open:
             return False

@@ -3,7 +3,11 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from hummingbot.strategy_v2.gates.gate_chain import GateChain, KillSwitchGate, WsStalenessGate
+from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_halt_source import (
+    NoHaltSource,
+    SessionHaltState,
+)
+from hummingbot.strategy_v2.gates.gate_chain import GateChain, KillSwitchGate, SessionHaltGate, WsStalenessGate
 
 try:
     # The executor module pulls the V2 strategy base (paho), absent in the local
@@ -31,6 +35,7 @@ class LadderMakerWsStalenessWiringTest(unittest.TestCase):
             max_kis_ws_age_s=3.0,
             max_hl_ws_age_s=12.0,
             ws_staleness_grace_s=90.0,
+            session_halt_gate_enabled=False,
             target_inventory=Decimal("0"),
             inventory_skew_bps_per_unit=Decimal("0"),
         )
@@ -42,7 +47,8 @@ class LadderMakerWsStalenessWiringTest(unittest.TestCase):
         ex._init_ws_staleness_state()
         ex._staleness_kill_switch = latched
         ex._gate_chain = GateChain([KillSwitchGate(), WsStalenessGate(3.0, 12.0)])
-        ex._calendar = SimpleNamespace(now=lambda ts: _kst(10))
+        ex._halt_source = NoHaltSource()
+        ex._calendar = SimpleNamespace(now=lambda ts: _kst(10), in_auction_window=lambda ts: False)
         ex._seed_fail_closed = False
         ex._unhedged_base_signed = MagicMock(return_value=Decimal("0"))
         ex._open_maker_orders = MagicMock(return_value=[])
@@ -70,3 +76,22 @@ class LadderMakerWsStalenessWiringTest(unittest.TestCase):
         ex = self._make(enabled=True, kis_age=0.5, hl_age=0.5, latched=True)
         ex._evaluate_ws_staleness()
         self.assertFalse(ex._gates_open())
+
+    def test_gates_closed_when_session_halted(self):
+        ex = self._make(enabled=True)
+        ex._gate_chain = GateChain([KillSwitchGate(), SessionHaltGate()])
+        ex.config.session_halt_gate_enabled = True
+        ex._halt_source = SimpleNamespace(
+            evaluate=lambda p, **kw: SessionHaltState(halted=True, ready=True, reason="book_frozen"))
+        ex._calendar = SimpleNamespace(now=lambda ts: _kst(10), in_auction_window=lambda ts: False)
+        self.assertFalse(ex._gates_open())
+
+    def test_gates_open_when_not_halted(self):
+        ex = self._make(enabled=True)
+        ex._gate_chain = GateChain([KillSwitchGate(), SessionHaltGate()])
+        ex.config.session_halt_gate_enabled = True
+        ex._halt_source = SimpleNamespace(
+            evaluate=lambda p, **kw: SessionHaltState(halted=False, ready=True, reason=""))
+        ex._calendar = SimpleNamespace(now=lambda ts: _kst(10), in_auction_window=lambda ts: False)
+        # other gates open + fair computable -> open
+        self.assertTrue(ex._gates_open())

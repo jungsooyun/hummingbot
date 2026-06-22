@@ -31,6 +31,8 @@ def _mock_config(max_inventory):
     cfg.hedge_market = MagicMock()
     cfg.entry_side = TradeType.SELL
     cfg.fx_connector = "upbit"
+    cfg.session_halt_gate_enabled = False
+    cfg.ws_staleness_kill_switch_enabled = False
     return cfg
 
 
@@ -81,6 +83,14 @@ class LadderMakerInitTest(unittest.TestCase):
         inv_gates = [g for g in ex._gate_chain._gates if isinstance(g, InventoryGate)]
         self.assertEqual(len(inv_gates), 1)
         self.assertIsNone(inv_gates[0]._max_inventory)
+
+    def test_session_halt_requires_ws_staleness(self):
+        cfg = _mock_config(Decimal("8"))
+        cfg.session_halt_gate_enabled = True
+        cfg.ws_staleness_kill_switch_enabled = False
+        with self.assertRaises(ValueError):
+            with patch.object(CrossVenueHedgedExecutorBase, "__init__", lambda self, **k: None):
+                LadderMakerExecutor(strategy=MagicMock(), config=cfg)
 
 
 @unittest.skipUnless(_EXECUTOR_IMPORTABLE, "ladder_maker_executor requires the V2 stack (paho) — run in Docker/CI")
