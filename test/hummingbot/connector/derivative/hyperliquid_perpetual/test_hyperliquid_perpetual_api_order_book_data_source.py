@@ -229,6 +229,9 @@ class HyperliquidPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTest
         expected_depth_subscription_payload = self.ex_trading_pair.split("-")[0]
         self.assertEqual(expected_depth_subscription_channel, sent_subscription_messages[1]["subscription"]["type"])
         self.assertEqual(expected_depth_subscription_payload, sent_subscription_messages[1]["subscription"]["coin"])
+        # JEP-193: the l2Book subscription must request fast-mode push cadence (~10x more
+        # frequent frames) to cut HL maker-leg freshness from ~5.4s to sub-second.
+        self.assertTrue(sent_subscription_messages[1]["subscription"]["fast"])
         # Verify funding info subscription
         expected_funding_subscription_payload = self.ex_trading_pair.split("-")[0]
         self.assertEqual(expected_funding_subscription_payload, sent_subscription_messages[2]["subscription"]["coin"])
@@ -279,6 +282,21 @@ class HyperliquidPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTest
         self.assertTrue(
             self._is_logged("ERROR", "Unexpected error occurred subscribing to order book data streams.")
         )
+
+    async def test_subscribe_to_trading_pair_orderbook_requests_fast_mode(self):
+        # JEP-193: the dynamic per-pair subscribe path must also request l2Book fast-mode
+        # cadence, otherwise pairs added at runtime would silently fall back to the slow
+        # ~5.4s throttle while the boot-time pairs run fast.
+        self.data_source._ws_assistant = AsyncMock()
+
+        result = await self.data_source.subscribe_to_trading_pair(self.trading_pair)
+
+        self.assertTrue(result)
+        sent_payloads = [call.args[0].payload for call in self.data_source._ws_assistant.send.call_args_list]
+        ob_payloads = [p for p in sent_payloads if p["subscription"]["type"] == CONSTANTS.DEPTH_ENDPOINT_NAME]
+        self.assertEqual(1, len(ob_payloads))
+        self.assertEqual(self.base_asset, ob_payloads[0]["subscription"]["coin"])
+        self.assertTrue(ob_payloads[0]["subscription"]["fast"])
 
     async def test_listen_for_trades_cancelled_when_listening(self):
         mock_queue = MagicMock()

@@ -177,11 +177,18 @@ class HyperliquidPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource
                 }
                 subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=trades_payload)
 
+                # JEP-193: "fast" is an undocumented Hyperliquid l2Book subscription flag
+                # (absent from the public API/SDK, which key l2Book by coin only). The HL
+                # server honors it: it lifts the ~5.4s push throttle to sub-second cadence
+                # (probe 2026-06-22: 46 -> 222 frames/120s, p50 5364ms -> 544ms), cutting
+                # maker-leg adverse selection. The WS-staleness kill switch (max_hl_ws_age_s)
+                # is the safety net if HL ever stops honoring it.
                 order_book_payload = {
                     "method": "subscribe",
                     "subscription": {
                         "type": CONSTANTS.DEPTH_ENDPOINT_NAME,
                         "coin": symbol,
+                        "fast": True,
                     }
                 }
                 subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=order_book_payload)
@@ -347,6 +354,7 @@ class HyperliquidPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource
                 "subscription": {
                     "type": CONSTANTS.DEPTH_ENDPOINT_NAME,
                     "coin": coin,
+                    "fast": True,  # JEP-193: fast-mode push cadence (see _subscribe_channels)
                 }
             }
             subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=order_book_payload)
