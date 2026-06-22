@@ -298,6 +298,49 @@ class HyperliquidPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTest
         self.assertEqual(self.base_asset, ob_payloads[0]["subscription"]["coin"])
         self.assertTrue(ob_payloads[0]["subscription"]["fast"])
 
+    async def test_unsubscribe_from_trading_pair_orderbook_mirrors_fast_mode(self):
+        # JEP-193: unsubscribe must mirror the subscribe identity ("fast": True) so the
+        # un/subscribe pair stays symmetric and robust if HL ever keys l2Book by the full
+        # subscription object rather than by coin alone.
+        self.data_source._ws_assistant = AsyncMock()
+        self.data_source.add_trading_pair(self.trading_pair)
+
+        result = await self.data_source.unsubscribe_from_trading_pair(self.trading_pair)
+
+        self.assertTrue(result)
+        sent_payloads = [call.args[0].payload for call in self.data_source._ws_assistant.send.call_args_list]
+        ob_payloads = [p for p in sent_payloads if p["subscription"]["type"] == CONSTANTS.DEPTH_ENDPOINT_NAME]
+        self.assertEqual(1, len(ob_payloads))
+        self.assertEqual("unsubscribe", ob_payloads[0]["method"])
+        self.assertTrue(ob_payloads[0]["subscription"]["fast"])
+
+    @aioresponses()
+    async def test_parse_order_book_snapshot_tolerates_extra_fast_field(self, mock_api):
+        # JEP-193: fast-mode frames carry an extra data["fast"] field; the parser is pure
+        # key-access so the extra field must be ignored and bids/asks parsed unchanged
+        # (probe 2026-06-22 confirmed levels schema is identical to slow mode).
+        raw_message = {
+            "channel": "l2Book",
+            "data": {
+                "coin": self.base_asset,
+                "fast": True,
+                "time": 1700687397644,
+                "levels": [
+                    [{"px": "36000.0", "sz": "1.5", "n": 1}],  # bids
+                    [{"px": "36100.0", "sz": "2.0", "n": 1}],  # asks
+                ],
+            },
+        }
+
+        message_queue = asyncio.Queue()
+        await self.data_source._parse_order_book_snapshot_message(raw_message, message_queue)
+
+        message = message_queue.get_nowait()
+        self.assertEqual(OrderBookMessageType.SNAPSHOT, message.type)
+        self.assertEqual(self.trading_pair, message.content["trading_pair"])
+        self.assertEqual([[36000.0, 1.5]], message.content["bids"])
+        self.assertEqual([[36100.0, 2.0]], message.content["asks"])
+
     async def test_listen_for_trades_cancelled_when_listening(self):
         mock_queue = MagicMock()
         mock_queue.get.side_effect = asyncio.CancelledError()

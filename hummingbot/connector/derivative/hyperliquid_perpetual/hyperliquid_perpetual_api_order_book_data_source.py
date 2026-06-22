@@ -181,8 +181,10 @@ class HyperliquidPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource
                 # (absent from the public API/SDK, which key l2Book by coin only). The HL
                 # server honors it: it lifts the ~5.4s push throttle to sub-second cadence
                 # (probe 2026-06-22: 46 -> 222 frames/120s, p50 5364ms -> 544ms), cutting
-                # maker-leg adverse selection. The WS-staleness kill switch (max_hl_ws_age_s)
-                # is the safety net if HL ever stops honoring it.
+                # maker-leg adverse selection. NOTE: at the current max_hl_ws_age_s=12.0s the
+                # JEP-134 staleness gate fail-closes on a FULL HL WS outage (no frame -> stale)
+                # but does NOT catch a silent fast->slow degradation (~5.4s stays under 12s);
+                # detecting that requires the deferred 12s->3s tightening (tracked on JEP-193).
                 order_book_payload = {
                     "method": "subscribe",
                     "subscription": {
@@ -403,6 +405,7 @@ class HyperliquidPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource
                 "subscription": {
                     "type": CONSTANTS.DEPTH_ENDPOINT_NAME,
                     "coin": coin,
+                    "fast": True,  # JEP-193: mirror subscribe identity (symmetric un/subscribe)
                 }
             }
             unsubscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=order_book_payload)
