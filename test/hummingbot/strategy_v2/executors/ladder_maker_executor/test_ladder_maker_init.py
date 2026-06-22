@@ -119,6 +119,14 @@ class LadderMakerInitTest(unittest.TestCase):
         field = LadderHedgeControllerConfigBase.model_fields["session_halt_gate_enabled"]
         self.assertFalse(field.json_schema_extra["is_updatable"])
 
+    def test_safety_gates_on_by_default(self):
+        # JEP-198/JEP-134: the KIS-hedge safety gates ship ON by default. session_halt
+        # requires ws_staleness (the WS-freshness floor the halt 'ready' check depends
+        # on), so both default True; a regression must not silently disarm them.
+        fields = LadderHedgeControllerConfigBase.model_fields
+        self.assertIs(fields["session_halt_gate_enabled"].default, True)
+        self.assertIs(fields["ws_staleness_kill_switch_enabled"].default, True)
+
 
 @unittest.skipUnless(_EXECUTOR_IMPORTABLE, "ladder_maker_executor requires the V2 stack (paho) — run in Docker/CI")
 class LadderMakerBalanceValidationTest(unittest.TestCase):

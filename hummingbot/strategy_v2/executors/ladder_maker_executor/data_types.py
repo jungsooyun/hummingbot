@@ -62,11 +62,11 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
 
     # Safety
     kill_switch: bool = False
-    ws_staleness_kill_switch_enabled: bool = False
+    ws_staleness_kill_switch_enabled: bool = True
     max_kis_ws_age_s: Optional[float] = 3.0
     max_hl_ws_age_s: Optional[float] = 12.0
     ws_staleness_grace_s: float = 90.0
-    session_halt_gate_enabled: bool = False
+    session_halt_gate_enabled: bool = True
     session_halt_max_ws_age_s: float = 3.0
     session_halt_max_book_static_s: float = 8.0
     # Observe / no-submit: compute fair + targets and LOG the intended maker quotes
