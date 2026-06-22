@@ -335,6 +335,30 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         })
 
     @staticmethod
+    def _ws_market_status_subscription_success_raw(
+        tr_id: str = "H0UNMKO0", tr_key: str = "005930"
+    ) -> str:
+        return json.dumps({
+            "header": {
+                "tr_id": tr_id,
+                "tr_key": tr_key,
+                "encrypt": "N",
+            },
+            "body": {
+                "rt_cd": "0",
+                "msg_cd": "OPSP0000",
+                "msg1": "SUBSCRIBE SUCCESS",
+            },
+        })
+
+    @staticmethod
+    def _ws_market_status_payload(**overrides: str) -> str:
+        data = {col: "0" for col in CONSTANTS.WS_MARKET_STATUS_COLUMNS}
+        data["MKSC_SHRN_ISCD"] = "005930"
+        data.update(overrides)
+        return "^".join(data[col] for col in CONSTANTS.WS_MARKET_STATUS_COLUMNS)
+
+    @staticmethod
     def _ws_subscription_error_raw() -> str:
         """Raw subscription error response from KIS WS."""
         return json.dumps({
@@ -1299,7 +1323,7 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
     # Test: SOR/NXT routing-aware subscription + dispatch
     # ------------------------------------------------------------------
 
-    def _make_ds(self, market_routing):
+    def _make_ds(self, market_routing, market_status_enabled: bool = False):
         return KisAPIOrderBookDataSource(
             trading_pairs=[self.trading_pair],
             connector=self.connector,
@@ -1308,7 +1332,39 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
             hub=MagicMock(),
             domain=CONSTANTS.DEFAULT_DOMAIN,
             market_routing=market_routing,
+            market_status_enabled=market_status_enabled,
         )
+
+    def _make_two_pair_market_status_ds(self):
+        second_pair = "000660-KRW"
+        connector = KisExchange(
+            kis_app_key="test_app_key",
+            kis_app_secret="test_app_secret",
+            kis_account_number="12345678-01",
+            trading_pairs=[self.trading_pair, second_pair],
+            trading_required=False,
+            kis_market_routing=CONSTANTS.MARKET_ROUTING_KRX,
+            kis_market_status_enabled="true",
+        )
+        connector._auth._access_token = "test_token"
+        connector._auth._token_expires_at = time.time() + 86400
+        connector._set_trading_pair_symbol_map(bidict({
+            "005930": self.trading_pair,
+            "000660": second_pair,
+        }))
+        ds = KisAPIOrderBookDataSource(
+            trading_pairs=[self.trading_pair, second_pair],
+            connector=connector,
+            api_factory=connector._web_assistants_factory,
+            auth=self.mock_auth,
+            hub=MagicMock(),
+            domain=CONSTANTS.DEFAULT_DOMAIN,
+            market_routing=CONSTANTS.MARKET_ROUTING_KRX,
+            market_status_enabled=True,
+        )
+        ds.logger().setLevel(1)
+        ds.logger().addHandler(self)
+        return connector, ds, second_pair
 
     def _ws_orderbook_payload(self) -> str:
         """Caret body of an orderbook message (without the 0|TR_ID|TR_KEY| prefix)."""
@@ -1338,6 +1394,134 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         with patch.object(ds, "_process_orderbook_data", new_callable=AsyncMock) as m:
             await ds._handle_data_message(raw)
             m.assert_awaited_once()
+
+    async def test_trht_yn_latches_halt(self):
+        ds = self._make_ds("sor", market_status_enabled=True)
+        raw = "0|H0UNMKO0|005930|" + self._ws_market_status_payload(TRHT_YN="Y")
+
+        await ds._handle_data_message(raw)
+
+        self.assertTrue(self.connector.get_session_halt_signals(self.trading_pair).trht_halted)
+
+    async def test_cb_set_and_clear(self):
+        ds = self._make_ds("sor", market_status_enabled=True)
+
+        await ds._handle_data_message(
+            "0|H0UNMKO0|005930|" + self._ws_market_status_payload(MKOP_CLS_CODE="174")
+        )
+        self.assertTrue(self.connector.get_session_halt_signals(self.trading_pair).cb_latched)
+
+        await ds._handle_data_message(
+            "0|H0UNMKO0|005930|" + self._ws_market_status_payload(MKOP_CLS_CODE="175")
+        )
+        self.assertFalse(self.connector.get_session_halt_signals(self.trading_pair).cb_latched)
+
+        await ds._handle_data_message(
+            "0|H0UNMKO0|005930|" + self._ws_market_status_payload(MKOP_CLS_CODE="184")
+        )
+        self.assertTrue(self.connector.get_session_halt_signals(self.trading_pair).cb_latched)
+
+        await ds._handle_data_message(
+            "0|H0UNMKO0|005930|" + self._ws_market_status_payload(MKOP_CLS_CODE="185")
+        )
+        self.assertFalse(self.connector.get_session_halt_signals(self.trading_pair).cb_latched)
+
+    async def test_unknown_mkop_code_fail_closed(self):
+        ds = self._make_ds("sor", market_status_enabled=True)
+        self.connector.logger().setLevel(1)
+        self.connector.logger().addHandler(self)
+
+        await ds._handle_data_message(
+            "0|H0UNMKO0|005930|" + self._ws_market_status_payload(MKOP_CLS_CODE="174")
+        )
+        await ds._handle_data_message(
+            "0|H0UNMKO0|005930|" + self._ws_market_status_payload(MKOP_CLS_CODE="999")
+        )
+
+        self.assertTrue(self.connector.get_session_halt_signals(self.trading_pair).cb_latched)
+        self.assertTrue(self._is_logged_partial("WARNING", "unknown MKOP_CLS_CODE"))
+
+    async def test_cb_latch_retained_after_reconnect(self):
+        ds = self._make_ds("sor", market_status_enabled=True)
+
+        await ds._handle_data_message(
+            "0|H0UNMKO0|005930|" + self._ws_market_status_payload(MKOP_CLS_CODE="174")
+        )
+        ds_reconnected = self._make_ds("sor", market_status_enabled=True)
+
+        self.assertTrue(self.connector.get_session_halt_signals(self.trading_pair).cb_latched)
+        self.assertIsNot(ds, ds_reconnected)
+
+    async def test_short_h0unmko0_frame_does_not_flip_latch(self):
+        ds = self._make_ds("sor", market_status_enabled=True)
+        raw_halted = "0|H0UNMKO0|005930|" + self._ws_market_status_payload(TRHT_YN="Y")
+        raw_short = "0|H0UNMKO0|005930|005930^N"
+
+        await ds._handle_data_message(raw_halted)
+        await ds._handle_data_message(raw_short)
+
+        self.assertTrue(self.connector.get_session_halt_signals(self.trading_pair).trht_halted)
+
+    async def test_market_status_ready_per_pair(self):
+        ds = self._make_ds("sor", market_status_enabled=True)
+        self.connector._market_status_enabled = True
+        second_pair = "000660-KRW"
+        self.connector._set_trading_pair_symbol_map(bidict({
+            "005930": self.trading_pair,
+            "000660": second_pair,
+        }))
+
+        await ds._handle_control_message(self._ws_market_status_subscription_success_raw())
+
+        self.assertTrue(self.connector.get_session_halt_signals(self.trading_pair).market_status_ready)
+        self.assertFalse(self.connector.get_session_halt_signals(second_pair).market_status_ready)
+
+    async def test_market_status_ack_unresolvable_tr_key_does_not_confirm_first_pair(self):
+        connector, ds, _ = self._make_two_pair_market_status_ds()
+
+        await ds._handle_control_message(
+            self._ws_market_status_subscription_success_raw(tr_id="H0STMKO0", tr_key="GARBAGE")
+        )
+
+        self.assertNotIn(self.trading_pair, connector._sh_market_status_confirmed)
+        self.assertFalse(connector.get_session_halt_signals(self.trading_pair).market_status_ready)
+
+    async def test_market_status_data_unresolvable_tr_key_does_not_mutate_latch(self):
+        connector, ds, _ = self._make_two_pair_market_status_ds()
+        halted = "0|H0STMKO0|005930|" + self._ws_market_status_payload(
+            TRHT_YN="Y",
+            MKOP_CLS_CODE="174",
+        )
+        unresolved_clear = "0|H0STMKO0|GARBAGE|" + self._ws_market_status_payload(
+            TRHT_YN="N",
+            MKOP_CLS_CODE="175",
+        )
+
+        await ds._handle_data_message(halted)
+        await ds._handle_data_message(unresolved_clear)
+
+        signals = connector.get_session_halt_signals(self.trading_pair)
+        self.assertTrue(signals.trht_halted)
+        self.assertTrue(signals.cb_latched)
+
+    async def test_none_field_does_not_clear_latch(self):
+        self.connector.note_market_status(
+            self.trading_pair,
+            trht_yn=None,
+            mkop_cls_code="174",
+            vi_cls_code=None,
+            ovtm_vi_cls_code=None,
+        )
+
+        self.connector.note_market_status(
+            self.trading_pair,
+            trht_yn=None,
+            mkop_cls_code=None,
+            vi_cls_code=None,
+            ovtm_vi_cls_code=None,
+        )
+
+        self.assertTrue(self.connector.get_session_halt_signals(self.trading_pair).cb_latched)
 
     # ------------------------------------------------------------------
     # Test: _resolve_trading_pair
@@ -1387,6 +1571,31 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual({"H0UNASP0", "H0UNCNT0"}, reg_trs)
         unreg_trs = {c.args[0] for c in hub.unregister.await_args_list}
         self.assertEqual({"H0UNASP0", "H0UNCNT0"}, unreg_trs)
+
+    async def test_listen_registers_market_status_tr_when_enabled(self):
+        hub = MagicMock()
+        hub.register = AsyncMock()
+        hub.unregister = AsyncMock()
+        ds = self._make_ds("sor", market_status_enabled=True)
+        ds._hub = hub
+        self.connector.mark_market_status_confirmed(self.trading_pair)
+        with patch.object(
+            self.connector,
+            "exchange_symbol_associated_to_pair",
+            new=AsyncMock(return_value="005930"),
+        ):
+            task = asyncio.create_task(ds.listen_for_subscriptions())
+            await asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        reg_trs = {c.args[0] for c in hub.register.await_args_list}
+        self.assertEqual({"H0UNASP0", "H0UNCNT0", "H0UNMKO0"}, reg_trs)
+        unreg_trs = {c.args[0] for c in hub.unregister.await_args_list}
+        self.assertEqual({"H0UNASP0", "H0UNCNT0", "H0UNMKO0"}, unreg_trs)
+        self.assertNotIn(self.trading_pair, self.connector._sh_market_status_confirmed)
 
     async def test_stale_listen_finally_skips_unregister_after_restart(self):
         hub = MagicMock()

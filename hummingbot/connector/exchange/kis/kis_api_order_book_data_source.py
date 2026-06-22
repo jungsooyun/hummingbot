@@ -57,6 +57,7 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
         market_routing: str = CONSTANTS.MARKET_ROUTING_KRX,
         ws_enabled: bool = True,
+        market_status_enabled: bool = False,
     ):
         super().__init__(trading_pairs)
         self._connector = connector
@@ -69,6 +70,8 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._ws_enabled = ws_enabled
         self._ob_tr_id = CONSTANTS.WS_ORDERBOOK_TR_ID_BY_ROUTING[market_routing]
         self._trade_tr_id = CONSTANTS.WS_TRADE_TR_ID_BY_ROUTING[market_routing]
+        self._market_status_enabled = market_status_enabled
+        self._market_status_tr_id = CONSTANTS.WS_MARKET_STATUS_TR_ID_BY_ROUTING[market_routing]
         # REST snapshot market-division code, routing-aware like the WS TR_IDs above.
         # NB: sor maps to 'UN' (통합) — unified KRX+NXT quotes stay live across the KRX
         # close into the NXT after-market (JEP-180). See REST_QUOTE_MRKT_DIV_BY_ROUTING
@@ -78,6 +81,7 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._known_market_tr_ids = (
             set(CONSTANTS.WS_ORDERBOOK_TR_ID_BY_ROUTING.values())
             | set(CONSTANTS.WS_TRADE_TR_ID_BY_ROUTING.values())
+            | set(CONSTANTS.WS_MARKET_STATUS_TR_ID_BY_ROUTING.values())
         )
 
     # ------------------------------------------------------------------
@@ -109,22 +113,30 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
         self._listen_gen += 1
         my_gen = self._listen_gen
-        symbols = [
-            await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        pairs_symbols = [
+            (
+                trading_pair,
+                await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair),
+            )
             for trading_pair in self._trading_pairs
         ]
         try:
-            for symbol in symbols:
+            for _, symbol in pairs_symbols:
                 await self._hub.register(self._ob_tr_id, symbol, self._on_ws_frame)
                 await self._hub.register(self._trade_tr_id, symbol, self._on_ws_frame)
-            self.logger().info("Registered KIS orderbook + trade channels on the shared WS hub")
+                if self._market_status_enabled:
+                    await self._hub.register(self._market_status_tr_id, symbol, self._on_ws_frame)
+            self.logger().info("Registered KIS market-data channels on the shared WS hub")
             while True:
                 await self._sleep(3600)
         finally:
             if my_gen == self._listen_gen:
-                for symbol in symbols:
+                for trading_pair, symbol in pairs_symbols:
                     await self._hub.unregister(self._ob_tr_id, symbol)
                     await self._hub.unregister(self._trade_tr_id, symbol)
+                    if self._market_status_enabled:
+                        await self._hub.unregister(self._market_status_tr_id, symbol)
+                        self._connector.discard_market_status_confirmed(trading_pair)
 
     async def _on_ws_frame(self, raw: str):
         """Hub dispatch entry-point: route a raw frame like the old socket loop."""
@@ -152,6 +164,10 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
             parsed = self._parse_caret_fields(data_str, CONSTANTS.WS_TRADE_COLUMNS)
             if parsed:
                 await self._process_trade_data(tr_key, parsed)
+        elif self._market_status_enabled and tr_id == self._market_status_tr_id:
+            fields = data_str.split("^")
+            parsed = dict(zip(CONSTANTS.WS_MARKET_STATUS_COLUMNS, fields))
+            await self._process_market_status_data(tr_key, parsed)
         elif tr_id in self._known_market_tr_ids:
             # A market-data channel for a different routing mode than configured —
             # subscription/dispatch drift. Surface it instead of dropping silently.
@@ -174,6 +190,18 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         msg1 = body.get("msg1", "")
         if rt_cd not in ("", "0"):
             self.logger().warning(f"KIS WS subscription error: {msg1}")
+            return
+        header = data.get("header", {})
+        if self._market_status_enabled and rt_cd == "0" and header.get("tr_id") == self._market_status_tr_id:
+            tr_key = header.get("tr_key", "")
+            trading_pair = await self._resolve_trading_pair_exact(tr_key)
+            if trading_pair in self._trading_pairs:
+                self._connector.mark_market_status_confirmed(trading_pair)
+            else:
+                self.logger().warning(
+                    f"JEP-198 H0STMKO0 subscribe-ack tr_key={tr_key!r} did not resolve to a "
+                    f"subscribed pair; NOT confirming (fail-closed)."
+                )
 
     # ------------------------------------------------------------------
     # Data parsing
@@ -266,6 +294,24 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
             timestamp=timestamp,
         )
         self._message_queue[self._trade_messages_queue_key].put_nowait(trade_msg)
+
+    async def _process_market_status_data(self, tr_key: str, data: Dict[str, str]):
+        trading_pair = await self._resolve_trading_pair_exact(tr_key)
+        if trading_pair not in self._trading_pairs:
+            self.logger().warning(
+                f"JEP-198 H0STMKO0 frame tr_key={tr_key!r} unresolved; dropped (latches unchanged)."
+            )
+            return
+        if len(data) < len(CONSTANTS.WS_MARKET_STATUS_COLUMNS):
+            self.logger().warning("JEP-198 short H0STMKO0 frame ignored (latches unchanged).")
+            return
+        self._connector.note_market_status(
+            trading_pair,
+            trht_yn=data.get("TRHT_YN"),
+            mkop_cls_code=data.get("MKOP_CLS_CODE"),
+            vi_cls_code=data.get("VI_CLS_CODE"),
+            ovtm_vi_cls_code=data.get("OVTM_VI_CLS_CODE"),
+        )
 
     # ------------------------------------------------------------------
     # REST snapshot fallback (for initial load and recovery)
@@ -394,6 +440,23 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # Fallback: return first trading pair
         if self._trading_pairs:
             return self._trading_pairs[0]
+        return None
+
+    async def _resolve_trading_pair_exact(self, stock_code: str) -> Optional[str]:
+        """Strict resolve: ONLY a symbol-map hit. No _trading_pairs[0] fallback.
+        Used for the JEP-198 H0STMKO0 safety-gate paths where a wrong-pair attribution
+        is a money-safety defect (mirrors the JEP-134 orderbook symbol-map-match guard)."""
+        try:
+            symbol_map = getattr(self._connector, "_trading_pair_symbol_map", None)
+            if symbol_map is None:
+                map_ready = getattr(self._connector, "trading_pair_symbol_map_ready", None)
+                map_getter = getattr(self._connector, "trading_pair_symbol_map", None)
+                if callable(map_getter) and (not callable(map_ready) or map_ready()):
+                    symbol_map = await map_getter()
+            if symbol_map and stock_code and stock_code in symbol_map:
+                return symbol_map[stock_code]
+        except Exception:
+            pass
         return None
 
     # ------------------------------------------------------------------

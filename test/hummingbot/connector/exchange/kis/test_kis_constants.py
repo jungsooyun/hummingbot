@@ -29,4 +29,5 @@ def test_market_status_decode_tables_are_fail_closed():
     assert sidecar_codes.isdisjoint(CONSTANTS.MKOP_CLS_SET_TEMP_STOP)
 
     assert CONSTANTS.TRHT_HALTED == "Y"
+    assert "Y" in CONSTANTS.VI_ACTIVE_VALUES
     assert CONSTANTS.KNOWN_NORMAL_MKOP == frozenset()

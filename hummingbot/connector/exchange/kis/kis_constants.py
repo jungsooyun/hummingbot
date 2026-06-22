@@ -54,7 +54,7 @@ MKOP_CLS_SET_CB = frozenset({"174", "184"})      # 서킷브레이커 발동/개
 MKOP_CLS_CLEAR_CB = frozenset({"175", "185"})    # 서킷브레이커 해제 (UNVERIFIED-live)
 MKOP_CLS_SET_TEMP_STOP = frozenset({"164"})      # 시장임시정지 (release UNVERIFIED -> retain until verified-normal)
 TRHT_HALTED = "Y"                                # per-stock halt (VERIFIED)
-VI_ACTIVE_VALUES = frozenset({"1", "2", "3"})    # VI active (placeholder; confirm on capture)
+VI_ACTIVE_VALUES = frozenset({"Y", "1", "2", "3"})  # VI active — fail-safe superset; spec/research say Y/N flag, digits are a hypothesis; UNVERIFIED-live, confirm/narrow on §9 capture
 KNOWN_NORMAL_MKOP = frozenset()                  # normal-session codes; populate from live capture (empty => unknown fail-closed)
 
 # --------------------------------------------------------------------------- #

@@ -145,6 +145,16 @@ class KisConfigMap(BaseConnectorConfigMap):
             "is_updatable": True,
         },
     )
+    kis_market_status_enabled: str = Field(
+        default="false",
+        json_schema_extra={
+            "prompt": lambda cm: "Subscribe H0STMKO0 market-status feed for halt detection? (true/false)",
+            "is_secure": False,
+            "is_connect_key": True,
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
     # The customer HTS ID (고객 ID) is the tr_key required by the KIS execution-
     # notice realtime channel (H0STCNI0/H0STCNI9). It is NOT a stock code — KIS
     # rejects a stock symbol here with OPSP0017 "htsid가 잘못되었습니다", and the

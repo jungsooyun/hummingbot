@@ -64,6 +64,7 @@ class KisExchange(ExchangePyBase):
         kis_sandbox: str = "false",
         kis_market_routing: str = CONSTANTS.MARKET_ROUTING_SOR,
         kis_ws_enabled: str = "true",
+        kis_market_status_enabled: str = "false",
         kis_hts_id: str = "",
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
     ):
@@ -94,7 +95,14 @@ class KisExchange(ExchangePyBase):
         self._sh_prev_top: Dict[str, tuple] = {}
         self._sh_last_book_change: Dict[str, float] = {}
         # Phase-2 latches (populated only when kis_market_status_enabled)
-        self._market_status_enabled = False
+        self._market_status_enabled = str(kis_market_status_enabled).strip().lower() == "true"
+        if self._market_status_enabled and not CONSTANTS.KNOWN_NORMAL_MKOP:
+            self.logger().warning(
+                "JEP-198: kis_market_status_enabled=True but KNOWN_NORMAL_MKOP is empty — "
+                "the H0STMKO0 CB latch will fail-closed (permanent over-pause) on the first "
+                "normal frame. Populate KNOWN_NORMAL_MKOP from a live KRX-hours capture (§9) "
+                "before relying on this feed."
+            )
         self._sh_trht_halted: Dict[str, bool] = {}
         self._sh_cb_latched: bool = False           # market-wide CB (retained on reconnect)
         self._sh_vi_latched: Dict[str, bool] = {}
@@ -287,6 +295,7 @@ class KisExchange(ExchangePyBase):
             domain=self._domain,
             market_routing=self._market_routing,
             ws_enabled=self._ws_enabled,
+            market_status_enabled=self._market_status_enabled,
         )
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
@@ -310,6 +319,43 @@ class KisExchange(ExchangePyBase):
         if self._sh_prev_top.get(trading_pair) != top:
             self._sh_prev_top[trading_pair] = top
             self._sh_last_book_change[trading_pair] = time.perf_counter()
+
+    def mark_market_status_confirmed(self, trading_pair: str) -> None:
+        self._sh_market_status_confirmed.add(trading_pair)
+
+    def discard_market_status_confirmed(self, trading_pair: str) -> None:
+        self._sh_market_status_confirmed.discard(trading_pair)
+
+    def note_market_status(
+        self,
+        trading_pair: str,
+        *,
+        trht_yn: Optional[str],
+        mkop_cls_code: Optional[str],
+        vi_cls_code: Optional[str],
+        ovtm_vi_cls_code: Optional[str],
+    ) -> None:
+        if trht_yn is not None:
+            self._sh_trht_halted[trading_pair] = trht_yn == CONSTANTS.TRHT_HALTED
+        if vi_cls_code is not None or ovtm_vi_cls_code is not None:
+            self._sh_vi_latched[trading_pair] = (
+                vi_cls_code in CONSTANTS.VI_ACTIVE_VALUES
+                or ovtm_vi_cls_code in CONSTANTS.VI_ACTIVE_VALUES
+            )
+        if mkop_cls_code is None:
+            return
+        if (
+            mkop_cls_code in CONSTANTS.MKOP_CLS_SET_CB
+            or mkop_cls_code in CONSTANTS.MKOP_CLS_SET_TEMP_STOP
+        ):
+            self._sh_cb_latched = True
+        elif mkop_cls_code in CONSTANTS.MKOP_CLS_CLEAR_CB:
+            self._sh_cb_latched = False
+        elif mkop_cls_code not in CONSTANTS.KNOWN_NORMAL_MKOP:
+            self.logger().warning(
+                f"JEP-198 unknown MKOP_CLS_CODE={mkop_cls_code!r}; fail-closed (latch retained)."
+            )
+            self._sh_cb_latched = True
 
     def get_session_halt_signals(self, trading_pair: str) -> kis_utils.KisHaltSignals:
         now = time.perf_counter()
