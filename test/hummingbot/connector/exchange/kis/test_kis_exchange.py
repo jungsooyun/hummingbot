@@ -1423,6 +1423,39 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         # Omitted kis_hts_id -> empty (exec-notice WS skipped, REST fallback).
         self.assertEqual("", self._make_exchange()._hts_id)
 
+    def test_kis_hts_id_forwarded_as_connect_key(self):
+        # is_connect_key=True is the REAL forwarding switch: only is_connect_key
+        # fields are passed to the connector constructor
+        # (config_helpers.api_keys_from_connector_config_map -> settings.
+        # conn_init_parameters -> connector_class(**init_params)). If kis_hts_id
+        # is not a connect key it never reaches KisExchange.__init__ and
+        # self._hts_id is always "" -> silent REST-only fallback (JEP-180 trap).
+        from hummingbot.client.config.config_helpers import (
+            ClientConfigAdapter,
+            api_keys_from_connector_config_map,
+        )
+        from hummingbot.connector.exchange.kis.kis_utils import KisConfigMap
+
+        cm = ClientConfigAdapter(
+            KisConfigMap(
+                kis_app_key="k",
+                kis_app_secret="s",
+                kis_account_number="12345678-01",
+                kis_hts_id="myhts",
+            )
+        )
+        api_keys = api_keys_from_connector_config_map(cm)
+        self.assertIn("kis_hts_id", api_keys)
+        self.assertEqual("myhts", api_keys["kis_hts_id"])
+
+        # End-to-end (Plan Review F1): the forwarded connect-keys must actually
+        # CONSTRUCT the connector (this is what the live factory does:
+        # connector_class(**init_params)) and reach self._hts_id. kis_sandbox is
+        # is_connect_key=False so it is absent from api_keys -> constructor uses
+        # its default; trading_pairs is added the way the factory does.
+        ex = KisExchange(**api_keys, trading_pairs=[self.trading_pair])
+        self.assertEqual("myhts", ex._hts_id)
+
     def validate_auth_credentials_present(self, request_call: RequestCall):
         request_headers = request_call.kwargs["headers"]
         self.assertIn("Authorization", request_headers)

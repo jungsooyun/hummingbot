@@ -126,6 +126,26 @@ class KisConfigMap(BaseConnectorConfigMap):
             "is_updatable": True,
         },
     )
+    # The customer HTS ID (고객 ID) is the tr_key required by the KIS execution-
+    # notice realtime channel (H0STCNI0/H0STCNI9). It is NOT a stock code — KIS
+    # rejects a stock symbol here with OPSP0017 "htsid가 잘못되었습니다", and the
+    # rejected subscribe recycles the shared WS socket (taking the orderbook WS
+    # down with it). The channel is account-wide: one subscription = all fills
+    # for the account. Empty default -> exec-notice WS is skipped and fills fall
+    # back to REST order-status polling (orderbook WS stays up). is_connect_key=True
+    # is MANDATORY: only is_connect_key fields are forwarded to the connector
+    # constructor (api_keys_from_connector_config_map filters on is_connect_key) —
+    # see kis_ws_enabled / JEP-180. Not a secret (an identifier, like
+    # kis_account_number).
+    kis_hts_id: str = Field(
+        default="",
+        json_schema_extra={
+            "prompt": lambda cm: "Enter your KIS HTS ID (고객 ID) — required for the execution-notice channel (H0STCNI0)",
+            "is_secure": False,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        },
+    )
     model_config = ConfigDict(title="kis")
 
 
