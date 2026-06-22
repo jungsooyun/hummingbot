@@ -612,6 +612,39 @@ class KisAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
         hub.unregister.assert_not_called()
         self.connector.exchange_symbol_associated_to_pair.assert_not_called()
 
+    async def test_listen_preserves_dollar_prefixed_hts_id(self):
+        # REGRESSION (JEP-200 live, 2026-06-23): a real KIS HTS ID can be
+        # DOLLAR-PREFIXED — KIS issues it verbatim as "고객 ID : $1766930". The
+        # connector must register the exec-notice tr_key EXACTLY (the '$' and all
+        # digits preserved, only whitespace stripped). Dropping the '$' caused
+        # OPSP0017 "htsid가 잘못되" + a WS-hub recycle storm on EC2 until restored.
+        hub = MagicMock()
+        hub.register = AsyncMock()
+        hub.unregister = AsyncMock()
+        ds = KisAPIUserStreamDataSource(
+            auth=self.auth,
+            trading_pairs=["005930-KRW"],
+            connector=self.connector,
+            api_factory=self.api_factory,
+            hub=hub,
+            domain=CONSTANTS.DEFAULT_DOMAIN,
+            hts_id="$1766930",
+        )
+        self.assertEqual("$1766930", ds._hts_id)  # '$' NOT stripped at construction
+        out = asyncio.Queue()
+        task = asyncio.create_task(ds.listen_for_user_stream(out))
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        self.assertEqual(1, hub.register.await_count)
+        reg_args = hub.register.await_args_list[0].args
+        self.assertEqual("H0STCNI0", reg_args[0])       # tr_id
+        self.assertEqual("$1766930", reg_args[1])       # tr_key passed VERBATIM incl. '$'
+
     # ------------------------------------------------------------------ #
     # Test: AES decryption function
     # ------------------------------------------------------------------ #

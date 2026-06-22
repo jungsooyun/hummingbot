@@ -166,10 +166,18 @@ class KisConfigMap(BaseConnectorConfigMap):
     # constructor (api_keys_from_connector_config_map filters on is_connect_key) —
     # see kis_ws_enabled / JEP-180. Not a secret (an identifier, like
     # kis_account_number).
+    #
+    # FORMAT (JEP-200 live, 2026-06-23): enter the HTS ID EXACTLY as KIS issues it,
+    # INCLUDING any leading '$'. KIS provisions numeric HTS IDs dollar-prefixed —
+    # e.g. it SMSes "고객 ID : $1766930". Dropping the '$' (entering "1766930") is
+    # rejected with OPSP0017 "htsid가 잘못되었습니다" and recycles the shared WS hub.
+    # The connector strips only surrounding whitespace (NOT the '$') and sends the
+    # value verbatim as the H0STCNI0 tr_key. Pinned by the dollar-prefix regression
+    # tests in test_kis_exchange.py / test_kis_api_user_stream_data_source.py.
     kis_hts_id: str = Field(
         default="",
         json_schema_extra={
-            "prompt": lambda cm: "Enter your KIS HTS ID (고객 ID) — required for the execution-notice channel (H0STCNI0)",
+            "prompt": lambda cm: "Enter your KIS HTS ID exactly as KIS issues it, including any '$' prefix (고객 ID, e.g. $1766930) — required for the execution-notice channel (H0STCNI0)",
             "is_secure": False,
             "is_connect_key": True,
             "prompt_on_new": True,

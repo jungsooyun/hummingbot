@@ -1434,6 +1434,44 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         # Omitted kis_hts_id -> empty (exec-notice WS skipped, REST fallback).
         self.assertEqual("", self._make_exchange()._hts_id)
 
+    def test_dollar_prefixed_hts_id_preserved_end_to_end(self):
+        # REGRESSION (JEP-200 live, 2026-06-23): KIS provisions numeric HTS IDs
+        # DOLLAR-PREFIXED — it SMSes "고객 ID : $1766930". The '$' is part of the
+        # htsid; dropping it (entering "1766930") is rejected with OPSP0017
+        # "htsid가 잘못되었습니다" and recycles the shared WS hub (EC2-confirmed).
+        # Pin that the config->connect-keys->constructor->DS path preserves the '$'
+        # VERBATIM, and that .strip() removes only surrounding whitespace.
+        from hummingbot.client.config.config_helpers import (
+            ClientConfigAdapter,
+            api_keys_from_connector_config_map,
+        )
+        from hummingbot.connector.exchange.kis.kis_utils import KisConfigMap
+
+        cm = ClientConfigAdapter(
+            KisConfigMap(
+                kis_app_key="k",
+                kis_app_secret="s",
+                kis_account_number="12345678-01",
+                kis_hts_id="$1766930",
+            )
+        )
+        api_keys = api_keys_from_connector_config_map(cm)
+        self.assertEqual("$1766930", api_keys["kis_hts_id"])  # '$' survives config map
+        ex = KisExchange(**api_keys, trading_pairs=[self.trading_pair])
+        self.assertEqual("$1766930", ex._hts_id)  # '$' preserved through constructor
+        ds = ex._create_user_stream_data_source()
+        self.assertEqual("$1766930", ds._hts_id)  # forwarded verbatim to the DS
+        # .strip() removes whitespace only, NOT the '$' or digits.
+        ex2 = KisExchange(
+            kis_app_key="testAppKey",
+            kis_app_secret="testAppSecret",
+            kis_account_number="12345678-01",
+            trading_pairs=[self.trading_pair],
+            kis_market_routing="sor",
+            kis_hts_id="  $1766930  ",
+        )
+        self.assertEqual("$1766930", ex2._hts_id)
+
     def test_kis_hts_id_forwarded_as_connect_key(self):
         # is_connect_key=True is the REAL forwarding switch: only is_connect_key
         # fields are passed to the connector constructor
