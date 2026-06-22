@@ -193,7 +193,6 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         if not trading_pair:
             return
 
-        self._connector.note_hour_cls_code(trading_pair, data.get("HOUR_CLS_CODE"))
         timestamp = time.time()
         update_id = int(timestamp * 1e3)
 
@@ -238,6 +237,7 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
             if symbol_map and symbol_map.get(tr_key) == trading_pair:
                 self._mark_ws_orderbook_frame(trading_pair)
                 self._connector.note_top_of_book(trading_pair, bids[0][0], asks[0][0])
+                self._connector.note_hour_cls_code(trading_pair, data.get("HOUR_CLS_CODE"))
 
     async def _process_trade_data(self, tr_key: str, data: Dict[str, str]):
         """Convert parsed trade data to OrderBookMessage and enqueue."""

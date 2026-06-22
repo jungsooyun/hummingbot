@@ -28,7 +28,7 @@ class LadderHedgeControllerConfigBase(ControllerConfigBase):
     max_kis_ws_age_s: Optional[float] = Field(default=3.0, json_schema_extra={"is_updatable": True})
     max_hl_ws_age_s: Optional[float] = Field(default=12.0, json_schema_extra={"is_updatable": True})
     ws_staleness_grace_s: float = Field(default=90.0, json_schema_extra={"is_updatable": True})
-    session_halt_gate_enabled: bool = Field(default=False, json_schema_extra={"is_updatable": True})
+    session_halt_gate_enabled: bool = Field(default=False, json_schema_extra={"is_updatable": False})
     session_halt_max_ws_age_s: float = Field(default=3.0, json_schema_extra={"is_updatable": True})
     session_halt_max_book_static_s: float = Field(default=8.0, json_schema_extra={"is_updatable": True})
     adopt_existing_inventory: bool = Field(default=False, json_schema_extra={"is_updatable": True})

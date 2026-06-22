@@ -133,6 +133,14 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
                 raise ValueError(
                     "session_halt_gate_enabled requires ws_staleness_kill_switch_enabled=True "
                     "with a finite max_kis_ws_age_s (the WS-freshness floor the halt 'ready' check depends on).")
+            for _name, _val in (
+                ("session_halt_max_ws_age_s", getattr(config, "session_halt_max_ws_age_s", None)),
+                ("session_halt_max_book_static_s", getattr(config, "session_halt_max_book_static_s", None)),
+            ):
+                if _val is None or not math.isfinite(_val) or _val <= 0:
+                    raise ValueError(
+                        f"{_name} must be a finite positive number when session_halt_gate_enabled is True "
+                        f"(got {_val!r}).")
             _gates.append(SessionHaltGate())
         self._gate_chain = GateChain(_gates)
         super().__init__(

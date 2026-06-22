@@ -14,11 +14,13 @@ try:
     from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_maker_executor import (
         LadderMakerExecutor,
     )
+    from hummingbot.strategy_v2.controllers.ladder_hedge_controller_base import LadderHedgeControllerConfigBase
     from hummingbot.strategy_v2.gates.gate_chain import InventoryGate
     _EXECUTOR_IMPORTABLE = True
 except Exception:  # pragma: no cover - env-dependent
     LadderMakerExecutor = None
     CrossVenueHedgedExecutorBase = None
+    LadderHedgeControllerConfigBase = None
     InventoryGate = None
     _EXECUTOR_IMPORTABLE = False
 
@@ -91,6 +93,31 @@ class LadderMakerInitTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             with patch.object(CrossVenueHedgedExecutorBase, "__init__", lambda self, **k: None):
                 LadderMakerExecutor(strategy=MagicMock(), config=cfg)
+
+    def test_session_halt_rejects_invalid_thresholds(self):
+        for field_name, invalid_value in (
+            ("session_halt_max_book_static_s", float("nan")),
+            ("session_halt_max_book_static_s", float("inf")),
+            ("session_halt_max_book_static_s", 0),
+            ("session_halt_max_ws_age_s", float("nan")),
+            ("session_halt_max_ws_age_s", float("inf")),
+            ("session_halt_max_ws_age_s", 0),
+        ):
+            with self.subTest(field_name=field_name, invalid_value=invalid_value):
+                cfg = _mock_config(Decimal("8"))
+                cfg.session_halt_gate_enabled = True
+                cfg.ws_staleness_kill_switch_enabled = True
+                cfg.max_kis_ws_age_s = 3.0
+                cfg.session_halt_max_ws_age_s = 3.0
+                cfg.session_halt_max_book_static_s = 8.0
+                setattr(cfg, field_name, invalid_value)
+                with self.assertRaisesRegex(ValueError, field_name):
+                    with patch.object(CrossVenueHedgedExecutorBase, "__init__", lambda self, **k: None):
+                        LadderMakerExecutor(strategy=MagicMock(), config=cfg)
+
+    def test_session_halt_gate_enabled_is_not_hot_updatable(self):
+        field = LadderHedgeControllerConfigBase.model_fields["session_halt_gate_enabled"]
+        self.assertFalse(field.json_schema_extra["is_updatable"])
 
 
 @unittest.skipUnless(_EXECUTOR_IMPORTABLE, "ladder_maker_executor requires the V2 stack (paho) — run in Docker/CI")

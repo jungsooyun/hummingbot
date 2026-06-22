@@ -1057,7 +1057,25 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         parsed = KisAPIOrderBookDataSource._parse_caret_fields(
             raw.split("|")[3], CONSTANTS.WS_ORDERBOOK_COLUMNS
         )
+        self.connector._set_trading_pair_symbol_map(bidict({"005930": self.trading_pair}))
+
         await self.data_source._process_orderbook_data("005930", parsed)
+
+        self.assertTrue(self.connector.get_session_halt_signals(self.trading_pair).hour_cls_auction)
+
+    async def test_wrong_pair_frame_does_not_clear_auction_flag(self):
+        raw = self._ws_orderbook_raw(hour_cls_code="C")
+        parsed = KisAPIOrderBookDataSource._parse_caret_fields(
+            raw.split("|")[3], CONSTANTS.WS_ORDERBOOK_COLUMNS
+        )
+        self.connector._set_trading_pair_symbol_map(bidict({"005930": self.trading_pair}))
+        await self.data_source._process_orderbook_data("005930", parsed)
+        self.assertTrue(self.connector.get_session_halt_signals(self.trading_pair).hour_cls_auction)
+
+        wrong_pair = dict(parsed)
+        wrong_pair["HOUR_CLS_CODE"] = "0"
+        await self.data_source._process_orderbook_data("999999", wrong_pair)
+
         self.assertTrue(self.connector.get_session_halt_signals(self.trading_pair).hour_cls_auction)
 
     async def test_control_message_subscription_error_does_not_stamp(self):
