@@ -64,6 +64,7 @@ class KisExchange(ExchangePyBase):
         kis_sandbox: str = "false",
         kis_market_routing: str = CONSTANTS.MARKET_ROUTING_SOR,
         kis_ws_enabled: str = "true",
+        kis_hts_id: str = "",
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
     ):
         self._app_key = kis_app_key
@@ -82,6 +83,11 @@ class KisExchange(ExchangePyBase):
         # (REST-only market data + fills). Default enabled. The factory forwards
         # every config-map field as a kwarg, so the constructor MUST accept it.
         self._ws_enabled = str(kis_ws_enabled).strip().lower() != "false"
+        # Customer HTS ID for the execution-notice realtime channel (H0STCNI0).
+        # Empty -> exec-notice WS skipped (REST fill fallback); see kis_utils /
+        # the user-stream data source. The factory forwards every config-map
+        # field as a kwarg, so the constructor MUST accept it.
+        self._hts_id = (kis_hts_id or "").strip()
         self._ws_hub = None
         # JEP-198 session-halt per-pair state (perf_counter clock)
         self._sh_hour_cls_code: Dict[str, str] = {}
@@ -292,6 +298,7 @@ class KisExchange(ExchangePyBase):
             hub=self.ws_hub,
             domain=self._domain,
             ws_enabled=self._ws_enabled,
+            hts_id=self._hts_id,
         )
 
     def note_hour_cls_code(self, trading_pair: str, code: Optional[str]) -> None:

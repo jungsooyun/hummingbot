@@ -1389,6 +1389,7 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
             kis_account_number="12345678-01",
             kis_sandbox="false",
             kis_market_routing="sor",
+            kis_hts_id="myhts",
             trading_pairs=[self.trading_pair],
             trading_required=False,
             balance_asset_limit={},
@@ -1413,6 +1414,58 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         )
         self.assertEqual("sor", ex._market_routing)
         self.assertEqual(limit, ex._balance_asset_limit)
+
+    def test_constructor_stores_and_forwards_hts_id(self):
+        # kis_hts_id must reach the user-stream DS so the exec-notice channel
+        # (H0STCNI0) can subscribe with the customer HTS ID as tr_key.
+        ex = KisExchange(
+            kis_app_key="testAppKey",
+            kis_app_secret="testAppSecret",
+            kis_account_number="12345678-01",
+            trading_pairs=[self.trading_pair],
+            kis_market_routing="sor",
+            kis_hts_id="myhts",
+        )
+        self.assertEqual("myhts", ex._hts_id)
+        ds = ex._create_user_stream_data_source()
+        self.assertEqual("myhts", ds._hts_id)
+
+    def test_hts_id_defaults_empty(self):
+        # Omitted kis_hts_id -> empty (exec-notice WS skipped, REST fallback).
+        self.assertEqual("", self._make_exchange()._hts_id)
+
+    def test_kis_hts_id_forwarded_as_connect_key(self):
+        # is_connect_key=True is the REAL forwarding switch: only is_connect_key
+        # fields are passed to the connector constructor
+        # (config_helpers.api_keys_from_connector_config_map -> settings.
+        # conn_init_parameters -> connector_class(**init_params)). If kis_hts_id
+        # is not a connect key it never reaches KisExchange.__init__ and
+        # self._hts_id is always "" -> silent REST-only fallback (JEP-180 trap).
+        from hummingbot.client.config.config_helpers import (
+            ClientConfigAdapter,
+            api_keys_from_connector_config_map,
+        )
+        from hummingbot.connector.exchange.kis.kis_utils import KisConfigMap
+
+        cm = ClientConfigAdapter(
+            KisConfigMap(
+                kis_app_key="k",
+                kis_app_secret="s",
+                kis_account_number="12345678-01",
+                kis_hts_id="myhts",
+            )
+        )
+        api_keys = api_keys_from_connector_config_map(cm)
+        self.assertIn("kis_hts_id", api_keys)
+        self.assertEqual("myhts", api_keys["kis_hts_id"])
+
+        # End-to-end (Plan Review F1): the forwarded connect-keys must actually
+        # CONSTRUCT the connector (this is what the live factory does:
+        # connector_class(**init_params)) and reach self._hts_id. kis_sandbox is
+        # is_connect_key=False so it is absent from api_keys -> constructor uses
+        # its default; trading_pairs is added the way the factory does.
+        ex = KisExchange(**api_keys, trading_pairs=[self.trading_pair])
+        self.assertEqual("myhts", ex._hts_id)
 
     def validate_auth_credentials_present(self, request_call: RequestCall):
         request_headers = request_call.kwargs["headers"]

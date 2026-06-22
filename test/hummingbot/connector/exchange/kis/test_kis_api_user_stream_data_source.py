@@ -541,27 +541,76 @@ class KisAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
     # ------------------------------------------------------------------ #
 
     async def test_listen_registers_exec_notice_with_hub(self):
+        # The exec-notice channel (H0STCNI0) is account-wide and keyed by the
+        # customer HTS ID — NOT a stock code, NOT per-trading-pair. Sending a
+        # stock symbol as tr_key is the JEP-200 defect (OPSP0017 rejection ->
+        # socket recycle). Assert: exactly one register, tr_key == the HTS ID,
+        # and NO stock-symbol lookup for exec-notice.
         hub = MagicMock()
         hub.register = AsyncMock()
         hub.unregister = AsyncMock()
-        self.data_source._hub = hub
-        self.data_source._domain = CONSTANTS.DEFAULT_DOMAIN
+        ds = KisAPIUserStreamDataSource(
+            auth=self.auth,
+            trading_pairs=["005930-KRW", "000660-KRW"],  # two pairs
+            connector=self.connector,
+            api_factory=self.api_factory,
+            hub=hub,
+            domain=CONSTANTS.DEFAULT_DOMAIN,
+            hts_id="myhts",
+        )
+        self.connector.exchange_symbol_associated_to_pair.reset_mock()
         out = asyncio.Queue()
-        with patch.object(
-            self.connector,
-            "exchange_symbol_associated_to_pair",
-            new=AsyncMock(return_value="005930"),
-        ):
-            task = asyncio.create_task(self.data_source.listen_for_user_stream(out))
-            await asyncio.sleep(0)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        task = asyncio.create_task(ds.listen_for_user_stream(out))
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
-        self.assertEqual("H0STCNI0", hub.register.await_args_list[0].args[0])
-        self.assertEqual("H0STCNI0", hub.unregister.await_args_list[0].args[0])
+        # Exactly one registration (account-wide), keyed by the HTS ID.
+        self.assertEqual(1, hub.register.await_count)
+        reg_args = hub.register.await_args_list[0].args
+        self.assertEqual("H0STCNI0", reg_args[0])      # tr_id
+        self.assertEqual("myhts", reg_args[1])         # tr_key == HTS ID (NOT a symbol)
+        # No stock-symbol lookup for the exec-notice channel.
+        self.connector.exchange_symbol_associated_to_pair.assert_not_called()
+        # Finally-unregister uses the same (tr_id, hts_id).
+        self.assertEqual(1, hub.unregister.await_count)
+        unreg_args = hub.unregister.await_args_list[0].args
+        self.assertEqual("H0STCNI0", unreg_args[0])
+        self.assertEqual("myhts", unreg_args[1])
+
+    async def test_listen_skips_exec_notice_when_no_hts_id(self):
+        # Empty HTS ID -> the exec-notice subscription is skipped entirely. A
+        # symbol/empty tr_key would be rejected (OPSP0017) and recycle the shared
+        # socket, taking the orderbook WS down. Skip => nothing registered, no
+        # symbol lookup, no raise (fills fall back to REST order-status polling).
+        hub = MagicMock()
+        hub.register = AsyncMock()
+        hub.unregister = AsyncMock()
+        ds = KisAPIUserStreamDataSource(
+            auth=self.auth,
+            trading_pairs=["005930-KRW", "000660-KRW"],
+            connector=self.connector,
+            api_factory=self.api_factory,
+            hub=hub,
+            domain=CONSTANTS.DEFAULT_DOMAIN,
+            hts_id="",  # not configured
+        )
+        self.connector.exchange_symbol_associated_to_pair.reset_mock()
+        out = asyncio.Queue()
+        task = asyncio.create_task(ds.listen_for_user_stream(out))
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        hub.register.assert_not_called()
+        hub.unregister.assert_not_called()
+        self.connector.exchange_symbol_associated_to_pair.assert_not_called()
 
     # ------------------------------------------------------------------ #
     # Test: AES decryption function
