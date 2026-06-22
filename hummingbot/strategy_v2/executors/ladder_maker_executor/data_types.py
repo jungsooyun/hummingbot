@@ -62,6 +62,10 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
 
     # Safety
     kill_switch: bool = False
+    ws_staleness_kill_switch_enabled: bool = False
+    max_kis_ws_age_s: Optional[float] = 3.0
+    max_hl_ws_age_s: Optional[float] = 12.0
+    ws_staleness_grace_s: float = 90.0
     # Observe / no-submit: compute fair + targets and LOG the intended maker quotes
     # but never call place_order (no real orders, so no fills and no hedges). For
     # safe live verification of the full decision path before enabling submission.
