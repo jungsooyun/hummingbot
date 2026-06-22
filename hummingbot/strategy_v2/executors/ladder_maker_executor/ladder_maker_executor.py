@@ -41,7 +41,7 @@ from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import
     compute_hedge_order,
 )
 from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_calendar import KrxSessionCalendar
-from hummingbot.strategy_v2.gates.gate_chain import GateChain, GateContext, InventoryGate, KillSwitchGate
+from hummingbot.strategy_v2.gates.gate_chain import GateChain, GateContext, InventoryGate, KillSwitchGate, WsStalenessGate
 from hummingbot.strategy_v2.models.executors import TrackedOrder
 
 ZERO = Decimal("0")
@@ -107,7 +107,14 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         # sets ``self.config`` inside ``super().__init__`` (below), so ``self.config``
         # does not exist yet here. (Live regression: AttributeError on every action.)
         _max_inv = config.max_inventory if config.max_inventory and config.max_inventory > ZERO else None
-        self._gate_chain = GateChain([KillSwitchGate(), InventoryGate(_max_inv)])
+        _ws_enabled = getattr(config, "ws_staleness_kill_switch_enabled", False)
+        _gates = [KillSwitchGate(), InventoryGate(_max_inv)]
+        if _ws_enabled:
+            _gates.append(WsStalenessGate(
+                max_kis_ws_age_s=getattr(config, "max_kis_ws_age_s", None),
+                max_hl_ws_age_s=getattr(config, "max_hl_ws_age_s", None),
+            ))
+        self._gate_chain = GateChain(_gates)
         super().__init__(
             strategy=strategy,
             config=config,
@@ -147,9 +154,14 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
     def _gates_open(self) -> bool:
         if getattr(self, "_seed_fail_closed", False):
             return False
+
+        def _age_for_ctx(age):
+            return age if age is not None else float("inf")
+
+        ws_on = getattr(self.config, "ws_staleness_kill_switch_enabled", False)
         ctx = GateContext(
             now_kst=self._calendar.now(self._strategy.current_timestamp),
-            kis_age_s=0.0,  # feed-age gates land in JEP-133
+            kis_age_s=0.0,  # REST book-age gate -> JEP-133
             hl_age_s=0.0,
             fx_age_s=0.0,
             inventory=self._unhedged_base_signed(),
@@ -157,7 +169,9 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             pending_notional=self._pending_maker_notional(),
             # config kill_switch OR the auto-tripped hedge kill-switch (persistent hedge-
             # venue failure): either closes the maker gate (halt quoting, cancel makers).
-            kill_switch=bool(self.config.kill_switch) or self._hedge_kill_switch,
+            kill_switch=bool(self.config.kill_switch) or self._hedge_kill_switch or self._staleness_kill_switch,
+            kis_ws_age_s=_age_for_ctx(self._hedge_ws_age_s) if ws_on else 0.0,  # KIS = hedge leg
+            hl_ws_age_s=_age_for_ctx(self._maker_ws_age_s) if ws_on else 0.0,  # HL = maker leg
         )
         if not self._gate_chain.evaluate(ctx).open:
             return False
