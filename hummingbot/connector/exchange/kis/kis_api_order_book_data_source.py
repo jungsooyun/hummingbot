@@ -282,7 +282,17 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         )
         self._message_queue[self._snapshot_messages_queue_key].put_nowait(snapshot_msg)
         if bids and asks:
-            self._mark_ws_orderbook_frame(trading_pair)
+            # JEP-134: only a genuinely mapped frame proves WS freshness for its pair;
+            # never let the _resolve_trading_pair fallback stamp a non-target pair fresh.
+            symbol_map = None
+            map_ready = getattr(self._connector, "trading_pair_symbol_map_ready", None)
+            map_getter = getattr(self._connector, "trading_pair_symbol_map", None)
+            if callable(map_getter) and (not callable(map_ready) or map_ready()):
+                symbol_map = await map_getter()
+            else:
+                symbol_map = getattr(self._connector, "_trading_pair_symbol_map", None)
+            if symbol_map and symbol_map.get(tr_key) == trading_pair:
+                self._mark_ws_orderbook_frame(trading_pair)
 
     async def _process_trade_data(self, tr_key: str, data: Dict[str, str]):
         """Convert parsed trade data to OrderBookMessage and enqueue."""

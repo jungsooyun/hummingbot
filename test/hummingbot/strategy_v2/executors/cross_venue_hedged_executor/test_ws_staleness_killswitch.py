@@ -39,6 +39,7 @@ class _WsHarness(CrossVenueHedgedExecutorBase):
         self._maker_fees_quote = Decimal("0")
         self._hedge_fees_quote = Decimal("0")
         self._pending_hedge_signed = Decimal("0")
+        self._flatten_on_stop = False
         self._current_retries = 0
         self._max_retries = 3
         self._hedge_kill_switch = False
@@ -204,6 +205,18 @@ def test_control_task_runs_evaluate_then_suppresses_without_manual_call():
 
     assert h._hedge_ws_stale is True
     assert h._cancel_called is True
+    assert h.placed == []
+    assert h._pending_hedge_base == Decimal("2")
+
+
+def test_shutdown_control_task_refreshes_staleness_before_hedging():
+    h = _WsHarness(enabled=True, kis_age=None)
+    h._status = RunnableStatus.SHUTTING_DOWN
+    h._pending_hedge_signed = Decimal("-2")
+
+    asyncio.run(h.control_task())
+
+    assert h._hedge_ws_stale is True
     assert h.placed == []
     assert h._pending_hedge_base == Decimal("2")
 

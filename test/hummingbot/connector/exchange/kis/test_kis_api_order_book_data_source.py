@@ -1076,6 +1076,22 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         # Falls back to the first trading pair
         self.assertEqual(self.trading_pair, msg.trading_pair)
 
+    async def test_unknown_two_sided_orderbook_frame_enqueues_but_does_not_stamp_freshness(self):
+        data = {col: "0" for col in CONSTANTS.WS_ORDERBOOK_COLUMNS}
+        data["ASKP1"] = "100"
+        data["ASKP_RSQN1"] = "10"
+        data["BIDP1"] = "99"
+        data["BIDP_RSQN1"] = "11"
+
+        await self.data_source._process_orderbook_data("999999", data)
+
+        queue = self.data_source._message_queue[self.data_source._snapshot_messages_queue_key]
+        self.assertFalse(queue.empty())
+        msg: OrderBookMessage = queue.get_nowait()
+        self.assertEqual(self.trading_pair, msg.trading_pair)
+        for trading_pair in self.data_source._trading_pairs:
+            self.assertIsNone(self.data_source.last_ws_orderbook_time(trading_pair))
+
     # ------------------------------------------------------------------
     # Test: _process_trade_data
     # ------------------------------------------------------------------

@@ -371,6 +371,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self._reconcile_maker()
             self._process_hedges()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
+            self._evaluate_ws_staleness()
             await self._control_shutdown()
 
     def early_stop(self, keep_position: bool = False, flatten: bool = False):
