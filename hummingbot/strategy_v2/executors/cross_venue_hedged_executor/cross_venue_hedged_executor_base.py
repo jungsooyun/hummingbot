@@ -196,6 +196,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         # while hedging of the remaining pending continues, so it recovers in place when the
         # venue returns. Reversible (an operator can clear it) -> a false trip is conservative.
         self._hedge_kill_switch = False
+        self._init_ws_staleness_state()
 
         # JEP-184: read-only per-tick latency profiling (off unless config opts in).
         self._latency_recorder = None
@@ -286,11 +287,83 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             return (maker_avg - hedge_avg) * matched
         return (hedge_avg - maker_avg) * matched
 
+    def _init_ws_staleness_state(self) -> None:
+        # JEP-134 WS-staleness kill switch (off unless config enables it).
+        self._staleness_kill_switch = False
+        self._staleness_since_ts: Optional[float] = None
+        self._maker_ws_stale = False
+        self._hedge_ws_stale = False
+        self._maker_ws_age_s: Optional[float] = None
+        self._hedge_ws_age_s: Optional[float] = None
+        self._hedge_suppress_logged = False
+
+    def _ws_freshness_sec(self, connector: str, pair: str) -> Optional[float]:
+        try:
+            provider = getattr(self._strategy, "market_data_provider", None)
+            if provider is None:
+                return None
+            freshness = getattr(provider, "get_ws_freshness_sec", None)
+            if freshness is None:
+                return None
+            return freshness(connector, pair)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _leg_ws_stale(age: Optional[float], max_age: Optional[float]) -> bool:
+        if max_age is None:
+            return False
+        if age is None:
+            return True
+        return age > max_age
+
+    def _evaluate_ws_staleness(self) -> None:
+        """JEP-134: per-leg WS-orderbook staleness flags and Stage-2 latch."""
+        if not getattr(self.config, "ws_staleness_kill_switch_enabled", False):
+            return
+
+        maker_age = self._ws_freshness_sec(self.maker_connector, self.maker_trading_pair)
+        hedge_age = self._ws_freshness_sec(self.hedge_connector, self.hedge_trading_pair)
+        self._maker_ws_age_s = maker_age
+        self._hedge_ws_age_s = hedge_age
+        self._maker_ws_stale = self._leg_ws_stale(maker_age, getattr(self.config, "max_hl_ws_age_s", None))
+        self._hedge_ws_stale = self._leg_ws_stale(hedge_age, getattr(self.config, "max_kis_ws_age_s", None))
+
+        any_stale = self._maker_ws_stale or self._hedge_ws_stale
+        now = self._strategy.current_timestamp
+        grace = float(getattr(self.config, "ws_staleness_grace_s", 90.0))
+        if any_stale:
+            if self._staleness_since_ts is None:
+                self._staleness_since_ts = now
+                self.logger().warning(
+                    "JEP-134 WS staleness: maker_stale=%s (age=%s) hedge_stale=%s (age=%s); "
+                    "pausing quoting + suppressing stale-priced hedges, grace=%.0fs.",
+                    self._maker_ws_stale,
+                    maker_age,
+                    self._hedge_ws_stale,
+                    hedge_age,
+                    grace,
+                )
+            elif (now - self._staleness_since_ts) >= grace and not self._staleness_kill_switch:
+                self._staleness_kill_switch = True
+                self.logger().error(
+                    "JEP-134 WS continuously stale >= %.0fs: tripping the staleness kill-switch "
+                    "(HOLD: stop quoting, cancel makers, hold position, suppress stale hedges). "
+                    "Manual restart required once WS recovers.",
+                    grace,
+                )
+        else:
+            if self._staleness_since_ts is not None:
+                self.logger().info("JEP-134 WS feeds recovered; clearing staleness timer.")
+            self._staleness_since_ts = None
+            self._hedge_suppress_logged = False
+
     # ============================================================ lifecycle
 
     async def control_task(self):
         if self.status == RunnableStatus.RUNNING:
             await self._seed_inventory_from_connector()
+            self._evaluate_ws_staleness()
             if not self._gates_open():
                 self._cancel_all_maker()
                 self._process_hedges()
@@ -780,6 +853,16 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             return
         if self._hedge_in_flight():
             return
+        if getattr(self, "_hedge_ws_stale", False):
+            if not self._hedge_suppress_logged:
+                self.logger().error(
+                    "JEP-134: KIS hedge book WS-stale (age=%s) - suppressing new hedge "
+                    "submissions; holding pending=%s until WS recovers.",
+                    self._hedge_ws_age_s,
+                    self._pending_hedge_base,
+                )
+                self._hedge_suppress_logged = True
+            return
         pending_base = self._pending_hedge_base
         spec = self._size_hedge(pending_base)
         if spec is None:
@@ -1177,7 +1260,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         return self._maker_fees_quote + self._hedge_fees_quote
 
     def get_custom_info(self) -> Dict:
-        return {
+        info = {
             "side": self.entry_side,
             "execution_purpose": self.get_execution_purpose(),
             "maker_connector": self.maker_connector,
@@ -1192,3 +1275,12 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             "open_hedge_orders": len(self._open_hedge_orders()),
             "hedge_kill_switch": self._hedge_kill_switch,
         }
+        if getattr(self.config, "ws_staleness_kill_switch_enabled", False):
+            info.update(
+                {
+                    "staleness_kill_switch": getattr(self, "_staleness_kill_switch", False),
+                    "ws_maker_stale": getattr(self, "_maker_ws_stale", False),
+                    "ws_hedge_stale": getattr(self, "_hedge_ws_stale", False),
+                }
+            )
+        return info
