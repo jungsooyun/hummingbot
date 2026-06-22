@@ -85,6 +85,7 @@ class KisAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
             trading_pairs=[self.trading_pair],
             connector=self.connector,
             api_factory=self.api_factory,
+            hub=MagicMock(),
             domain="sandbox",
         )
 
@@ -104,6 +105,7 @@ class KisAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
             trading_pairs=[self.trading_pair],
             connector=self.connector,
             api_factory=self.api_factory,
+            hub=MagicMock(),
         )
         self.assertIsInstance(ds, KisAPIUserStreamDataSource)
         self.assertEqual(ds._domain, CONSTANTS.DEFAULT_DOMAIN)
@@ -293,7 +295,6 @@ class KisAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
 
     async def test_handle_control_message_stores_encryption_keys(self):
         """Subscription response with encrypt='Y' should store encryption keys."""
-        ws_mock = AsyncMock()
         raw = json.dumps({
             "header": {
                 "tr_id": "H0STCNI0",
@@ -310,7 +311,7 @@ class KisAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
             },
         })
 
-        await self.data_source._handle_control_message(ws_mock, raw)
+        await self.data_source._handle_control_message(raw)
 
         self.assertIn("H0STCNI0", self.data_source._encryption_keys)
         keys = self.data_source._encryption_keys["H0STCNI0"]
@@ -323,7 +324,6 @@ class KisAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
 
     async def test_handle_control_message_no_keys_when_encrypt_n(self):
         """Subscription response with encrypt='N' should not store encryption keys."""
-        ws_mock = AsyncMock()
         raw = json.dumps({
             "header": {
                 "tr_id": "H0STCNI0",
@@ -337,33 +337,8 @@ class KisAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
             },
         })
 
-        await self.data_source._handle_control_message(ws_mock, raw)
+        await self.data_source._handle_control_message(raw)
         self.assertNotIn("H0STCNI0", self.data_source._encryption_keys)
-
-    # ------------------------------------------------------------------ #
-    # Test: _handle_control_message — PINGPONG echoed back
-    # ------------------------------------------------------------------ #
-
-    async def test_handle_control_message_pingpong(self):
-        """PINGPONG message should be echoed back to the WebSocket."""
-        ws_mock = AsyncMock()
-        raw = json.dumps({"header": {"tr_id": "PINGPONG"}})
-
-        await self.data_source._handle_control_message(ws_mock, raw)
-
-        ws_mock.send_str.assert_awaited_once_with(raw)
-
-    # ------------------------------------------------------------------ #
-    # Test: _handle_control_message — PINGPONG does not store keys
-    # ------------------------------------------------------------------ #
-
-    async def test_handle_control_message_pingpong_no_keys(self):
-        """PINGPONG message should not store anything in _encryption_keys."""
-        ws_mock = AsyncMock()
-        raw = json.dumps({"header": {"tr_id": "PINGPONG"}})
-
-        await self.data_source._handle_control_message(ws_mock, raw)
-        self.assertNotIn("PINGPONG", self.data_source._encryption_keys)
 
     # ------------------------------------------------------------------ #
     # Test: _handle_control_message — invalid JSON is silently ignored
@@ -371,10 +346,8 @@ class KisAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
 
     async def test_handle_control_message_invalid_json_ignored(self):
         """Invalid JSON control messages should be silently ignored."""
-        ws_mock = AsyncMock()
-        await self.data_source._handle_control_message(ws_mock, "not valid json{{{")
-        # Should not raise, should not call send_str
-        ws_mock.send_str.assert_not_awaited()
+        await self.data_source._handle_control_message("not valid json{{{")
+        self.assertEqual({}, self.data_source._encryption_keys)
 
     # ------------------------------------------------------------------ #
     # Test: _handle_control_message — subscription error logs warning
@@ -382,7 +355,6 @@ class KisAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
 
     async def test_handle_control_message_subscription_error(self):
         """Subscription error (rt_cd != '0') should log a warning."""
-        ws_mock = AsyncMock()
         raw = json.dumps({
             "header": {
                 "tr_id": "H0STCNI0",
@@ -396,54 +368,8 @@ class KisAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
         })
 
         with patch.object(self.data_source, "logger") as mock_logger:
-            await self.data_source._handle_control_message(ws_mock, raw)
+            await self.data_source._handle_control_message(raw)
             mock_logger.return_value.warning.assert_called_once()
-
-    # ------------------------------------------------------------------ #
-    # Test: _subscribe_exec_notifications — real environment (H0STCNI0)
-    # ------------------------------------------------------------------ #
-
-    async def test_subscribe_exec_notifications_real(self):
-        """Real-environment subscription should use H0STCNI0 TR_ID."""
-        ds = KisAPIUserStreamDataSource(
-            auth=self.auth,
-            trading_pairs=[self.trading_pair],
-            connector=self.connector,
-            api_factory=self.api_factory,
-            domain=CONSTANTS.DEFAULT_DOMAIN,
-        )
-
-        ws_mock = AsyncMock()
-        approval_key = "test_approval_key"
-
-        await ds._subscribe_exec_notifications(ws_mock, approval_key)
-
-        ws_mock.send_json.assert_awaited_once()
-        call_args = ws_mock.send_json.call_args[0][0]
-        self.assertEqual(call_args["header"]["approval_key"], approval_key)
-        self.assertEqual(call_args["header"]["custtype"], "P")
-        self.assertEqual(call_args["header"]["tr_type"], "1")
-        self.assertEqual(call_args["body"]["input"]["tr_id"], "H0STCNI0")
-        self.assertEqual(call_args["body"]["input"]["tr_key"], "005930")
-
-    # ------------------------------------------------------------------ #
-    # Test: _subscribe_exec_notifications — sandbox environment (H0STCNI9)
-    # ------------------------------------------------------------------ #
-
-    async def test_subscribe_exec_notifications_sandbox(self):
-        """Sandbox-environment subscription should use H0STCNI9 TR_ID."""
-        ws_mock = AsyncMock()
-        approval_key = "test_approval_key"
-
-        await self.data_source._subscribe_exec_notifications(ws_mock, approval_key)
-
-        ws_mock.send_json.assert_awaited_once()
-        call_args = ws_mock.send_json.call_args[0][0]
-        self.assertEqual(call_args["header"]["approval_key"], approval_key)
-        self.assertEqual(call_args["header"]["custtype"], "P")
-        self.assertEqual(call_args["header"]["tr_type"], "1")
-        self.assertEqual(call_args["body"]["input"]["tr_id"], "H0STCNI9")
-        self.assertEqual(call_args["body"]["input"]["tr_key"], "005930")
 
     # ------------------------------------------------------------------ #
     # Test: WebSocket endpoint URL (nautilus-proven, no /tryitout path)
@@ -490,63 +416,71 @@ class KisAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(plaintext, recovered)
 
     # ------------------------------------------------------------------ #
-    # Test: _subscribe_exec_notifications — multiple trading pairs
+    # Test: _on_ws_frame — routes data messages
     # ------------------------------------------------------------------ #
 
-    async def test_subscribe_exec_notifications_multiple_pairs(self):
-        """Subscription should send one message per trading pair."""
-        self.connector.exchange_symbol_associated_to_pair = AsyncMock(
-            side_effect=["005930", "000660"]
-        )
-        ds = KisAPIUserStreamDataSource(
-            auth=self.auth,
-            trading_pairs=["005930-KRW", "000660-KRW"],
-            connector=self.connector,
-            api_factory=self.api_factory,
-            domain="sandbox",
-        )
-
-        ws_mock = AsyncMock()
-        await ds._subscribe_exec_notifications(ws_mock, "test_approval_key")
-
-        self.assertEqual(ws_mock.send_json.await_count, 2)
-        first_call = ws_mock.send_json.call_args_list[0][0][0]
-        second_call = ws_mock.send_json.call_args_list[1][0][0]
-        self.assertEqual(first_call["body"]["input"]["tr_key"], "005930")
-        self.assertEqual(second_call["body"]["input"]["tr_key"], "000660")
-
-    # ------------------------------------------------------------------ #
-    # Test: _process_ws_message — routes data messages
-    # ------------------------------------------------------------------ #
-
-    async def test_process_ws_message_routes_data_message(self):
+    async def test_on_ws_frame_routes_data_message(self):
         """Messages starting with '0' or '1' should be routed to _handle_data_message."""
         fields = "^".join(["F"] * len(CONSTANTS.WS_EXEC_NOTICE_COLUMNS))
         raw = f"0|H0STCNI0|001|{fields}"
 
-        ws_mock = AsyncMock()
         output = asyncio.Queue()
+        self.data_source._output = output
 
-        await self.data_source._process_ws_message(ws_mock, raw, output)
+        await self.data_source._on_ws_frame(raw)
 
         self.assertFalse(output.empty())
         event = output.get_nowait()
         self.assertEqual(event["type"], "execution_notification")
 
     # ------------------------------------------------------------------ #
-    # Test: _process_ws_message — routes control messages
+    # Test: _on_ws_frame — routes control messages
     # ------------------------------------------------------------------ #
 
-    async def test_process_ws_message_routes_control_message(self):
+    async def test_on_ws_frame_routes_control_message(self):
         """JSON messages should be routed to _handle_control_message."""
-        ws_mock = AsyncMock()
-        output = asyncio.Queue()
-        raw = json.dumps({"header": {"tr_id": "PINGPONG"}})
+        raw = json.dumps({"header": {"tr_id": "H0STCNI0", "encrypt": "N"}, "body": {"rt_cd": "0"}})
 
-        await self.data_source._process_ws_message(ws_mock, raw, output)
+        with patch.object(self.data_source, "_handle_control_message", new_callable=AsyncMock) as mock_handle:
+            await self.data_source._on_ws_frame(raw)
 
-        ws_mock.send_str.assert_awaited_once_with(raw)
-        self.assertTrue(output.empty())
+        mock_handle.assert_awaited_once_with(raw)
+
+    async def test_on_ws_frame_aes_capture_then_decrypt_and_enqueue(self):
+        out = asyncio.Queue()
+        self.data_source._output = out
+        ctrl = json.dumps({
+            "header": {"tr_id": "H0STCNI0", "encrypt": "Y"},
+            "body": {"rt_cd": "0", "output": {"key": "k" * 32, "iv": "i" * 16}},
+        })
+        await self.data_source._on_ws_frame(ctrl)
+        self.assertIn("H0STCNI0", self.data_source._encryption_keys)
+
+        with patch(
+            "hummingbot.connector.exchange.kis.kis_api_user_stream_data_source._aes_cbc_decrypt",
+            return_value="^".join(["x"] * len(CONSTANTS.WS_EXEC_NOTICE_COLUMNS)),
+        ):
+            await self.data_source._on_ws_frame("0|H0STCNI0|005930|cipher")
+
+        event = out.get_nowait()
+        self.assertEqual("execution_notification", event["type"])
+        self.assertEqual("H0STCNI0", event["tr_id"])
+
+    async def test_exec_notice_does_not_lengthen_rest_poll(self):
+        out = asyncio.Queue()
+        self.data_source._output = out
+        ctrl = json.dumps({
+            "header": {"tr_id": "H0STCNI0", "encrypt": "Y"},
+            "body": {"rt_cd": "0", "output": {"key": "k" * 32, "iv": "i" * 16}},
+        })
+        await self.data_source._on_ws_frame(ctrl)
+        with patch(
+            "hummingbot.connector.exchange.kis.kis_api_user_stream_data_source._aes_cbc_decrypt",
+            return_value="^".join(["x"] * len(CONSTANTS.WS_EXEC_NOTICE_COLUMNS)),
+        ):
+            await self.data_source._on_ws_frame("0|H0STCNI0|005930|cipher")
+
+        self.assertEqual(0.0, self.data_source.last_recv_time)
 
     # ------------------------------------------------------------------ #
     # Test: _handle_data_message with encrypted data (decryption path)
@@ -606,85 +540,28 @@ class KisAPIUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
     # Test: listen_for_user_stream — WebSocket mocking
     # ------------------------------------------------------------------ #
 
-    async def test_listen_for_user_stream_connects_and_receives(self):
-        """listen_for_user_stream should connect to WS, subscribe, and process messages."""
-        import aiohttp as _aiohttp
-
-        # Build a valid data message
-        fields = [
-            "CUST123", "12345678-01", "0000001", "0000000", "02", "00",
-            "00", "0", "005930", "100", "67800", "093001", "N", "2", "Y",
-            "1234", "100", "테스트계좌", "0", "00", "N", "", "00",
-            "20260228", "삼성전자", "67800",
-        ]
-        data_str = "^".join(fields)
-        data_msg = f"0|H0STCNI9|001|{data_str}"
-
-        ws_msg = MagicMock()
-        ws_msg.type = _aiohttp.WSMsgType.TEXT
-        ws_msg.data = data_msg
-
-        close_msg = MagicMock()
-        close_msg.type = _aiohttp.WSMsgType.CLOSED
-
-        fake_ws = _FakeWS([ws_msg, close_msg])
-
-        mock_session = MagicMock()
-        mock_session.ws_connect = MagicMock(return_value=_FakeAsyncCtx(fake_ws))
-
-        output_queue = asyncio.Queue()
-
-        with patch(
-            "hummingbot.connector.exchange.kis.kis_api_user_stream_data_source.aiohttp.ClientSession",
-            return_value=_FakeAsyncCtx(mock_session),
+    async def test_listen_registers_exec_notice_with_hub(self):
+        hub = MagicMock()
+        hub.register = AsyncMock()
+        hub.unregister = AsyncMock()
+        self.data_source._hub = hub
+        self.data_source._domain = CONSTANTS.DEFAULT_DOMAIN
+        out = asyncio.Queue()
+        with patch.object(
+            self.connector,
+            "exchange_symbol_associated_to_pair",
+            new=AsyncMock(return_value="005930"),
         ):
-            # After WS closes cleanly, the while-True restarts.
-            # Make get_ws_approval_key raise CancelledError on 2nd call.
-            with patch.object(
-                self.data_source._auth, "get_ws_approval_key", new_callable=AsyncMock
-            ) as mock_key:
-                mock_key.side_effect = ["test_approval_key", asyncio.CancelledError()]
+            task = asyncio.create_task(self.data_source.listen_for_user_stream(out))
+            await asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
-                with self.assertRaises(asyncio.CancelledError):
-                    await self.data_source.listen_for_user_stream(output=output_queue)
-
-        # Verify subscribe was called
-        fake_ws.send_json.assert_awaited()
-
-        # Verify data message was processed and enqueued
-        self.assertFalse(output_queue.empty())
-        event = output_queue.get_nowait()
-        self.assertEqual(event["type"], "execution_notification")
-        self.assertEqual(event["data"]["CNTG_YN"], "2")
-
-    # ------------------------------------------------------------------ #
-    # Test: listen_for_user_stream — reconnects on error
-    # ------------------------------------------------------------------ #
-
-    async def test_listen_for_user_stream_reconnects_on_error(self):
-        """listen_for_user_stream should reconnect after an unexpected error."""
-        call_count = 0
-
-        async def mock_get_ws_approval_key():
-            nonlocal call_count
-            call_count += 1
-            if call_count >= 2:
-                raise asyncio.CancelledError()
-            raise ConnectionError("test connection error")
-
-        with patch.object(self.data_source._auth, "get_ws_approval_key", side_effect=mock_get_ws_approval_key):
-            with patch.object(self.data_source, "_sleep", new_callable=AsyncMock):
-                output_queue = asyncio.Queue()
-                task = asyncio.create_task(
-                    self.data_source.listen_for_user_stream(output=output_queue)
-                )
-                try:
-                    await asyncio.wait_for(task, timeout=2.0)
-                except (asyncio.CancelledError, asyncio.TimeoutError):
-                    pass
-
-        # Should have attempted at least 2 connections
-        self.assertGreaterEqual(call_count, 2)
+        self.assertEqual("H0STCNI0", hub.register.await_args_list[0].args[0])
+        self.assertEqual("H0STCNI0", hub.unregister.await_args_list[0].args[0])
 
     # ------------------------------------------------------------------ #
     # Test: AES decryption function

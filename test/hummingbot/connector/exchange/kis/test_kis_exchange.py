@@ -3,6 +3,7 @@ import re
 import time
 from decimal import Decimal
 from typing import Any, Callable, List, Optional, Tuple
+from unittest.mock import AsyncMock, MagicMock
 
 from aioresponses import aioresponses
 from aioresponses.core import RequestCall
@@ -342,6 +343,36 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         exchange._auth._access_token = "test_access_token"
         exchange._auth._token_expires_at = time.time() + 86400
         return exchange
+
+    def test_both_data_sources_share_one_hub(self):
+        ob = self.exchange._create_order_book_data_source()
+        us = self.exchange._create_user_stream_data_source()
+
+        self.assertIs(ob._hub, us._hub)
+        self.assertIs(ob._hub, self.exchange.ws_hub)
+
+    async def test_stop_network_stops_hub_once(self):
+        hub = MagicMock()
+        hub.stop = AsyncMock()
+        self.exchange._ws_hub = hub
+
+        await self.exchange.stop_network()
+
+        hub.stop.assert_awaited_once()
+
+    async def test_ws_enabled_false_hub_never_connects(self):
+        conn = KisExchange(
+            kis_app_key="k",
+            kis_app_secret="s",
+            kis_account_number="12345678-01",
+            trading_pairs=[self.trading_pair],
+            trading_required=False,
+            kis_ws_enabled="false",
+        )
+
+        self.assertFalse(conn.ws_hub._ws_enabled)
+        await conn.ws_hub.register("H0UNASP0", "005930", AsyncMock())
+        self.assertIsNone(conn.ws_hub._run_task)
 
     @aioresponses()
     async def test_all_trading_pairs_does_not_raise_exception(self, mock_api):

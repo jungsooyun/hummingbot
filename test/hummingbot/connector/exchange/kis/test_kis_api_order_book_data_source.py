@@ -119,7 +119,9 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
             connector=self.connector,
             api_factory=self.connector._web_assistants_factory,
             auth=self.mock_auth,
+            hub=MagicMock(),
             domain=CONSTANTS.DEFAULT_DOMAIN,
+            market_routing=CONSTANTS.MARKET_ROUTING_SOR,
         )
         self.data_source.logger().setLevel(1)
         self.data_source.logger().addHandler(self)
@@ -282,9 +284,9 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
     @staticmethod
     def _ws_orderbook_raw() -> str:
-        """Raw WS orderbook message (H0STASP0) with pipe + caret format."""
+        """Raw WS orderbook message (H0UNASP0) with pipe + caret format."""
         return (
-            "0|H0STASP0|005930|"
+            "0|H0UNASP0|005930|"
             "005930^093000^0"
             "^67800^67900^68000^68100^68200^68300^68400^68500^68600^68700"
             "^67700^67600^67500^67400^67300^67200^67100^67000^66900^66800"
@@ -295,9 +297,9 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
     @staticmethod
     def _ws_trade_raw() -> str:
-        """Raw WS trade message (H0STCNT0) with pipe + caret format."""
+        """Raw WS trade message (H0UNCNT0) with pipe + caret format."""
         return (
-            "0|H0STCNT0|005930|"
+            "0|H0UNCNT0|005930|"
             "005930^093001^67800^2^-200^-0.29^67750^68000^68200^67600"
             "^67900^67700^100^500000^33900000000^1234^5678^-4444^25.5"
             "^617^383^1^38.3^3.5^090000^2^200^091500^2^200^093000^2^-200"
@@ -825,39 +827,6 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
     # ==================================================================
 
     # ------------------------------------------------------------------
-    # Test: _build_subscription_message
-    # ------------------------------------------------------------------
-
-    def test_build_subscription_message_subscribe(self):
-        """Should build a valid KIS WS subscription JSON with tr_type=1 for subscribe."""
-        msg = KisAPIOrderBookDataSource._build_subscription_message(
-            approval_key="my_approval_key",
-            tr_id="H0STASP0",
-            tr_key="005930",
-            tr_type="1",
-        )
-
-        self.assertEqual("my_approval_key", msg["header"]["approval_key"])
-        self.assertEqual("P", msg["header"]["custtype"])
-        self.assertEqual("1", msg["header"]["tr_type"])
-        self.assertEqual("utf-8", msg["header"]["content-type"])
-        self.assertEqual("H0STASP0", msg["body"]["input"]["tr_id"])
-        self.assertEqual("005930", msg["body"]["input"]["tr_key"])
-
-    def test_build_subscription_message_unsubscribe(self):
-        """Should build a valid KIS WS unsubscription JSON with tr_type=2."""
-        msg = KisAPIOrderBookDataSource._build_subscription_message(
-            approval_key="key123",
-            tr_id="H0STCNT0",
-            tr_key="000660",
-            tr_type="2",
-        )
-
-        self.assertEqual("2", msg["header"]["tr_type"])
-        self.assertEqual("H0STCNT0", msg["body"]["input"]["tr_id"])
-        self.assertEqual("000660", msg["body"]["input"]["tr_key"])
-
-    # ------------------------------------------------------------------
     # Test: WebSocket endpoint URL (nautilus-proven, no /tryitout path)
     # ------------------------------------------------------------------
 
@@ -1051,15 +1020,8 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertFalse(q.empty())
         self.assertIsNone(self.data_source.last_ws_orderbook_time(self.trading_pair))
 
-    async def test_pingpong_and_sub_error_do_not_stamp(self):
-        await self.data_source._handle_control_message(
-            _FakeWS([]),
-            self._ws_pingpong_raw(),
-        )
-        await self.data_source._handle_control_message(
-            _FakeWS([]),
-            self._ws_subscription_error_raw(),
-        )
+    async def test_control_message_subscription_error_does_not_stamp(self):
+        await self.data_source._handle_control_message(self._ws_subscription_error_raw())
 
         self.assertIsNone(self.data_source.last_ws_orderbook_time(self.trading_pair))
 
@@ -1170,69 +1132,67 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
     # Test: _handle_control_message
     # ------------------------------------------------------------------
 
-    async def test_handle_control_message_pingpong(self):
-        """PINGPONG messages should be echoed back via ws.send_str."""
-        mock_ws = AsyncMock()
-        raw = self._ws_pingpong_raw()
-
-        await self.data_source._handle_control_message(mock_ws, raw)
-
-        mock_ws.send_str.assert_awaited_once_with(raw)
-
     async def test_handle_control_message_subscription_success(self):
         """Successful subscription response (rt_cd=0) should not log a warning."""
-        mock_ws = AsyncMock()
         raw = self._ws_subscription_success_raw()
 
-        await self.data_source._handle_control_message(mock_ws, raw)
+        await self.data_source._handle_control_message(raw)
 
-        # Should not send anything back (not a PINGPONG)
-        mock_ws.send_str.assert_not_awaited()
         # No warning logged for success
         self.assertFalse(self._is_logged_partial("WARNING", "subscription error"))
 
     async def test_handle_control_message_subscription_error(self):
         """Failed subscription response (rt_cd!=0) should log a warning."""
-        mock_ws = AsyncMock()
         raw = self._ws_subscription_error_raw()
 
-        await self.data_source._handle_control_message(mock_ws, raw)
+        await self.data_source._handle_control_message(raw)
 
         self.assertTrue(self._is_logged_partial("WARNING", "KIS WS subscription error"))
 
     async def test_handle_control_message_invalid_json(self):
         """Invalid JSON should log a warning and not raise."""
-        mock_ws = AsyncMock()
-
-        await self.data_source._handle_control_message(mock_ws, "not valid json {{{")
+        await self.data_source._handle_control_message("not valid json {{{")
 
         self.assertTrue(self._is_logged_partial("WARNING", "Invalid JSON from KIS WS"))
 
     # ------------------------------------------------------------------
-    # Test: _process_ws_message routing
+    # Test: _on_ws_frame routing
     # ------------------------------------------------------------------
 
-    async def test_process_ws_message_routes_data_to_handle_data_message(self):
+    async def test_on_ws_frame_routes_data_to_handle_data_message(self):
         """Messages starting with '0' or '1' should be routed to _handle_data_message."""
-        mock_ws = AsyncMock()
         raw = self._ws_orderbook_raw()
 
         with patch.object(
             self.data_source, "_handle_data_message", new_callable=AsyncMock
         ) as mock_handle:
-            await self.data_source._process_ws_message(mock_ws, raw)
+            await self.data_source._on_ws_frame(raw)
             mock_handle.assert_awaited_once_with(raw)
 
-    async def test_process_ws_message_routes_json_to_handle_control_message(self):
+    async def test_on_ws_frame_routes_json_to_handle_control_message(self):
         """Messages not starting with '0'/'1' should be routed to _handle_control_message."""
-        mock_ws = AsyncMock()
-        raw = self._ws_pingpong_raw()
+        raw = self._ws_subscription_success_raw()
 
         with patch.object(
             self.data_source, "_handle_control_message", new_callable=AsyncMock
         ) as mock_handle:
-            await self.data_source._process_ws_message(mock_ws, raw)
-            mock_handle.assert_awaited_once_with(mock_ws, raw)
+            await self.data_source._on_ws_frame(raw)
+            mock_handle.assert_awaited_once_with(raw)
+
+    async def test_on_ws_frame_routes_orderbook_data(self):
+        await self.data_source._on_ws_frame(self._ws_orderbook_raw())
+
+        queue = self.data_source._message_queue[self.data_source._snapshot_messages_queue_key]
+        self.assertFalse(queue.empty())
+
+    async def test_jep134_stamp_preserved(self):
+        marked = []
+        self.data_source._mark_ws_orderbook_frame = lambda trading_pair: marked.append(trading_pair)
+        self.connector._trading_pair_symbol_map = {"005930": self.trading_pair}
+
+        await self.data_source._on_ws_frame(self._ws_orderbook_raw())
+
+        self.assertEqual([self.trading_pair], marked)
 
     # ------------------------------------------------------------------
     # Test: _handle_data_message
@@ -1287,6 +1247,7 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
             connector=self.connector,
             api_factory=self.connector._web_assistants_factory,
             auth=self.mock_auth,
+            hub=MagicMock(),
             domain=CONSTANTS.DEFAULT_DOMAIN,
             market_routing=market_routing,
         )
@@ -1294,24 +1255,6 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
     def _ws_orderbook_payload(self) -> str:
         """Caret body of an orderbook message (without the 0|TR_ID|TR_KEY| prefix)."""
         return self._ws_orderbook_raw().split("|", 3)[3]
-
-    async def test_subscribe_uses_unified_tr_ids_under_sor(self):
-        ds = self._make_ds("sor")
-        ws = AsyncMock()
-        with patch.object(self.connector, "exchange_symbol_associated_to_pair",
-                          new_callable=AsyncMock, return_value="005930"):
-            await ds._subscribe_ws_channels(ws, "approval")
-        sent = [c[0][0]["body"]["input"]["tr_id"] for c in ws.send_json.call_args_list]
-        self.assertEqual(["H0UNASP0", "H0UNCNT0"], sent)
-
-    async def test_subscribe_uses_nxt_tr_ids_under_nxt(self):
-        ds = self._make_ds("nxt")
-        ws = AsyncMock()
-        with patch.object(self.connector, "exchange_symbol_associated_to_pair",
-                          new_callable=AsyncMock, return_value="005930"):
-            await ds._subscribe_ws_channels(ws, "approval")
-        sent = [c[0][0]["body"]["input"]["tr_id"] for c in ws.send_json.call_args_list]
-        self.assertEqual(["H0NXASP0", "H0NXCNT0"], sent)
 
     async def test_handle_data_message_unified_orderbook_dispatched(self):
         ds = self._make_ds("sor")
@@ -1365,115 +1308,64 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
     # Test: listen_for_subscriptions (WS loop with mocking)
     # ------------------------------------------------------------------
 
-    async def test_listen_for_subscriptions_connects_and_subscribes(self):
-        """listen_for_subscriptions should connect to WS and subscribe to channels."""
-        mock_ws = AsyncMock()
-        mock_ws.send_json = AsyncMock()
-        mock_ws.__aiter__ = MagicMock(return_value=iter([]))
-
-        mock_session = MagicMock()
-        mock_session.ws_connect = MagicMock(return_value=_FakeAsyncCtx(mock_ws))
-
-        with patch(
-            "hummingbot.connector.exchange.kis.kis_api_order_book_data_source.aiohttp.ClientSession",
-            return_value=_FakeAsyncCtx(mock_session),
+    async def test_listen_registers_market_trs_with_hub(self):
+        hub = MagicMock()
+        hub.register = AsyncMock()
+        hub.unregister = AsyncMock()
+        self.data_source._hub = hub
+        with patch.object(
+            self.connector,
+            "exchange_symbol_associated_to_pair",
+            new=AsyncMock(return_value="005930"),
         ):
-            with patch.object(self.data_source, "_sleep", new_callable=AsyncMock) as sleep_mock:
-                sleep_mock.side_effect = asyncio.CancelledError()
-
-                with self.assertRaises(asyncio.CancelledError):
-                    await self.data_source.listen_for_subscriptions()
-
-        self.assertEqual(2, mock_ws.send_json.await_count)
-
-        calls = mock_ws.send_json.call_args_list
-        ob_msg = calls[0][0][0]
-        trade_msg = calls[1][0][0]
-        self.assertEqual(CONSTANTS.WS_DOMESTIC_STOCK_ORDERBOOK_TR_ID, ob_msg["body"]["input"]["tr_id"])
-        self.assertEqual(CONSTANTS.WS_DOMESTIC_STOCK_TRADE_TR_ID, trade_msg["body"]["input"]["tr_id"])
-        self.assertEqual("005930", ob_msg["body"]["input"]["tr_key"])
-
-    async def test_listen_for_subscriptions_processes_messages(self):
-        """listen_for_subscriptions should process incoming WS messages."""
-        import aiohttp as _aiohttp
-
-        mock_ob_msg = MagicMock()
-        mock_ob_msg.type = _aiohttp.WSMsgType.TEXT
-        mock_ob_msg.data = self._ws_orderbook_raw()
-
-        mock_trade_msg = MagicMock()
-        mock_trade_msg.type = _aiohttp.WSMsgType.TEXT
-        mock_trade_msg.data = self._ws_trade_raw()
-
-        mock_close_msg = MagicMock()
-        mock_close_msg.type = _aiohttp.WSMsgType.CLOSED
-
-        fake_ws = _FakeWS([mock_ob_msg, mock_trade_msg, mock_close_msg])
-
-        mock_session = MagicMock()
-        mock_session.ws_connect = MagicMock(return_value=_FakeAsyncCtx(fake_ws))
-
-        with patch(
-            "hummingbot.connector.exchange.kis.kis_api_order_book_data_source.aiohttp.ClientSession",
-            return_value=_FakeAsyncCtx(mock_session),
-        ):
-            # After the WS closes cleanly, the while-True loop restarts.
-            # Make get_ws_approval_key raise CancelledError on the 2nd call.
-            with patch.object(
-                self.data_source._auth, "get_ws_approval_key", new_callable=AsyncMock
-            ) as mock_key:
-                mock_key.side_effect = ["test_approval_key", asyncio.CancelledError()]
-
-                with self.assertRaises(asyncio.CancelledError):
-                    await self.data_source.listen_for_subscriptions()
-
-        ob_queue = self.data_source._message_queue[self.data_source._snapshot_messages_queue_key]
-        self.assertFalse(ob_queue.empty())
-        ob_msg = ob_queue.get_nowait()
-        self.assertEqual(OrderBookMessageType.SNAPSHOT, ob_msg.type)
-
-        trade_queue = self.data_source._message_queue[self.data_source._trade_messages_queue_key]
-        self.assertFalse(trade_queue.empty())
-        trade_msg = trade_queue.get_nowait()
-        self.assertEqual(OrderBookMessageType.TRADE, trade_msg.type)
-
-    async def test_listen_for_subscriptions_handles_exception_and_reconnects(self):
-        """On connection error, should log exception and attempt to reconnect."""
-
-        class _FailCtx:
-            async def __aenter__(self):
-                raise ConnectionError("WS connection failed")
-
-            async def __aexit__(self, *args):
+            task = asyncio.create_task(self.data_source.listen_for_subscriptions())
+            await asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
                 pass
+        reg_trs = {c.args[0] for c in hub.register.await_args_list}
+        self.assertEqual({"H0UNASP0", "H0UNCNT0"}, reg_trs)
+        unreg_trs = {c.args[0] for c in hub.unregister.await_args_list}
+        self.assertEqual({"H0UNASP0", "H0UNCNT0"}, unreg_trs)
 
-        with patch(
-            "hummingbot.connector.exchange.kis.kis_api_order_book_data_source.aiohttp.ClientSession",
-            return_value=_FailCtx(),
+    async def test_stale_listen_finally_skips_unregister_after_restart(self):
+        hub = MagicMock()
+        hub.register = AsyncMock()
+        hub.unregister = AsyncMock()
+        self.data_source._hub = hub
+        with patch.object(
+            self.connector,
+            "exchange_symbol_associated_to_pair",
+            new=AsyncMock(return_value="005930"),
         ):
-            with patch.object(self.data_source, "_sleep", new_callable=AsyncMock) as sleep_mock:
-                sleep_mock.side_effect = [None, asyncio.CancelledError()]
-
-                with self.assertRaises(asyncio.CancelledError):
-                    await self.data_source.listen_for_subscriptions()
-
-        self.assertTrue(
-            self._is_logged_partial("ERROR", "KIS orderbook WebSocket failed")
-        )
-        # Capped exponential backoff: first failure = base 5s, second = 10s
-        # (so a persistently-down WS does not flood reconnects/logs every 5s).
-        self.assertEqual(5.0, sleep_mock.call_args_list[0].args[0])
-        self.assertEqual(10.0, sleep_mock.call_args_list[1].args[0])
+            task_a = asyncio.create_task(self.data_source.listen_for_subscriptions())
+            await asyncio.sleep(0)
+            task_b = asyncio.create_task(self.data_source.listen_for_subscriptions())
+            await asyncio.sleep(0)
+            task_a.cancel()
+            try:
+                await task_a
+            except asyncio.CancelledError:
+                pass
+            unreg_after_stale = hub.unregister.await_count
+            task_b.cancel()
+            try:
+                await task_b
+            except asyncio.CancelledError:
+                pass
+        self.assertEqual(0, unreg_after_stale)
+        self.assertEqual({"H0UNASP0", "H0UNCNT0"}, {c.args[0] for c in hub.unregister.await_args_list})
 
     async def test_listen_for_subscriptions_propagates_cancelled_error(self):
-        """CancelledError during WS loop should propagate cleanly."""
-        with patch.object(
-            self.data_source._auth, "get_ws_approval_key", new_callable=AsyncMock
-        ) as mock_key:
-            mock_key.side_effect = asyncio.CancelledError()
-
+        """CancelledError during hub-backed listen should propagate cleanly."""
+        self.data_source._hub.register = AsyncMock(side_effect=asyncio.CancelledError())
+        self.data_source._hub.unregister = AsyncMock()
+        with patch.object(self.connector, "exchange_symbol_associated_to_pair", new=AsyncMock(return_value="005930")):
             with self.assertRaises(asyncio.CancelledError):
                 await self.data_source.listen_for_subscriptions()
+        self.assertEqual({"H0UNASP0", "H0UNCNT0"}, {c.args[0] for c in self.data_source._hub.unregister.await_args_list})
 
     # ------------------------------------------------------------------
     # Test: listen_for_trades uses WS trade queue
@@ -1549,58 +1441,10 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
             connector=self.connector,
             api_factory=self.connector._web_assistants_factory,
             auth=self.mock_auth,
+            hub=MagicMock(),
             domain="sandbox",
         )
         self.assertEqual("sandbox", ds._domain)
-
-    # ------------------------------------------------------------------
-    # Test: _subscribe_ws_channels
-    # ------------------------------------------------------------------
-
-    async def test_subscribe_ws_channels_sends_correct_messages(self):
-        """Should send orderbook and trade subscription messages for each trading pair."""
-        mock_ws = AsyncMock()
-
-        await self.data_source._subscribe_ws_channels(mock_ws, "test_approval_key")
-
-        # 1 trading pair => 2 subscription messages (orderbook + trade)
-        self.assertEqual(2, mock_ws.send_json.await_count)
-
-        ob_call = mock_ws.send_json.call_args_list[0][0][0]
-        trade_call = mock_ws.send_json.call_args_list[1][0][0]
-
-        # Verify orderbook subscription
-        self.assertEqual("test_approval_key", ob_call["header"]["approval_key"])
-        self.assertEqual("1", ob_call["header"]["tr_type"])
-        self.assertEqual(CONSTANTS.WS_DOMESTIC_STOCK_ORDERBOOK_TR_ID,
-                         ob_call["body"]["input"]["tr_id"])
-        self.assertEqual("005930", ob_call["body"]["input"]["tr_key"])
-
-        # Verify trade subscription
-        self.assertEqual(CONSTANTS.WS_DOMESTIC_STOCK_TRADE_TR_ID,
-                         trade_call["body"]["input"]["tr_id"])
-        self.assertEqual("005930", trade_call["body"]["input"]["tr_key"])
-
-        # Verify subscription success was logged
-        self.assertTrue(
-            self._is_logged("INFO", "Subscribed to KIS WebSocket orderbook and trade channels")
-        )
-
-    async def test_subscribe_ws_channels_multiple_pairs(self):
-        """With multiple trading pairs, should send 2 subscriptions per pair."""
-        self.data_source._trading_pairs = [self.trading_pair, "000660-KRW"]
-        self.connector._set_trading_pair_symbol_map(
-            bidict({
-                "005930": self.trading_pair,
-                "000660": "000660-KRW",
-            })
-        )
-
-        mock_ws = AsyncMock()
-        await self.data_source._subscribe_ws_channels(mock_ws, "key")
-
-        # 2 pairs * 2 channels = 4 messages
-        self.assertEqual(4, mock_ws.send_json.await_count)
 
     # ------------------------------------------------------------------
     # Test: WS orderbook message timestamp and update_id

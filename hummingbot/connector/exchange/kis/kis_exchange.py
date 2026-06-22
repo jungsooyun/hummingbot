@@ -15,6 +15,7 @@ from hummingbot.connector.exchange.kis import (
 from hummingbot.connector.exchange.kis.kis_api_order_book_data_source import KisAPIOrderBookDataSource
 from hummingbot.connector.exchange.kis.kis_api_user_stream_data_source import KisAPIUserStreamDataSource
 from hummingbot.connector.exchange.kis.kis_auth import KisAuth
+from hummingbot.connector.exchange.kis.kis_ws_hub import KisWsHub
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
@@ -80,6 +81,7 @@ class KisExchange(ExchangePyBase):
         # (REST-only market data + fills). Default enabled. The factory forwards
         # every config-map field as a kwarg, so the constructor MUST accept it.
         self._ws_enabled = str(kis_ws_enabled).strip().lower() != "false"
+        self._ws_hub = None
 
         # Resolve order routing BEFORE super().__init__() — ExchangePyBase.__init__
         # constructs the order book data source, which needs self._market_routing.
@@ -247,12 +249,24 @@ class KisExchange(ExchangePyBase):
             auth=self._auth,
         )
 
+    @property
+    def ws_hub(self) -> KisWsHub:
+        """The single shared KIS WS transport hub."""
+        if self._ws_hub is None:
+            self._ws_hub = KisWsHub(
+                auth=self._auth,
+                domain=self._domain,
+                ws_enabled=self._ws_enabled,
+            )
+        return self._ws_hub
+
     def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
         return KisAPIOrderBookDataSource(
             trading_pairs=self._trading_pairs,
             connector=self,
             api_factory=self._web_assistants_factory,
             auth=self._auth,
+            hub=self.ws_hub,
             domain=self._domain,
             market_routing=self._market_routing,
             ws_enabled=self._ws_enabled,
@@ -264,9 +278,15 @@ class KisExchange(ExchangePyBase):
             trading_pairs=self._trading_pairs,
             connector=self,
             api_factory=self._web_assistants_factory,
+            hub=self.ws_hub,
             domain=self._domain,
             ws_enabled=self._ws_enabled,
         )
+
+    async def stop_network(self):
+        await super().stop_network()
+        if self._ws_hub is not None:
+            await self._ws_hub.stop()
 
     # ------------------------------------------------------------------
     # Fee

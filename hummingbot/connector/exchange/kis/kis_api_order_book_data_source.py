@@ -3,8 +3,6 @@ import json
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-import aiohttp
-
 from hummingbot.connector.exchange.kis import (
     kis_constants as CONSTANTS,
     kis_utils,
@@ -21,6 +19,7 @@ from hummingbot.logger import HummingbotLogger
 if TYPE_CHECKING:
     from hummingbot.connector.exchange.kis.kis_auth import KisAuth
     from hummingbot.connector.exchange.kis.kis_exchange import KisExchange
+    from hummingbot.connector.exchange.kis.kis_ws_hub import KisWsHub
 
 
 class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
@@ -35,10 +34,10 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
     KIS WebSocket specifics:
     - Auth uses approval_key (separate from REST OAuth token)
     - Data arrives as pipe-delimited text: ``0|TR_ID|TR_KEY|field1^field2^...``
-    - Control messages (subscription responses, PINGPONG) are JSON
+    - Control messages (subscription responses, hub-owned PINGPONG) are JSON
     - Subscription: JSON with ``tr_type: "1"`` (subscribe) / ``"2"`` (unsubscribe)
     - Field separator within data: ``^`` (caret)
-    - PINGPONG heartbeat: echo the raw message back
+    - PINGPONG heartbeat: echoed centrally by KisWsHub
     """
 
     _logger: Optional[HummingbotLogger] = None
@@ -54,6 +53,7 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         connector: "KisExchange",
         api_factory: WebAssistantsFactory,
         auth: "KisAuth",
+        hub: "KisWsHub",
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
         market_routing: str = CONSTANTS.MARKET_ROUTING_KRX,
         ws_enabled: bool = True,
@@ -62,6 +62,8 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._connector = connector
         self._api_factory = api_factory
         self._auth = auth
+        self._hub = hub
+        self._listen_gen = 0
         self._domain = domain
         self._market_routing = market_routing
         self._ws_enabled = ws_enabled
@@ -77,7 +79,6 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
             set(CONSTANTS.WS_ORDERBOOK_TR_ID_BY_ROUTING.values())
             | set(CONSTANTS.WS_TRADE_TR_ID_BY_ROUTING.values())
         )
-        self._ws_failures = 0  # consecutive WS reconnect failures (for backoff)
 
     # ------------------------------------------------------------------
     # Public interface
@@ -95,12 +96,7 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
     # ------------------------------------------------------------------
 
     async def listen_for_subscriptions(self):
-        """Connect to KIS WebSocket and stream orderbook + trade data.
-
-        Overrides the base class to handle KIS's custom message format:
-        - Data messages: pipe-delimited text with caret-separated fields
-        - Control messages: JSON (subscription responses, PINGPONG)
-        """
+        """Register KIS orderbook + trade channels on the shared WS hub."""
         if not self._ws_enabled:
             # REST-only mode: never touch the WS edge. The order book is kept fresh
             # by the base REST snapshot poll (FULL_ORDER_BOOK_RESET_DELTA_SECONDS).
@@ -110,76 +106,32 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
             )
             while True:
                 await self._sleep(3600)
-        while True:
-            try:
-                approval_key = await self._auth.get_ws_approval_key()
-                ws_url = web_utils.ws_url(self._domain)
 
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(ws_url) as ws:
-                        # Subscribe to channels
-                        await self._subscribe_ws_channels(ws, approval_key)
-                        self._ws_failures = 0  # connected; reset backoff
+        self._listen_gen += 1
+        my_gen = self._listen_gen
+        symbols = [
+            await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+            for trading_pair in self._trading_pairs
+        ]
+        try:
+            for symbol in symbols:
+                await self._hub.register(self._ob_tr_id, symbol, self._on_ws_frame)
+                await self._hub.register(self._trade_tr_id, symbol, self._on_ws_frame)
+            self.logger().info("Registered KIS orderbook + trade channels on the shared WS hub")
+            while True:
+                await self._sleep(3600)
+        finally:
+            if my_gen == self._listen_gen:
+                for symbol in symbols:
+                    await self._hub.unregister(self._ob_tr_id, symbol)
+                    await self._hub.unregister(self._trade_tr_id, symbol)
 
-                        # Process messages
-                        async for msg in ws:
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                await self._process_ws_message(ws, msg.data)
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                                break
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self._ws_failures += 1
-                delay = web_utils.reconnect_backoff(self._ws_failures)
-                # Full traceback once per streak; concise + capped-backoff thereafter
-                # so a persistently-unavailable WS doesn't flood the log every 5s.
-                if self._ws_failures == 1:
-                    self.logger().exception(
-                        "KIS orderbook WebSocket failed; retrying with backoff."
-                    )
-                else:
-                    self.logger().warning(
-                        f"KIS orderbook WebSocket still unavailable "
-                        f"(attempt {self._ws_failures}); retrying in {delay:.0f}s."
-                    )
-                await self._sleep(delay)
-
-    async def _subscribe_ws_channels(self, ws: aiohttp.ClientWebSocketResponse, approval_key: str):
-        """Subscribe to orderbook and trade channels for all trading pairs."""
-        for trading_pair in self._trading_pairs:
-            symbol = await self._connector.exchange_symbol_associated_to_pair(
-                trading_pair=trading_pair
-            )
-
-            # Subscribe to orderbook (KRX H0STASP0 / NXT H0NXASP0 / unified H0UNASP0)
-            ob_msg = self._build_subscription_message(
-                approval_key=approval_key,
-                tr_id=self._ob_tr_id,
-                tr_key=symbol,
-                tr_type="1",
-            )
-            await ws.send_json(ob_msg)
-
-            # Subscribe to trades (KRX H0STCNT0 / NXT H0NXCNT0 / unified H0UNCNT0)
-            trade_msg = self._build_subscription_message(
-                approval_key=approval_key,
-                tr_id=self._trade_tr_id,
-                tr_key=symbol,
-                tr_type="1",
-            )
-            await ws.send_json(trade_msg)
-
-        self.logger().info("Subscribed to KIS WebSocket orderbook and trade channels")
-
-    async def _process_ws_message(self, ws: aiohttp.ClientWebSocketResponse, raw: str):
-        """Route incoming WS message to the appropriate handler."""
+    async def _on_ws_frame(self, raw: str):
+        """Hub dispatch entry-point: route a raw frame like the old socket loop."""
         if raw and raw[0] in ("0", "1"):
-            # Data message: 0|TR_ID|TR_KEY|data
             await self._handle_data_message(raw)
         else:
-            # JSON control message (subscription response, PINGPONG)
-            await self._handle_control_message(ws, raw)
+            await self._handle_control_message(raw)
 
     async def _handle_data_message(self, raw: str):
         """Parse pipe-delimited data message and enqueue."""
@@ -209,27 +161,18 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 f"trade={self._trade_tr_id})."
             )
 
-    async def _handle_control_message(self, ws: aiohttp.ClientWebSocketResponse, raw: str):
-        """Handle JSON control messages (PINGPONG, subscription responses)."""
+    async def _handle_control_message(self, raw: str):
+        """Handle JSON subscription responses. PINGPONG is echoed centrally by the hub."""
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
             self.logger().warning(f"Invalid JSON from KIS WS: {raw[:100]}")
             return
 
-        header = data.get("header", {})
-        tr_id = header.get("tr_id", "")
-
-        if tr_id == "PINGPONG":
-            # Echo the raw message back as pong
-            await ws.send_str(raw)
-            return
-
-        # Subscription response
         body = data.get("body", {})
         rt_cd = body.get("rt_cd", "")
         msg1 = body.get("msg1", "")
-        if rt_cd != "0":
+        if rt_cd not in ("", "0"):
             self.logger().warning(f"KIS WS subscription error: {msg1}")
 
     # ------------------------------------------------------------------
@@ -450,26 +393,6 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         if self._trading_pairs:
             return self._trading_pairs[0]
         return None
-
-    @staticmethod
-    def _build_subscription_message(
-        approval_key: str, tr_id: str, tr_key: str, tr_type: str,
-    ) -> dict:
-        """Build a KIS WebSocket subscription JSON message."""
-        return {
-            "header": {
-                "approval_key": approval_key,
-                "custtype": "P",
-                "tr_type": tr_type,
-                "content-type": "utf-8",
-            },
-            "body": {
-                "input": {
-                    "tr_id": tr_id,
-                    "tr_key": tr_key,
-                },
-            },
-        }
 
     # ------------------------------------------------------------------
     # Base class abstract methods (no-op for WS-based source)
