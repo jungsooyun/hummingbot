@@ -281,6 +281,8 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
             timestamp,
         )
         self._message_queue[self._snapshot_messages_queue_key].put_nowait(snapshot_msg)
+        if bids and asks:
+            self._mark_ws_orderbook_frame(trading_pair)
 
     async def _process_trade_data(self, tr_key: str, data: Dict[str, str]):
         """Convert parsed trade data to OrderBookMessage and enqueue."""

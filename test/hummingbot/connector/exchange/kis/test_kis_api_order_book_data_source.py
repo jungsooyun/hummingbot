@@ -1031,6 +1031,38 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(68000.0, msg.asks[0].price)
         self.assertEqual(67900.0, msg.bids[0].price)
 
+    async def test_ws_orderbook_frame_stamps_freshness(self):
+        self.assertIsNone(self.data_source.last_ws_orderbook_time(self.trading_pair))
+        raw = self._ws_orderbook_raw()
+        parsed = KisAPIOrderBookDataSource._parse_caret_fields(
+            raw.split("|")[3], CONSTANTS.WS_ORDERBOOK_COLUMNS
+        )
+
+        await self.data_source._process_orderbook_data("005930", parsed)
+
+        self.assertIsNotNone(self.data_source.last_ws_orderbook_time(self.trading_pair))
+
+    async def test_empty_book_does_not_stamp(self):
+        empty = {k: "0" for k in CONSTANTS.WS_ORDERBOOK_COLUMNS}
+
+        await self.data_source._process_orderbook_data("005930", empty)
+
+        q = self.data_source._message_queue[self.data_source._snapshot_messages_queue_key]
+        self.assertFalse(q.empty())
+        self.assertIsNone(self.data_source.last_ws_orderbook_time(self.trading_pair))
+
+    async def test_pingpong_and_sub_error_do_not_stamp(self):
+        await self.data_source._handle_control_message(
+            _FakeWS([]),
+            self._ws_pingpong_raw(),
+        )
+        await self.data_source._handle_control_message(
+            _FakeWS([]),
+            self._ws_subscription_error_raw(),
+        )
+
+        self.assertIsNone(self.data_source.last_ws_orderbook_time(self.trading_pair))
+
     async def test_process_orderbook_data_unknown_symbol_uses_fallback(self):
         """When the stock code is not in the symbol map, should fall back to first trading pair."""
         data = {col: "0" for col in CONSTANTS.WS_ORDERBOOK_COLUMNS}
