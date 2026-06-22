@@ -1378,6 +1378,7 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
             kis_account_number="12345678-01",
             kis_sandbox="false",
             kis_market_routing="sor",
+            kis_hts_id="myhts",
             trading_pairs=[self.trading_pair],
             trading_required=False,
             balance_asset_limit={},
@@ -1402,6 +1403,25 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         )
         self.assertEqual("sor", ex._market_routing)
         self.assertEqual(limit, ex._balance_asset_limit)
+
+    def test_constructor_stores_and_forwards_hts_id(self):
+        # kis_hts_id must reach the user-stream DS so the exec-notice channel
+        # (H0STCNI0) can subscribe with the customer HTS ID as tr_key.
+        ex = KisExchange(
+            kis_app_key="testAppKey",
+            kis_app_secret="testAppSecret",
+            kis_account_number="12345678-01",
+            trading_pairs=[self.trading_pair],
+            kis_market_routing="sor",
+            kis_hts_id="myhts",
+        )
+        self.assertEqual("myhts", ex._hts_id)
+        ds = ex._create_user_stream_data_source()
+        self.assertEqual("myhts", ds._hts_id)
+
+    def test_hts_id_defaults_empty(self):
+        # Omitted kis_hts_id -> empty (exec-notice WS skipped, REST fallback).
+        self.assertEqual("", self._make_exchange()._hts_id)
 
     def validate_auth_credentials_present(self, request_call: RequestCall):
         request_headers = request_call.kwargs["headers"]
