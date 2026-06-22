@@ -18,6 +18,7 @@ from hummingbot.strategy_v2.gates.gate_chain import (
     KillSwitchGate,
     TradingHoursGate,
     StalenessGate,
+    WsStalenessGate,
     OrderCapGate,
     InventoryGate,
     SessionWindow,
@@ -40,6 +41,8 @@ def _ctx(
     kis_age_s: float = 0.0,
     hl_age_s: float = 0.0,
     fx_age_s: float = 0.0,
+    kis_ws_age_s: float = 0.0,
+    hl_ws_age_s: float = 0.0,
     inventory: Decimal = Decimal("0"),
     open_order_count: int = 0,
     pending_notional: Decimal = Decimal("0"),
@@ -52,6 +55,8 @@ def _ctx(
         kis_age_s=kis_age_s,
         hl_age_s=hl_age_s,
         fx_age_s=fx_age_s,
+        kis_ws_age_s=kis_ws_age_s,
+        hl_ws_age_s=hl_ws_age_s,
         inventory=inventory,
         open_order_count=open_order_count,
         pending_notional=pending_notional,
@@ -253,6 +258,32 @@ class TestStalenessGate:
         # hl and fx are wildly stale but should be ignored
         r = gate.evaluate(_ctx(kis_age_s=0.0, hl_age_s=9999.0, fx_age_s=9999.0))
         assert r.open is True
+
+
+# ---------------------------------------------------------------------------
+# WsStalenessGate
+# ---------------------------------------------------------------------------
+
+
+class TestWsStalenessGate:
+    gate = WsStalenessGate(max_kis_ws_age_s=3.0, max_hl_ws_age_s=12.0)
+
+    def test_open_when_all_fresh(self):
+        assert self.gate.evaluate(_ctx(kis_ws_age_s=0.0, hl_ws_age_s=0.0)).open is True
+
+    def test_open_at_exact_threshold(self):
+        assert self.gate.evaluate(_ctx(kis_ws_age_s=3.0, hl_ws_age_s=12.0)).open is True
+
+    def test_closed_kis_ws_stale(self):
+        r = self.gate.evaluate(_ctx(kis_ws_age_s=3.001, hl_ws_age_s=0.0))
+        assert r.open is False and "kis" in r.reason.lower()
+
+    def test_unproven_inf_age_closes(self):
+        assert self.gate.evaluate(_ctx(kis_ws_age_s=float("inf"))).open is False
+
+    def test_none_max_disables(self):
+        g = WsStalenessGate(max_kis_ws_age_s=None, max_hl_ws_age_s=None)
+        assert g.evaluate(_ctx(kis_ws_age_s=9999.0, hl_ws_age_s=9999.0)).open is True
 
 
 # ---------------------------------------------------------------------------

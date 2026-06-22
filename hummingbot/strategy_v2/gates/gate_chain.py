@@ -13,6 +13,7 @@ SessionWindow       — (start_hour, start_min) / (end_hour, end_min) window.
 KillSwitchGate      — closes when ctx.kill_switch is True.
 TradingHoursGate    — closes outside all configured SessionWindow(s).
 StalenessGate       — closes when any feed's age exceeds its max threshold.
+WsStalenessGate     — closes when a leg's WS frame age exceeds its max threshold.
 OrderCapGate        — closes when open-order count or pending notional hits cap.
 GateChain           — ordered AND-chain; evaluate() short-circuits on first
                       closed gate; diagnose() runs all gates for logging.
@@ -79,6 +80,10 @@ class GateContext:
         Sum of (price × qty) for all open orders (quote currency).
     kill_switch:
         When True all trading must halt immediately.
+    kis_ws_age_s:
+        Seconds since the last KIS WS orderbook frame.
+    hl_ws_age_s:
+        Seconds since the last Hyperliquid WS orderbook frame.
     """
 
     now_kst: datetime
@@ -89,6 +94,8 @@ class GateContext:
     open_order_count: int
     pending_notional: Decimal
     kill_switch: bool
+    kis_ws_age_s: float = 0.0
+    hl_ws_age_s: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +233,32 @@ class StalenessGate:
                 return GateResult(
                     open=False,
                     reason=f"stale_{label}: age={age:.3f}s > max={max_age:.3f}s",
+                )
+        return _OPEN
+
+
+class WsStalenessGate:
+    """Closes when a leg's WS-orderbook-frame age exceeds its threshold.
+
+    Distinct from StalenessGate's REST/aggregate book-age signal. ``None``
+    disables a leg; callers pass ``inf`` for unproven feeds. Semantics:
+    age > max -> closed, age == max -> open.
+    """
+
+    def __init__(self, max_kis_ws_age_s: Optional[float], max_hl_ws_age_s: Optional[float]) -> None:
+        self._max_kis = max_kis_ws_age_s
+        self._max_hl = max_hl_ws_age_s
+
+    def evaluate(self, ctx: GateContext) -> GateResult:
+        checks: List[Tuple[Optional[float], float, str]] = [
+            (self._max_kis, ctx.kis_ws_age_s, "kis"),
+            (self._max_hl, ctx.hl_ws_age_s, "hl"),
+        ]
+        for max_age, age, label in checks:
+            if max_age is not None and age > max_age:
+                return GateResult(
+                    open=False,
+                    reason=f"stale_ws_{label}: age={age:.3f}s > max={max_age:.3f}s",
                 )
         return _OPEN
 
