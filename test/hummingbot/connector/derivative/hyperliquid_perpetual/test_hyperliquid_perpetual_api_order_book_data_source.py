@@ -183,6 +183,25 @@ class HyperliquidPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTest
         with self.assertRaises(IOError):
             await self.data_source.get_new_order_book(self.trading_pair)
 
+    async def test_l2book_snapshot_stamps_ws_freshness(self):
+        self.assertIsNone(self.data_source.last_ws_orderbook_time(self.trading_pair))
+        out: asyncio.Queue = asyncio.Queue()
+
+        await self.data_source._parse_order_book_snapshot_message(self.get_ws_snapshot_msg(), out)
+
+        self.assertFalse(out.empty())
+        self.assertIsNotNone(self.data_source.last_ws_orderbook_time(self.trading_pair))
+
+    async def test_empty_l2book_does_not_stamp(self):
+        out: asyncio.Queue = asyncio.Queue()
+        msg = self.get_ws_snapshot_msg()
+        msg["data"]["levels"] = [[], []]
+
+        await self.data_source._parse_order_book_snapshot_message(msg, out)
+
+        self.assertFalse(out.empty())
+        self.assertIsNone(self.data_source.last_ws_orderbook_time(self.trading_pair))
+
     @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
     async def test_listen_for_subscriptions_subscribes_to_trades_diffs_and_orderbooks(self, ws_connect_mock):
         ws_connect_mock.return_value = self.mocking_assistant.create_websocket_mock()

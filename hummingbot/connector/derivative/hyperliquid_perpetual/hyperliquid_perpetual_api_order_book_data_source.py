@@ -252,6 +252,8 @@ class HyperliquidPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource
             "asks": [[float(i['px']), float(i['sz'])] for i in data["levels"][1]],
         }, timestamp=timestamp)
         message_queue.put_nowait(order_book_message)
+        if order_book_message.content["bids"] and order_book_message.content["asks"]:
+            self._mark_ws_orderbook_frame(trading_pair)
 
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         exchange_symbol = self.parse_symbol(raw_message)
