@@ -46,6 +46,17 @@ REST_ORDER_BOOK_POLL_INTERVAL = 5.0
 
 HOUR_CLS_AUCTION = "C"
 
+# H0STMKO0 MKOP_CLS_CODE — market-wide CB only (sidecar 387/388/397/398 intentionally NOT used:
+# a market-wide sidecar does not block a single-stock taker hedge). Values verified against the
+# KIS apiportal field spec (research §3.3) but UNVERIFIED against a live H0STMKO0 frame; fail-closed
+# design (unknown code => halt) means a mis-decoded CB code degrades only to value-staleness latency.
+MKOP_CLS_SET_CB = frozenset({"174", "184"})      # 서킷브레이커 발동/개시 (UNVERIFIED-live)
+MKOP_CLS_CLEAR_CB = frozenset({"175", "185"})    # 서킷브레이커 해제 (UNVERIFIED-live)
+MKOP_CLS_SET_TEMP_STOP = frozenset({"164"})      # 시장임시정지 (release UNVERIFIED -> retain until verified-normal)
+TRHT_HALTED = "Y"                                # per-stock halt (VERIFIED)
+VI_ACTIVE_VALUES = frozenset({"1", "2", "3"})    # VI active (placeholder; confirm on capture)
+KNOWN_NORMAL_MKOP = frozenset()                  # normal-session codes; populate from live capture (empty => unknown fail-closed)
+
 # --------------------------------------------------------------------------- #
 # Domestic Futures / Options (국내 선물옵션)
 # --------------------------------------------------------------------------- #
@@ -133,6 +144,12 @@ WS_TRADE_TR_ID_BY_ROUTING = {
     MARKET_ROUTING_NXT: "H0NXCNT0",
     MARKET_ROUTING_SOR: "H0UNCNT0",
 }
+# 라우팅 → 장운영정보 WS TR_ID (KRX / NXT / 통합)
+WS_MARKET_STATUS_TR_ID_BY_ROUTING = {
+    MARKET_ROUTING_KRX: "H0STMKO0",
+    MARKET_ROUTING_NXT: "H0NXMKO0",
+    MARKET_ROUTING_SOR: "H0UNMKO0",
+}
 # 라우팅 → REST 국내주식 시세조회 FID_COND_MRKT_DIV_CODE (J:KRX / NX:NXT / UN:통합).
 # 호가(inquire-asking-price-exp-ccn) / 틱커(inquire-price) 등 domestic-stock quotation
 # REST 엔드포인트의 "조건 시장 분류 코드".
@@ -184,6 +201,23 @@ WS_TRADE_COLUMNS = (
     "TOTAL_ASKP_RSQN", "TOTAL_BIDP_RSQN", "VOL_TNRT",
     "PRDY_SMNS_HOUR_ACML_VOL", "PRDY_SMNS_HOUR_ACML_VOL_RATE",
     "HOUR_CLS_CODE", "MRKT_TRTM_CLS_CODE", "VI_STND_PRC",
+)
+
+# H0STMKO0 — 국내주식 장운영정보 (KRX) — 11 fields
+# Source (field order load-bearing): koreainvestment/open-trading-api
+#   examples_llm/domestic_stock/market_status_krx/market_status_krx.py (== examples_user/.../domestic_stock_functions_ws.py)
+WS_MARKET_STATUS_COLUMNS = (
+    "MKSC_SHRN_ISCD",       # 유가증권단축종목코드
+    "TRHT_YN",              # 거래정지여부
+    "TR_SUSP_REAS_CNTT",    # 거래정지사유내용
+    "MKOP_CLS_CODE",        # 장운영구분코드
+    "ANTC_MKOP_CLS_CODE",   # 예상장운영구분코드
+    "MRKT_TRTM_CLS_CODE",   # 임의연장구분코드
+    "DIVI_APP_CLS_CODE",    # 동시호가배분처리구분코드
+    "ISCD_STAT_CLS_CODE",   # 종목상태구분코드
+    "VI_CLS_CODE",          # VI적용구분코드
+    "OVTM_VI_CLS_CODE",     # 시간외단일가VI적용구분코드
+    "EXCH_CLS_CODE",        # 거래소구분코드
 )
 
 # H0STCNI0 — 국내주식 체결통보 — 26 fields (encrypted)
