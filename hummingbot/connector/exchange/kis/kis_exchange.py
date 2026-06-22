@@ -1,4 +1,5 @@
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
@@ -82,6 +83,16 @@ class KisExchange(ExchangePyBase):
         # every config-map field as a kwarg, so the constructor MUST accept it.
         self._ws_enabled = str(kis_ws_enabled).strip().lower() != "false"
         self._ws_hub = None
+        # JEP-198 session-halt per-pair state (perf_counter clock)
+        self._sh_hour_cls_code: Dict[str, str] = {}
+        self._sh_prev_top: Dict[str, tuple] = {}
+        self._sh_last_book_change: Dict[str, float] = {}
+        # Phase-2 latches (populated only when kis_market_status_enabled)
+        self._market_status_enabled = False
+        self._sh_trht_halted: Dict[str, bool] = {}
+        self._sh_cb_latched: bool = False           # market-wide CB (retained on reconnect)
+        self._sh_vi_latched: Dict[str, bool] = {}
+        self._sh_market_status_confirmed: set = set()   # trading_pairs whose own H0STMKO0 sub is ack-confirmed (PER-PAIR — not a global flag)
 
         # Resolve order routing BEFORE super().__init__() — ExchangePyBase.__init__
         # constructs the order book data source, which needs self._market_routing.
@@ -281,6 +292,35 @@ class KisExchange(ExchangePyBase):
             hub=self.ws_hub,
             domain=self._domain,
             ws_enabled=self._ws_enabled,
+        )
+
+    def note_hour_cls_code(self, trading_pair: str, code: Optional[str]) -> None:
+        if code is not None:
+            self._sh_hour_cls_code[trading_pair] = code
+
+    def note_top_of_book(self, trading_pair: str, best_bid: float, best_ask: float) -> None:
+        top = (best_bid, best_ask)
+        if self._sh_prev_top.get(trading_pair) != top:
+            self._sh_prev_top[trading_pair] = top
+            self._sh_last_book_change[trading_pair] = time.perf_counter()
+
+    def get_session_halt_signals(self, trading_pair: str) -> kis_utils.KisHaltSignals:
+        now = time.perf_counter()
+        ds = self.order_book_tracker.data_source if self.order_book_tracker else None
+        last_frame = ds.last_ws_orderbook_time(trading_pair) if ds else None
+        book_age = (now - last_frame) if last_frame is not None else None
+        last_change = self._sh_last_book_change.get(trading_pair)
+        book_static = (now - last_change) if last_change is not None else None
+        # Phase 1 (status feed off) -> ready True; Phase 2 -> THIS pair's own H0STMKO0 ack confirmed
+        status_ready = True if not self._market_status_enabled else (trading_pair in self._sh_market_status_confirmed)
+        return kis_utils.KisHaltSignals(
+            hour_cls_auction=(self._sh_hour_cls_code.get(trading_pair) == CONSTANTS.HOUR_CLS_AUCTION),
+            book_age_sec=book_age,
+            book_static_sec=book_static,
+            trht_halted=bool(self._sh_trht_halted.get(trading_pair, False)),
+            cb_latched=self._sh_cb_latched,
+            vi_latched=bool(self._sh_vi_latched.get(trading_pair, False)),
+            market_status_ready=status_ready,
         )
 
     async def stop_network(self):

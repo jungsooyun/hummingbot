@@ -60,6 +60,13 @@ class _FakeWS:
         return _AsyncIter(self._messages)
 
 
+def _reprice(parsed: dict, best_ask: str, best_bid: str) -> dict:
+    p = dict(parsed)
+    p["ASKP1"] = best_ask
+    p["BIDP1"] = best_bid
+    return p
+
+
 class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
     """
     Tests for the KIS WebSocket-based order book data source.
@@ -283,11 +290,11 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _ws_orderbook_raw() -> str:
+    def _ws_orderbook_raw(hour_cls_code: str = "0") -> str:
         """Raw WS orderbook message (H0UNASP0) with pipe + caret format."""
         return (
             "0|H0UNASP0|005930|"
-            "005930^093000^0"
+            f"005930^093000^{hour_cls_code}"
             "^67800^67900^68000^68100^68200^68300^68400^68500^68600^68700"
             "^67700^67600^67500^67400^67300^67200^67100^67000^66900^66800"
             "^1000^2000^3000^4000^5000^6000^7000^8000^9000^10000"
@@ -1019,6 +1026,39 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         q = self.data_source._message_queue[self.data_source._snapshot_messages_queue_key]
         self.assertFalse(q.empty())
         self.assertIsNone(self.data_source.last_ws_orderbook_time(self.trading_pair))
+
+    async def test_identical_top_of_book_does_not_reset_book_change(self):
+        raw = self._ws_orderbook_raw()
+        parsed = KisAPIOrderBookDataSource._parse_caret_fields(
+            raw.split("|")[3], CONSTANTS.WS_ORDERBOOK_COLUMNS
+        )
+        with patch("time.perf_counter", side_effect=[100.0, 100.0, 110.0, 110.0, 120.0]):
+            await self.data_source._process_orderbook_data("005930", parsed)
+            await self.data_source._process_orderbook_data("005930", parsed)
+            sig = self.connector.get_session_halt_signals(self.trading_pair)
+        self.assertGreaterEqual(sig.book_static_sec, 9.0)
+        self.assertFalse(sig.hour_cls_auction)
+
+    async def test_moved_top_of_book_resets_book_change(self):
+        raw = self._ws_orderbook_raw()
+        base = KisAPIOrderBookDataSource._parse_caret_fields(
+            raw.split("|")[3], CONSTANTS.WS_ORDERBOOK_COLUMNS
+        )
+        a = _reprice(base, best_ask="70100", best_bid="70000")
+        b = _reprice(base, best_ask="70200", best_bid="70100")
+        with patch("time.perf_counter", side_effect=[100.0, 100.0, 110.0, 110.0, 110.0]):
+            await self.data_source._process_orderbook_data("005930", a)
+            await self.data_source._process_orderbook_data("005930", b)
+            sig = self.connector.get_session_halt_signals(self.trading_pair)
+        self.assertLessEqual(sig.book_static_sec, 0.001)
+
+    async def test_hour_cls_code_auction_flag(self):
+        raw = self._ws_orderbook_raw(hour_cls_code="C")
+        parsed = KisAPIOrderBookDataSource._parse_caret_fields(
+            raw.split("|")[3], CONSTANTS.WS_ORDERBOOK_COLUMNS
+        )
+        await self.data_source._process_orderbook_data("005930", parsed)
+        self.assertTrue(self.connector.get_session_halt_signals(self.trading_pair).hour_cls_auction)
 
     async def test_control_message_subscription_error_does_not_stamp(self):
         await self.data_source._handle_control_message(self._ws_subscription_error_raw())

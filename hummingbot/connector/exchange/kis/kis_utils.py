@@ -1,4 +1,5 @@
 from decimal import Decimal
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from pydantic import ConfigDict, Field, SecretStr
@@ -55,6 +56,24 @@ def first_float(data: Dict[str, Any], keys: List[str]) -> Optional[float]:
             if val is not None:
                 return val
     return None
+
+
+@dataclass(frozen=True)
+class KisHaltSignals:
+    """Raw per-pair halt signals computed purely from KIS WS (JEP-198).
+
+    book_age_sec / book_static_sec use time.perf_counter (the same monotonic clock
+    as the JEP-134 freshness stamp). None = no data yet (cold start) -> fail-closed
+    downstream. Phase-2 latches default to the no-halt value so the Phase-1 baseline
+    (no H0STMKO0) reports them benign.
+    """
+    hour_cls_auction: bool
+    book_age_sec: Optional[float]
+    book_static_sec: Optional[float]
+    trht_halted: bool = False
+    cb_latched: bool = False
+    vi_latched: bool = False
+    market_status_ready: bool = True
 
 
 class KisConfigMap(BaseConnectorConfigMap):

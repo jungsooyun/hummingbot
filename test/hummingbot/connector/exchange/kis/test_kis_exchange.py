@@ -374,6 +374,17 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         await conn.ws_hub.register("H0UNASP0", "005930", AsyncMock())
         self.assertIsNone(conn.ws_hub._run_task)
 
+    def test_session_halt_signals_cold_start_has_no_book_ages(self):
+        sig = self.exchange.get_session_halt_signals(self.trading_pair)
+
+        self.assertFalse(sig.hour_cls_auction)
+        self.assertIsNone(sig.book_age_sec)
+        self.assertIsNone(sig.book_static_sec)
+        self.assertFalse(sig.trht_halted)
+        self.assertFalse(sig.cb_latched)
+        self.assertFalse(sig.vi_latched)
+        self.assertTrue(sig.market_status_ready)
+
     @aioresponses()
     async def test_all_trading_pairs_does_not_raise_exception(self, mock_api):
         # Override the base test: KIS has no symbols-list API, so trading pairs

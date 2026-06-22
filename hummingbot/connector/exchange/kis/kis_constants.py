@@ -44,6 +44,8 @@ DOMESTIC_STOCK_ORDERBOOK_PATH = "uapi/domestic-stock/v1/quotations/inquire-askin
 # documented "REST polling, 5s interval" design and the stratops REST client).
 REST_ORDER_BOOK_POLL_INTERVAL = 5.0
 
+HOUR_CLS_AUCTION = "C"
+
 # --------------------------------------------------------------------------- #
 # Domestic Futures / Options (국내 선물옵션)
 # --------------------------------------------------------------------------- #
