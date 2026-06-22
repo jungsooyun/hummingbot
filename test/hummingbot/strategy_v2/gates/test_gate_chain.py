@@ -16,6 +16,7 @@ from hummingbot.strategy_v2.gates.gate_chain import (
     GateResult,
     GateChain,
     KillSwitchGate,
+    SessionHaltGate,
     TradingHoursGate,
     StalenessGate,
     WsStalenessGate,
@@ -43,6 +44,7 @@ def _ctx(
     fx_age_s: float = 0.0,
     kis_ws_age_s: float = 0.0,
     hl_ws_age_s: float = 0.0,
+    kis_session_halted: bool = False,
     inventory: Decimal = Decimal("0"),
     open_order_count: int = 0,
     pending_notional: Decimal = Decimal("0"),
@@ -57,6 +59,7 @@ def _ctx(
         fx_age_s=fx_age_s,
         kis_ws_age_s=kis_ws_age_s,
         hl_ws_age_s=hl_ws_age_s,
+        kis_session_halted=kis_session_halted,
         inventory=inventory,
         open_order_count=open_order_count,
         pending_notional=pending_notional,
@@ -130,6 +133,27 @@ class TestKillSwitchGate:
     def test_reason_non_empty_when_closed(self):
         r = self.gate.evaluate(_ctx(kill_switch=True))
         assert r.reason != ""
+
+
+# ---------------------------------------------------------------------------
+# SessionHaltGate
+# ---------------------------------------------------------------------------
+
+
+class TestSessionHaltGate:
+    gate = SessionHaltGate()
+
+    def test_open_when_not_halted(self):
+        assert self.gate.evaluate(_ctx(kis_session_halted=False)).open is True
+
+    def test_closed_when_halted(self):
+        res = self.gate.evaluate(_ctx(kis_session_halted=True))
+        assert res.open is False
+        assert res.reason  # non-empty
+
+    def test_gatecontext_defaults_kis_session_halted_false(self):
+        # behavior-neutral: a GateContext built without the field is not halted
+        assert _ctx().kis_session_halted is False
 
 
 # ---------------------------------------------------------------------------

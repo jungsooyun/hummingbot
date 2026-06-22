@@ -11,6 +11,7 @@ GateContext         — immutable snapshot of runtime inputs passed to gates.
 Gate                — Protocol every gate must satisfy.
 SessionWindow       — (start_hour, start_min) / (end_hour, end_min) window.
 KillSwitchGate      — closes when ctx.kill_switch is True.
+SessionHaltGate     — closes when ctx.kis_session_halted is True.
 TradingHoursGate    — closes outside all configured SessionWindow(s).
 StalenessGate       — closes when any feed's age exceeds its max threshold.
 WsStalenessGate     — closes when a leg's WS frame age exceeds its max threshold.
@@ -84,6 +85,8 @@ class GateContext:
         Seconds since the last KIS WS orderbook frame.
     hl_ws_age_s:
         Seconds since the last Hyperliquid WS orderbook frame.
+    kis_session_halted:
+        JEP-198 — KIS leg cannot take an immediate taker hedge (auction/VI/거래정지/CB or fail-closed).
     """
 
     now_kst: datetime
@@ -96,6 +99,7 @@ class GateContext:
     kill_switch: bool
     kis_ws_age_s: float = 0.0
     hl_ws_age_s: float = 0.0
+    kis_session_halted: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +264,21 @@ class WsStalenessGate:
                     open=False,
                     reason=f"stale_ws_{label}: age={age:.3f}s > max={max_age:.3f}s",
                 )
+        return _OPEN
+
+
+class SessionHaltGate:
+    """JEP-198: closes immediately when ``ctx.kis_session_halted`` is True.
+
+    The halt decision (clock auction-window + HOUR_CLS_CODE + value-staleness
+    book_frozen + H0STMKO0 latches + fail-closed) is folded UPSTREAM in the
+    executor/connector; this gate stays a pure boolean predicate so gate_chain.py
+    remains stdlib-only.
+    """
+
+    def evaluate(self, ctx: GateContext) -> GateResult:
+        if ctx.kis_session_halted:
+            return GateResult(open=False, reason="kis_session_halted")
         return _OPEN
 
 
