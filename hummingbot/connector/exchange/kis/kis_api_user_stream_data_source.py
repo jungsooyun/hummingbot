@@ -64,6 +64,7 @@ class KisAPIUserStreamDataSource(UserStreamTrackerDataSource):
         hub: "KisWsHub",
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
         ws_enabled: bool = True,
+        hts_id: str = "",
     ):
         super().__init__()
         self._auth = auth
@@ -73,6 +74,9 @@ class KisAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._hub = hub
         self._domain = domain
         self._ws_enabled = ws_enabled
+        # Customer HTS ID = tr_key for the account-wide exec-notice channel.
+        # Empty -> exec-notice WS is skipped (see listen_for_user_stream).
+        self._hts_id = (hts_id or "").strip()
         self._output: Optional[asyncio.Queue] = None
 
         # AES decryption state (per TR_ID)
@@ -84,13 +88,30 @@ class KisAPIUserStreamDataSource(UserStreamTrackerDataSource):
     # ------------------------------------------------------------------ #
 
     async def listen_for_user_stream(self, output: asyncio.Queue):
-        """Register KIS execution notifications on the shared WS hub."""
+        """Register the KIS execution-notice channel (H0STCNI0) on the shared WS hub.
+
+        The exec-notice channel is account-wide and keyed by the customer HTS ID
+        (NOT a stock code), so it is registered ONCE with self._hts_id.
+        """
         if not self._ws_enabled:
             # REST-only mode: never touch the WS edge. Fills are caught via REST
             # order-status polling (readiness is decoupled from the user stream).
             self.logger().info(
                 "KIS execution-notice WebSocket disabled (kis_ws_enabled=false); "
                 "fills tracked via REST order-status polling."
+            )
+            while True:
+                await self._sleep(3600)
+
+        if not self._hts_id:
+            # No HTS ID -> a stock-symbol/empty tr_key would be rejected (OPSP0017)
+            # and recycle the shared socket, taking the orderbook WS down with it.
+            # Skip the exec-notice subscription entirely; fills fall back to REST
+            # order-status polling and the orderbook WS stays up.
+            self.logger().warning(
+                "KIS exec-notice WS (H0STCNI0/H0STCNI9) skipped: kis_hts_id not "
+                "configured; fills tracked via REST order-status polling. "
+                "(Set kis_hts_id via `connect kis`.)"
             )
             while True:
                 await self._sleep(3600)
@@ -104,20 +125,16 @@ class KisAPIUserStreamDataSource(UserStreamTrackerDataSource):
             if sandbox
             else CONSTANTS.WS_DOMESTIC_STOCK_EXEC_NOTICE_TR_ID
         )
-        symbols = [
-            await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-            for trading_pair in self._trading_pairs
-        ]
         try:
-            for symbol in symbols:
-                await self._hub.register(tr_id, symbol, self._on_ws_frame)
-            self.logger().info("Registered KIS execution-notice channel on the shared WS hub")
+            await self._hub.register(tr_id, self._hts_id, self._on_ws_frame)
+            self.logger().info(
+                f"Registered KIS execution-notice channel ({tr_id}) on the shared WS hub"
+            )
             while True:
                 await self._sleep(3600)
         finally:
             if my_gen == self._listen_gen:
-                for symbol in symbols:
-                    await self._hub.unregister(tr_id, symbol)
+                await self._hub.unregister(tr_id, self._hts_id)
 
     async def _on_ws_frame(self, raw: str):
         if raw and raw[0] in ("0", "1"):
