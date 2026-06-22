@@ -75,8 +75,16 @@ class KisWsHub:
         if not self._ws_enabled:
             return
         async with self._lock:
+            # A register() means "(re)start". ExchangePyBase.start_network() calls
+            # stop_network() FIRST (exchange_py_base.py:676), which runs hub.stop() and
+            # sets _stopped=True; without this reset the hub would be permanently dead and
+            # never reconnect on the (re)start that immediately follows. Clear it BEFORE the
+            # overwrite guard so the guard stays armed across restarts; the legitimate
+            # same-handler re-register is a no-op via the identity check below (a DS instance
+            # and its bound _on_ws_frame persist across start/stop cycles).
+            self._stopped = False
             existing = self._dispatch.get(tr_id)
-            if existing is not None and existing is not handler and not self._stopped:
+            if existing is not None and existing is not handler:
                 raise ValueError(
                     f"KisWsHub: tr_id {tr_id} is already registered to a different handler; "
                     f"refusing to overwrite (would silently drop frames)."
@@ -84,11 +92,6 @@ class KisWsHub:
             self._dispatch[tr_id] = handler
             self._subs.add((tr_id, tr_key))
             live = self._ws is not None and not self._ws.closed
-            # A register() means "(re)start". ExchangePyBase.start_network() calls
-            # stop_network() FIRST (exchange_py_base.py:676), which runs hub.stop()
-            # and sets _stopped=True; without this reset the hub would be permanently
-            # dead and never reconnect on the (re)start that immediately follows.
-            self._stopped = False
             self._ensure_running()
         if live:
             await self._safe_send_sub(tr_id, tr_key, "1")
@@ -132,6 +135,10 @@ class KisWsHub:
             self._run_task = safe_ensure_future(self._run())
 
     async def _run(self) -> None:
+        # Fresh run-task = fresh backoff state. The hub is a per-connector singleton reused
+        # across stop_network()/start_network() cycles; without this a flappy prior session
+        # would carry a high _ws_failures into the restart and start at the 60s backoff cap.
+        self._ws_failures = 0
         while not self._stopped:
             try:
                 ws_url = web_utils.ws_url(self._domain)
@@ -173,9 +180,14 @@ class KisWsHub:
                     await self._dispatch_to_handler(tr_id, raw)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                # Full traceback on the first failure of a streak; concise repr thereafter so a
+                # persistently-unavailable WS still surfaces its root cause (401/DNS/TLS) without
+                # flooding the log every few seconds.
                 if self._ws_failures == 0:
                     self.logger().exception("KisWsHub: connection failed; retrying with backoff.")
+                else:
+                    self.logger().warning(f"KisWsHub: connection error ({exc!r}); backing off.")
             finally:
                 await self._close_ws()
             if self._stopped:

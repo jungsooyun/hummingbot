@@ -287,14 +287,17 @@ class KisWsHubTests(IsolatedAsyncioWrapperTestCase):
         ws1 = _FakeWS([_text("0|H0UNASP0|005930|a")])
         ws2 = _FakeWS([_text("0|H0UNASP0|005930|b")])
         fake_session = _FakeSession([ws1, ws2])
+        # Same handler object across the restart, mirroring production: the DS instance
+        # (and its bound _on_ws_frame) persists across start_network/stop_network cycles.
+        handler = AsyncMock()
         with patch("hummingbot.connector.exchange.kis.kis_ws_hub.aiohttp.ClientSession",
                    return_value=fake_session):
             hub = KisWsHub(auth=_make_auth(), domain="real", ws_enabled=True, sleep=AsyncMock())
-            await hub.register("H0UNASP0", "005930", AsyncMock())
+            await hub.register("H0UNASP0", "005930", handler)
             await self._settle()
             await hub.stop()
             self.assertTrue(hub._stopped)
-            await hub.register("H0UNASP0", "005930", AsyncMock())   # restart
+            await hub.register("H0UNASP0", "005930", handler)   # restart (same handler)
             self.assertFalse(hub._stopped)
             self.assertIsNotNone(hub._run_task)
             await self._drain(hub)
