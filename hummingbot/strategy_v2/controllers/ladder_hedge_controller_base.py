@@ -30,7 +30,7 @@ class LadderHedgeControllerConfigBase(ControllerConfigBase):
     ws_staleness_grace_s: float = Field(default=90.0, json_schema_extra={"is_updatable": True})
     session_halt_gate_enabled: bool = Field(default=True, json_schema_extra={"is_updatable": False})
     session_halt_max_ws_age_s: float = Field(default=3.0, json_schema_extra={"is_updatable": True})
-    session_halt_max_book_static_s: float = Field(default=8.0, json_schema_extra={"is_updatable": True})
+    session_halt_max_book_static_s: float = Field(default=15.0, json_schema_extra={"is_updatable": True})
     adopt_existing_inventory: bool = Field(default=False, json_schema_extra={"is_updatable": True})
     latency_profiling: bool = Field(default=False, json_schema_extra={"is_updatable": True})
     max_executors: int = Field(default=1, json_schema_extra={"is_updatable": True})

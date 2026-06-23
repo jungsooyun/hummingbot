@@ -1082,6 +1082,25 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
             sig = self.connector.get_session_halt_signals(self.trading_pair)
         self.assertLessEqual(sig.book_static_sec, 0.001)
 
+    async def test_depth_change_with_static_top_resets_book_change(self):
+        # JEP-198/202: the best bid/ask can hold static for many seconds in a quiet
+        # market while deeper levels keep moving. book_static must track the full
+        # depth (the data source feeds the whole book), so a deeper-level change on
+        # an unchanged top still proves the feed is live -> no false book_frozen.
+        raw = self._ws_orderbook_raw()
+        base = KisAPIOrderBookDataSource._parse_caret_fields(
+            raw.split("|")[3], CONSTANTS.WS_ORDERBOOK_COLUMNS
+        )
+        a = dict(base)
+        b = dict(base)
+        # Top of book unchanged; only a deeper bid-level size moves (BIDP_RSQN2).
+        b["BIDP_RSQN2"] = str(int(float(base["BIDP_RSQN2"])) + 100)
+        with patch("time.perf_counter", side_effect=[100.0, 100.0, 110.0, 110.0, 110.0]):
+            await self.data_source._process_orderbook_data("005930", a)
+            await self.data_source._process_orderbook_data("005930", b)
+            sig = self.connector.get_session_halt_signals(self.trading_pair)
+        self.assertLessEqual(sig.book_static_sec, 0.001)
+
     async def test_hour_cls_code_auction_flag(self):
         raw = self._ws_orderbook_raw(hour_cls_code="C")
         parsed = KisAPIOrderBookDataSource._parse_caret_fields(

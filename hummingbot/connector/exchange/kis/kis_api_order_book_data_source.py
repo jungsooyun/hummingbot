@@ -274,7 +274,7 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 symbol_map = getattr(self._connector, "_trading_pair_symbol_map", None)
             if symbol_map and symbol_map.get(tr_key) == trading_pair:
                 self._mark_ws_orderbook_frame(trading_pair)
-                self._connector.note_top_of_book(trading_pair, bids[0][0], asks[0][0])
+                self._connector.note_book_snapshot(trading_pair, bids, asks)
                 self._connector.note_hour_cls_code(trading_pair, data.get("HOUR_CLS_CODE"))
 
     async def _process_trade_data(self, tr_key: str, data: Dict[str, str]):

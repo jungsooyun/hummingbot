@@ -385,6 +385,38 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         self.assertFalse(sig.vi_latched)
         self.assertTrue(sig.market_status_ready)
 
+    def test_book_static_resets_on_any_depth_change_even_if_top_unchanged(self):
+        # JEP-198/202: a quiet but live market holds the best bid/ask static for
+        # many seconds (the touch can persist for 30+ minutes) while deeper levels
+        # and sizes keep churning. "book static" must track the FULL depth, not the
+        # top alone, or the session-halt gate false-trips book_frozen on a healthy feed.
+        from unittest.mock import patch
+        tp = self.trading_pair
+        bids_a = [(100.0, 5.0), (99.0, 3.0)]
+        asks_a = [(101.0, 4.0), (102.0, 6.0)]
+        # Top of book identical (100.0 / 101.0); only a deeper bid size moves 3.0 -> 9.0.
+        bids_b = [(100.0, 5.0), (99.0, 9.0)]
+        asks_b = [(101.0, 4.0), (102.0, 6.0)]
+        with patch("time.perf_counter", side_effect=[100.0, 200.0]):
+            self.exchange.note_book_snapshot(tp, bids_a, asks_a)
+            self.assertEqual(100.0, self.exchange._sh_last_book_change[tp])
+            self.exchange.note_book_snapshot(tp, bids_b, asks_b)
+            self.assertEqual(200.0, self.exchange._sh_last_book_change[tp])
+
+    def test_book_static_does_not_reset_when_full_book_identical(self):
+        # A genuinely frozen book (every level identical across frames) must NOT
+        # reset book_static, so the session-halt gate can still detect a real freeze.
+        from unittest.mock import patch
+        tp = self.trading_pair
+        bids = [(100.0, 5.0), (99.0, 3.0)]
+        asks = [(101.0, 4.0), (102.0, 6.0)]
+        with patch("time.perf_counter", side_effect=[100.0, 999.0]):
+            self.exchange.note_book_snapshot(tp, bids, asks)
+            self.assertEqual(100.0, self.exchange._sh_last_book_change[tp])
+            # Identical full book -> last_change MUST NOT advance.
+            self.exchange.note_book_snapshot(tp, list(bids), list(asks))
+            self.assertEqual(100.0, self.exchange._sh_last_book_change[tp])
+
     @aioresponses()
     async def test_all_trading_pairs_does_not_raise_exception(self, mock_api):
         # Override the base test: KIS has no symbols-list API, so trading pairs
