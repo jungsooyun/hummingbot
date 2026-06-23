@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,6 +17,7 @@ from hummingbot.client.config.config_helpers import (
     ReadOnlyClientConfigAdapter,
     get_connector_config_yml_path,
     get_strategy_config_map,
+    list_connector_configs,
     load_connector_config_map_from_file,
     save_to_yml,
 )
@@ -118,6 +120,74 @@ strategy: pure_market_making
         instance._decrypt_all_internal_secrets()
 
         self.assertEqual(secret_value, instance.sub_model.secret_attr.get_secret_value())
+
+    def test_list_connector_configs_ignores_non_yml_files(self):
+        # JEP-196: non-*.yml files (.bak/.orig/.save/editor-temp/copies) in conf/connectors/
+        # must NOT shadow connector config. A kis.yml.bak with a different body previously
+        # raced kis.yml (os.scandir order is OS/inode-dependent) and silently won.
+        with TemporaryDirectory() as d:
+            d = Path(d)
+            config_helpers.CONNECTORS_CONF_DIR_PATH = d
+            (d / "kis.yml").write_text("connector: kis\nkis_ws_enabled: 'true'\n")
+            # Sibling files that must be ignored regardless of scandir order.
+            (d / "kis.yml.bak").write_text("connector: kis\nkis_ws_enabled: 'false'\n")
+            (d / "kis.yml.orig").write_text("connector: kis\n")
+            (d / "kis.yml.save").write_text("connector: kis\n")
+            (d / "kis.yml.swp").write_text("connector: kis\n")
+            (d / "kis copy.yaml").write_text("connector: kis\n")
+
+            configs = list_connector_configs()
+
+        names = sorted(p.name for p in configs)
+        self.assertEqual(["kis.yml"], names)
+
+    def test_list_connector_configs_warns_on_duplicate_connector_key(self):
+        # JEP-196: two *.yml files resolving to the same `connector:` key must produce a
+        # deterministic WARNING and return exactly ONE entry (the lex-first file).
+        # Previously the function returned both files, making Security.decrypt_all()'s
+        # last-write-wins semantics contradict the warning (which named kis.yml as winner
+        # while kis_backup.yml actually loaded). Now only the winner is returned.
+        with TemporaryDirectory() as d:
+            d = Path(d)
+            config_helpers.CONNECTORS_CONF_DIR_PATH = d
+            (d / "kis.yml").write_text("connector: kis\nkis_ws_enabled: 'true'\n")
+            (d / "kis_backup.yml").write_text("connector: kis\nkis_ws_enabled: 'false'\n")
+
+            with self.assertLogs(level="WARNING") as log_ctx:
+                configs = list_connector_configs()
+
+        # (a) Warning fires.
+        warning_text = "\n".join(log_ctx.output)
+        self.assertTrue(any("WARNING" in line for line in log_ctx.output))
+
+        # (b) Exactly ONE entry returned for the duplicated connector key.
+        self.assertEqual(1, len(configs))
+
+        # (c) The returned/kept entry is the lex-first file (kis.yml < kis_backup.yml).
+        self.assertEqual("kis.yml", configs[0].name)
+
+        # (d) Warning message names the actual winner (lex-first) and the ignored duplicate.
+        self.assertIn("kis.yml", warning_text)
+        self.assertIn("kis_backup.yml", warning_text)
+
+    def test_list_connector_configs_no_warning_for_distinct_connectors(self):
+        # JEP-196: legitimate single-file-per-connector setups must not warn.
+        with TemporaryDirectory() as d:
+            d = Path(d)
+            config_helpers.CONNECTORS_CONF_DIR_PATH = d
+            (d / "kis.yml").write_text("connector: kis\n")
+            (d / "binance.yml").write_text("connector: binance\n")
+            (d / "_template.yml").write_text("connector: ignored\n")
+            (d / ".hidden.yml").write_text("connector: ignored\n")
+
+            logger = logging.getLogger()
+            with patch.object(logger, "warning") as warning_mock:
+                configs = list_connector_configs()
+
+            warning_mock.assert_not_called()
+
+        names = sorted(p.name for p in configs)
+        self.assertEqual(["binance.yml", "kis.yml"], names)
 
 
 class ReadOnlyClientAdapterTest(unittest.TestCase):
