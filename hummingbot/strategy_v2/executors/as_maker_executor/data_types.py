@@ -6,14 +6,14 @@ from typing import Literal
 
 from pydantic import Field
 
-from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.strategy_v2.executors.data_types import ExecutorConfigBase
 
 
 class AsMakerExecutorConfig(ExecutorConfigBase):
     type: Literal["as_maker_executor"] = "as_maker_executor"
 
-    # Single perp venue (the maker leg). hedge_market is derived = maker_market.
+    # Maker (passive) leg venue.
     connector_name: str
     trading_pair: str
     # Nominal maker entry side for base compatibility (A&S quotes BOTH sides).
@@ -41,6 +41,14 @@ class AsMakerExecutorConfig(ExecutorConfigBase):
 
     # Perp
     leverage: int = 1
+
+    # Hedge (aggressive) leg venue — distinct perp connector/pair (JEP-205 3c).
+    hedge_connector_name: str
+    hedge_trading_pair: str
+    hedge_leverage: int = 1
+    hedge_max_slippage_bps: Decimal = Field(default=Decimal("5"), ge=0)
+    hedge_tick: Decimal = Field(default=Decimal("0.1"), gt=0)
+    hedge_order_type: OrderType = OrderType.LIMIT
 
     # Safety / lifecycle
     kill_switch: bool = False

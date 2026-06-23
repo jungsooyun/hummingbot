@@ -1,8 +1,9 @@
-"""Lane 2 Avellaneda-Stoikov two-sided maker executor (Phase 3b).
+"""Lane 2 Avellaneda-Stoikov two-sided maker executor (Phase 3b/3c).
 
-Single perp venue, two-sided A&S quoting, hedge leg degenerate (NOOP). Sibling of
-LadderMakerExecutor under CrossVenueHedgedExecutorBase. Verified in observe mode;
-production placement path present but live-uncertified (spec §3.9).
+Two venues: an A&S maker leg (HL) + a distinct perp hedge leg (OKX), wired in
+JEP-205 3c. Sibling of LadderMakerExecutor under CrossVenueHedgedExecutorBase.
+Verified in observe mode; production placement path present but live-uncertified
+(spec §3.9). Real submission / hedge fills are 3d-gated.
 """
 from __future__ import annotations
 
@@ -21,12 +22,15 @@ from hummingbot.strategy_v2.executors.as_maker_executor.volatility_source import
 from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.cross_venue_hedged_executor_base import (
     CrossVenueHedgedExecutorBase,
 )
+from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.inventory_adapter import PerpHedgeInventory
 from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.maker_reconcile import RungTarget, Side
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
+from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import compute_hedge_order
 from hummingbot.strategy_v2.gates.gate_chain import GateChain, GateContext, InventoryGate, KillSwitchGate
 from hummingbot.strategy_v2.models.executors import TrackedOrder
 
 ZERO = Decimal("0")
+ONE = Decimal("1")
 TWO = Decimal("2")
 _EDGE = ZERO
 
@@ -48,12 +52,13 @@ class AsMakerExecutor(CrossVenueHedgedExecutorBase):
         self._last_quote: Optional[Dict] = None
         _max_inv = config.max_inventory if config.max_inventory and config.max_inventory > ZERO else None
         self._gate_chain = GateChain([KillSwitchGate(), InventoryGate(_max_inv)])
-        pair = ConnectorPair(connector_name=config.connector_name, trading_pair=config.trading_pair)
+        maker_pair = ConnectorPair(connector_name=config.connector_name, trading_pair=config.trading_pair)
+        hedge_pair = ConnectorPair(connector_name=config.hedge_connector_name, trading_pair=config.hedge_trading_pair)
         super().__init__(
             strategy=strategy,
             config=config,
-            maker_market=pair,
-            hedge_market=pair,
+            maker_market=maker_pair,
+            hedge_market=hedge_pair,
             entry_side=config.entry_side,
             update_interval=update_interval,
             max_retries=max_retries,
@@ -61,6 +66,9 @@ class AsMakerExecutor(CrossVenueHedgedExecutorBase):
         self._vol: VolatilitySource = volatility_source or InstantVolatilitySource(
             config.volatility_sampling_length, config.volatility_processing_length
         )
+        # 3d hedge-queue-consumer injection seam: constructed now, no 3c caller (JEP-205 §3.2/§6).
+        self._inventory = PerpHedgeInventory(self.connectors, self.maker_connector, self.maker_trading_pair,
+                                             self.hedge_connector, self.hedge_trading_pair)
 
     def _mid_price(self) -> Optional[Decimal]:
         conn = self.connectors.get(self.maker_connector)
@@ -231,14 +239,43 @@ class AsMakerExecutor(CrossVenueHedgedExecutorBase):
     def _emit_observe_snapshot(self, targets: List[RungTarget]) -> None:
         snap = dict(self._last_quote or {})
         snap["targets"] = [(t.side.name, t.price, t.size) for t in targets]
+        snap["hedge_preview"] = [
+            {"maker_side": t.side.name, "hedge_side": self._opp(t.side).name,
+             "spec": self._hedge_spec_for(self._opp(t.side), t.size)}
+            for t in targets
+        ]
         self._last_observe = snap
         now = self._strategy.current_timestamp
         if (now - self._last_observe_log_ts) >= self._OBSERVE_LOG_INTERVAL_S:
             self._last_observe_log_ts = now
             self.logger().info(f"[AsMaker observe] {snap}")
 
+    @staticmethod
+    def _opp(side: Side) -> Side:
+        return Side.SELL if side is Side.BUY else Side.BUY
+
+    def _hedge_spec_for(self, hedge_side: Side, base_qty: Decimal) -> Optional[Dict]:
+        okx = self.connectors.get(self.hedge_connector)
+        pt = PriceType.BestAsk if hedge_side is Side.BUY else PriceType.BestBid
+        ref = okx.get_price_by_type(self.hedge_trading_pair, pt) if okx else None
+        if not ref or Decimal(str(ref)) <= ZERO:
+            return None
+        # compute_hedge_order's `kis_price` arg is a generic reference price (the param name is
+        # historical from ladder_policy/KIS); here it is the OKX hedge best-ask/bid.
+        h = compute_hedge_order(fill_qty=base_qty, share_per_unit=ONE, kis_price=Decimal(str(ref)),
+                                max_slippage_bps=self.config.hedge_max_slippage_bps,
+                                tick=self.config.hedge_tick, side=hedge_side)
+        amount = okx.quantize_order_amount(self.hedge_trading_pair, h.size)
+        if amount <= ZERO:
+            return None
+        price = (Decimal("NaN") if self.config.hedge_order_type == OrderType.MARKET
+                 else okx.quantize_order_price(self.hedge_trading_pair, h.price))
+        return {"amount": amount, "price": price, "order_type": self.config.hedge_order_type,
+                "metadata": {"order_role": "hedge"}}
+
     def _size_hedge(self, pending_base: Decimal) -> Optional[Dict]:
-        return None
+        hedge_side = Side.BUY if self._pending_hedge_signed < ZERO else Side.SELL
+        return self._hedge_spec_for(hedge_side, pending_base)
 
     def _maker_balance_candidate(self) -> Optional[OrderCandidate]:
         if self.config.observe:

@@ -22,6 +22,9 @@ def _valid_config_kwargs(**overrides):
         order_amount=Decimal("0.01"),
         max_inventory=Decimal("0.1"),
         maker_tick=Decimal("0.5"),
+        # JEP-205 3c: hedge leg is now a distinct REQUIRED venue (no default).
+        hedge_connector_name="okx_perpetual",
+        hedge_trading_pair="BTC-USDT",
     )
     base.update(overrides)
     return base
@@ -102,8 +105,13 @@ class _FakeStrategy:
         self.cancelled.append((connector, pair, oid))
 
 
-def _fake_strategy_with_book(connector_name, pair, best_bid, best_ask, **ticks):
-    return _FakeStrategy({connector_name: _FakeConnector(best_bid, best_ask, **ticks)})
+def _fake_strategy_with_book(connector_name, pair, best_bid, best_ask, hedge_connector_name="okx_perpetual", **ticks):
+    # JEP-205 3c: the hedge leg is now a distinct connector. Register it too so the base
+    # __init__ subscribes both legs (the existing maker-only assertions are unchanged).
+    return _FakeStrategy({
+        connector_name: _FakeConnector(best_bid, best_ask, **ticks),
+        hedge_connector_name: _FakeConnector(best_bid, best_ask, **ticks),
+    })
 
 
 def _rung(side, price, size):
@@ -211,9 +219,16 @@ def test_sigma_fed_even_when_gate_closed():
     assert ex._gates_open() is False
 
 
-def test_size_hedge_is_noop():
+def test_size_hedge_returns_spec_against_hedge_book():
+    # JEP-205 3c: _size_hedge is no longer a NOOP; it sizes a real hedge spec from the
+    # distinct hedge (OKX) book. Observe-safety still holds: this only COMPUTES a dict;
+    # the Slice 1 observe guard blocks any hedge order-API call.
     ex = _make_exec()
-    assert ex._size_hedge(Decimal("5")) is None
+    ex._pending_hedge_signed = Decimal("-0.01")     # short pending -> hedge BUYs
+    spec = ex._size_hedge(Decimal("0.01"))
+    assert spec is not None
+    assert spec["metadata"] == {"order_role": "hedge"}
+    assert spec["amount"] > Decimal("0")
 
 
 def test_maker_balance_candidate_none_in_observe():
