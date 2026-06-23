@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.executors.arbitrage_executor.data_types import ArbitrageExecutorConfig
+from hummingbot.strategy_v2.executors.as_maker_executor.data_types import AsMakerExecutorConfig
 from hummingbot.strategy_v2.executors.dca_executor.data_types import DCAExecutorConfig
 from hummingbot.strategy_v2.executors.grid_executor.data_types import GridExecutorConfig
 from hummingbot.strategy_v2.executors.inventory_rebalance_executor.data_types import InventoryRebalanceExecutorConfig
@@ -28,6 +29,7 @@ AnyExecutorConfig = Union[
     TWAPExecutorConfig,
     LPExecutorConfig,
     LadderMakerExecutorConfig,
+    AsMakerExecutorConfig,
 ]
 
 

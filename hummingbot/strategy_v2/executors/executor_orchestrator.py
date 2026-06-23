@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 
 from hummingbot.strategy_v2.executors.arbitrage_executor.arbitrage_executor import ArbitrageExecutor
+from hummingbot.strategy_v2.executors.as_maker_executor.as_maker_executor import AsMakerExecutor
 from hummingbot.strategy_v2.executors.data_types import PositionSummary
 from hummingbot.strategy_v2.executors.dca_executor.dca_executor import DCAExecutor
 from hummingbot.strategy_v2.executors.grid_executor.grid_executor import GridExecutor
@@ -216,6 +217,7 @@ class ExecutorOrchestrator:
         "order_executor": OrderExecutor,
         "lp_executor": LPExecutor,
         "ladder_maker_executor": LadderMakerExecutor,
+        "as_maker_executor": AsMakerExecutor,
     }
 
     @classmethod
