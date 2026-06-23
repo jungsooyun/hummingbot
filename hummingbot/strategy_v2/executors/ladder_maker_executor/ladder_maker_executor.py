@@ -45,6 +45,7 @@ from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_calend
 from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_halt_source import (
     KisSessionHaltSource,
     NoHaltSource,
+    apply_post_halt_cooldown,
 )
 from hummingbot.strategy_v2.gates.gate_chain import (
     GateChain,
@@ -141,6 +142,11 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
                     raise ValueError(
                         f"{_name} must be a finite positive number when session_halt_gate_enabled is True "
                         f"(got {_val!r}).")
+            _cooldown = getattr(config, "session_halt_cooldown_s", 1800.0)
+            if _cooldown is None or not math.isfinite(_cooldown) or _cooldown < 0:
+                raise ValueError(
+                    "session_halt_cooldown_s must be a finite non-negative number when "
+                    f"session_halt_gate_enabled is True (0 disables; got {_cooldown!r}).")
             _gates.append(SessionHaltGate())
         self._gate_chain = GateChain(_gates)
         super().__init__(
@@ -164,6 +170,9 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             KisSessionHaltSource(self.connectors[self.hedge_connector])
             if getattr(self.config, "session_halt_gate_enabled", False) else NoHaltSource()
         )
+        # JEP-198 interim post-halt cooldown latch (D): monotonic deadline (strategy clock)
+        # until which the maker-quote halt is held past a freeze/CB; 0.0 = inactive.
+        self._halt_cooldown_until: float = 0.0
         self._fair = FxBridgedFairSource(
             getattr(self.config, "side_aware_fx", True),
             getattr(self.config, "static_fx_rate", None),
@@ -197,6 +206,22 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             max_ws_age_s=getattr(self.config, "session_halt_max_ws_age_s", 3.0),
             max_book_static_s=getattr(self.config, "session_halt_max_book_static_s", 15.0),
         )
+        # JEP-198 interim auction-gap guard (D): hold the halt past the freeze END so the CB
+        # single-price-auction phase (updating 예상체결 book) cannot re-open the gate while the
+        # KIS taker hedge is unavailable. Behavior-neutral when the gate is disabled (NoHaltSource
+        # never halts) or session_halt_cooldown_s == 0.
+        _halt_st, self._halt_cooldown_until, _cd_armed = apply_post_halt_cooldown(
+            _halt_st,
+            now=self._strategy.current_timestamp,
+            cooldown_until=getattr(self, "_halt_cooldown_until", 0.0),
+            cooldown_s=getattr(self.config, "session_halt_cooldown_s", 1800.0),
+        )
+        if _cd_armed:
+            self.logger().warning(
+                "JEP-198 post-halt cooldown ARMED "
+                f"({getattr(self.config, 'session_halt_cooldown_s', 1800.0)}s): holding the maker-quote "
+                f"halt past the freeze to cover the unscheduled single-price auction "
+                f"(KIS taker unavailable). arming_reason={_halt_st.reason!r}")
         ctx = GateContext(
             now_kst=self._calendar.now(self._strategy.current_timestamp),
             kis_age_s=0.0,  # REST book-age gate -> JEP-133

@@ -72,6 +72,50 @@ def compute_session_halt(
     return SessionHaltState(False, ready, "")
 
 
+# JEP-198 interim post-halt cooldown (until JEP-201 H0STMKO0 decode is verified + enabled).
+# Reasons that signal an UNSCHEDULED trading halt whose taker-unavailable window can persist
+# into a single-price (단일가) auction the clock-based calendar can't see — a market-wide CB
+# enters a ~10min 예상체결 auction whose UPDATING book would otherwise un-freeze the gate and
+# re-open quoting while the KIS taker hedge is still impossible. NOT armed by:
+#   * not_ready_* (WS staleness) — recovers in seconds, would over-pause 30min on every blip;
+#   * in_auction_window / hour_cls_auction — SCHEDULED auctions self-clear via the calendar.
+# In Phase 1 (H0STMKO0 off) only ``book_frozen`` actually fires; cb/trht/vi arm too once Phase 2
+# is enabled (belt-and-suspenders alongside the explicit latch).
+COOLDOWN_ARM_REASONS = frozenset({"book_frozen", "market_wide_cb", "trht_halt", "vi"})
+
+
+def apply_post_halt_cooldown(
+    state: SessionHaltState,
+    *,
+    now: float,
+    cooldown_until: float,
+    cooldown_s: float,
+) -> Tuple[SessionHaltState, float, bool]:
+    """Fold a sticky post-halt cooldown onto a per-tick ``compute_session_halt`` decision.
+
+    Once an unscheduled freeze/halt is seen (``state.reason`` in ``COOLDOWN_ARM_REASONS``),
+    hold ``halted=True`` for ``cooldown_s`` seconds AFTER the book stops looking frozen, so the
+    CB single-price-auction phase cannot re-open the gate while the taker hedge is unavailable.
+    The window is EXTENDED on every frozen tick, so it always covers ``cooldown_s`` past the
+    freeze's END (conservative — safe for halts longer than ``cooldown_s``).
+
+    Pure: ``now``/``cooldown_until`` are passed in (no wall-clock read), so the caller owns the
+    state across ticks. ``cooldown_s <= 0`` disables it (behavior-neutral). Returns
+    ``(effective_state, new_cooldown_until, armed_now)``; ``armed_now`` is True only on the
+    inactive→active transition, for one-shot logging.
+    """
+    new_until = cooldown_until
+    armed_now = False
+    if state.halted and cooldown_s > 0 and state.reason in COOLDOWN_ARM_REASONS:
+        candidate = now + cooldown_s
+        if candidate > new_until:
+            armed_now = new_until <= now   # arming from an inactive (expired) cooldown
+            new_until = candidate
+    if not state.halted and now < new_until:
+        return SessionHaltState(True, state.ready, "post_halt_cooldown"), new_until, armed_now
+    return state, new_until, armed_now
+
+
 @runtime_checkable
 class SessionHaltSource(Protocol):
     def evaluate(

@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_halt_source import (
     compute_session_halt, NoHaltSource, KisSessionHaltSource, SessionHaltState,
+    apply_post_halt_cooldown, COOLDOWN_ARM_REASONS,
 )
 
 def _sig(**kw):
@@ -54,3 +55,76 @@ def test_kis_source_delegates_to_connector():
     conn = SimpleNamespace(get_session_halt_signals=lambda p: _sig(cb_latched=True, book_static_sec=0.1))
     st = KisSessionHaltSource(conn).evaluate("X", in_auction=False, max_ws_age_s=3.0, max_book_static_s=8.0)
     assert st.halted is True
+
+
+# ----------------------------------------------------------- JEP-198 post-halt cooldown (D)
+
+def _frozen():
+    return SessionHaltState(True, True, "book_frozen")
+
+
+def _open():
+    return SessionHaltState(False, True, "")
+
+
+def test_cooldown_passthrough_when_open_and_inactive():
+    st, until, armed = apply_post_halt_cooldown(_open(), now=100.0, cooldown_until=0.0, cooldown_s=1800.0)
+    assert st.halted is False and until == 0.0 and armed is False
+
+
+def test_cooldown_arms_on_book_frozen():
+    st, until, armed = apply_post_halt_cooldown(_frozen(), now=100.0, cooldown_until=0.0, cooldown_s=1800.0)
+    assert st.halted is True and st.reason == "book_frozen"
+    assert until == 1900.0 and armed is True
+
+
+def test_cooldown_holds_halt_after_freeze_clears():
+    # book un-froze (open) but still within the cooldown window -> forced halt
+    st, until, armed = apply_post_halt_cooldown(_open(), now=500.0, cooldown_until=1900.0, cooldown_s=1800.0)
+    assert st.halted is True and st.reason == "post_halt_cooldown"
+    assert until == 1900.0 and armed is False
+
+
+def test_cooldown_releases_after_expiry():
+    st, until, armed = apply_post_halt_cooldown(_open(), now=2000.0, cooldown_until=1900.0, cooldown_s=1800.0)
+    assert st.halted is False and until == 1900.0 and armed is False
+
+
+def test_staleness_does_not_arm_cooldown():
+    stale = SessionHaltState(True, False, "not_ready_book_stale")
+    st, until, armed = apply_post_halt_cooldown(stale, now=100.0, cooldown_until=0.0, cooldown_s=1800.0)
+    assert until == 0.0 and armed is False
+    assert st.reason == "not_ready_book_stale"  # passthrough — halted by its own reason, not cooldown
+
+
+def test_cooldown_extends_while_frozen_but_arms_once():
+    st1, until1, armed1 = apply_post_halt_cooldown(_frozen(), now=100.0, cooldown_until=0.0, cooldown_s=1800.0)
+    assert armed1 is True and until1 == 1900.0
+    st2, until2, armed2 = apply_post_halt_cooldown(_frozen(), now=101.0, cooldown_until=until1, cooldown_s=1800.0)
+    assert armed2 is False and until2 == 1901.0   # extended (covers from freeze END), no re-arm
+
+
+def test_scheduled_auction_does_not_arm_cooldown():
+    auc = SessionHaltState(True, True, "in_auction_window")
+    st, until, armed = apply_post_halt_cooldown(auc, now=100.0, cooldown_until=0.0, cooldown_s=1800.0)
+    assert until == 0.0 and armed is False   # scheduled auctions self-clear via the clock
+
+
+def test_cb_latch_arms_cooldown():
+    cb = SessionHaltState(True, True, "market_wide_cb")
+    _, until, armed = apply_post_halt_cooldown(cb, now=100.0, cooldown_until=0.0, cooldown_s=1800.0)
+    assert until == 1900.0 and armed is True
+
+
+def test_cooldown_zero_disables():
+    st, until, armed = apply_post_halt_cooldown(_frozen(), now=100.0, cooldown_until=0.0, cooldown_s=0.0)
+    assert until == 0.0 and armed is False           # cooldown_s=0 never arms
+    st2, _, _ = apply_post_halt_cooldown(_open(), now=100.0, cooldown_until=until, cooldown_s=0.0)
+    assert st2.halted is False                        # and never holds
+
+
+def test_arm_reasons_membership():
+    assert "book_frozen" in COOLDOWN_ARM_REASONS
+    assert "market_wide_cb" in COOLDOWN_ARM_REASONS
+    assert "not_ready_book_stale" not in COOLDOWN_ARM_REASONS
+    assert "in_auction_window" not in COOLDOWN_ARM_REASONS

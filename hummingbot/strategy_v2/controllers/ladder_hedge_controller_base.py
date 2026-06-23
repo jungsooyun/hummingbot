@@ -31,6 +31,10 @@ class LadderHedgeControllerConfigBase(ControllerConfigBase):
     session_halt_gate_enabled: bool = Field(default=True, json_schema_extra={"is_updatable": False})
     session_halt_max_ws_age_s: float = Field(default=3.0, json_schema_extra={"is_updatable": True})
     session_halt_max_book_static_s: float = Field(default=15.0, json_schema_extra={"is_updatable": True})
+    # JEP-198 interim auction-gap guard: once a freeze/CB is detected, hold the maker-quote
+    # halt this many seconds past the freeze END (covers the ~10min CB single-price auction the
+    # clock can't see). Default 1800s = full CB (20min freeze + 10min auction). 0 disables.
+    session_halt_cooldown_s: float = Field(default=1800.0, json_schema_extra={"is_updatable": True})
     adopt_existing_inventory: bool = Field(default=False, json_schema_extra={"is_updatable": True})
     latency_profiling: bool = Field(default=False, json_schema_extra={"is_updatable": True})
     max_executors: int = Field(default=1, json_schema_extra={"is_updatable": True})

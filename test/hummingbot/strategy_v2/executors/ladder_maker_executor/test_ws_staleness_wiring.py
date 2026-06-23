@@ -95,3 +95,37 @@ class LadderMakerWsStalenessWiringTest(unittest.TestCase):
         ex._calendar = SimpleNamespace(now=lambda ts: _kst(10), in_auction_window=lambda ts: False)
         # other gates open + fair computable -> open
         self.assertTrue(ex._gates_open())
+
+    def _make_halt_seq(self, cooldown_s):
+        """Executor whose halt source returns whatever ``state`` currently holds (mutate across ticks)."""
+        ex = self._make(enabled=True)
+        ex._gate_chain = GateChain([KillSwitchGate(), SessionHaltGate()])
+        ex.config.session_halt_gate_enabled = True
+        ex.config.session_halt_cooldown_s = cooldown_s
+        state = {"halted": True, "reason": "book_frozen"}
+        ex._halt_source = SimpleNamespace(
+            evaluate=lambda p, **kw: SessionHaltState(
+                halted=state["halted"], ready=True, reason=state["reason"]))
+        ex._calendar = SimpleNamespace(now=lambda ts: _kst(10), in_auction_window=lambda ts: False)
+        return ex, state
+
+    def test_cooldown_holds_halt_after_freeze_clears(self):
+        ex, state = self._make_halt_seq(1800.0)
+        # tick 1: real freeze -> gates closed + cooldown armed (until 1000+1800=2800)
+        ex._strategy.current_timestamp = 1000.0
+        self.assertFalse(ex._gates_open())
+        # tick 2: book un-froze (CB single-price auction) but within cooldown -> STILL closed
+        state["halted"], state["reason"] = False, ""
+        ex._strategy.current_timestamp = 1500.0
+        self.assertFalse(ex._gates_open())
+        # tick 3: cooldown expired -> gates open again
+        ex._strategy.current_timestamp = 2801.0
+        self.assertTrue(ex._gates_open())
+
+    def test_cooldown_zero_does_not_hold(self):
+        ex, state = self._make_halt_seq(0.0)   # cooldown disabled
+        ex._strategy.current_timestamp = 1000.0
+        self.assertFalse(ex._gates_open())      # frozen -> closed by the freeze itself
+        state["halted"], state["reason"] = False, ""
+        ex._strategy.current_timestamp = 1001.0
+        self.assertTrue(ex._gates_open())       # no cooldown -> reopens immediately
