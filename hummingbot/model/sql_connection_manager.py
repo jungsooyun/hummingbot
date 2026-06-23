@@ -3,7 +3,7 @@ from enum import Enum
 from os.path import join
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import MetaData, create_engine, inspect
+from sqlalchemy import MetaData, create_engine, event, inspect
 from sqlalchemy.engine.base import Engine
 from sqlalchemy.orm import Query, Session, sessionmaker
 from sqlalchemy.schema import DropConstraint, ForeignKeyConstraint, Table
@@ -73,6 +73,13 @@ class SQLConnectionManager(TransactionBase):
 
         if connection_type is SQLConnectionType.TRADE_FILLS:
             self._engine: Engine = create_engine(client_config_map.db_mode.get_url(self.db_path))
+            # Put SQLite into WAL journaling so out-of-process readers (e.g. the
+            # PnL dashboard reading this ledger read-only) never block the bot's
+            # writes, which happen on the trading event loop. WAL is persistent
+            # on the db file, but registering it on every connect also covers a
+            # freshly created db. No-op for non-SQLite engines (DBOtherMode).
+            if self._engine.dialect.name == "sqlite":
+                event.listen(self._engine, "connect", self._enable_sqlite_wal)
             self._metadata: MetaData = self.get_declarative_base().metadata
             self._metadata.create_all(self._engine)
 
@@ -95,6 +102,16 @@ class SQLConnectionManager(TransactionBase):
 
         if connection_type is SQLConnectionType.TRADE_FILLS and (not called_from_migrator):
             self.check_and_migrate_db(client_config_map)
+
+    @staticmethod
+    def _enable_sqlite_wal(dbapi_connection, connection_record):
+        # WAL lets one writer and many readers proceed concurrently without the
+        # SHARED/EXCLUSIVE lock contention of the default DELETE rollback journal.
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+        finally:
+            cursor.close()
 
     @property
     def engine(self) -> Engine:
