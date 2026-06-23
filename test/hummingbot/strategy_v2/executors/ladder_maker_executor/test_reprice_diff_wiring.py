@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.common import OrderType, TradeType
 
 try:
     from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_maker_executor import LadderMakerExecutor
@@ -42,7 +42,7 @@ def _target(side, price, size="1", edge="100"):
     return RungTarget(side=side, price=Decimal(str(price)), size=Decimal(str(size)), edge_bps=Decimal(str(edge)))
 
 
-def _make_executor(targets, observe=False, two_sided=True):
+def _make_executor(targets, observe=False, two_sided=True, maker_post_only=True):
     ex = LadderMakerExecutor.__new__(LadderMakerExecutor)
     ex.config = SimpleNamespace(
         observe=observe,
@@ -50,6 +50,7 @@ def _make_executor(targets, observe=False, two_sided=True):
         maker_tick=Decimal("0.01"),
         min_reprice_delta_ticks=Decimal("2"),
         min_reprice_interval_s=0,
+        maker_post_only=maker_post_only,
     )
     ex.maker_connector = "hyperliquid_perpetual"
     ex.maker_trading_pair = "XYZ:SKHX-USD"
@@ -220,3 +221,29 @@ def test_opposite_side_same_price_size_not_matched():
     ex.place_order.assert_called_once()
     assert ex.place_order.call_args.kwargs["side"] == TradeType.BUY
     assert ex.place_order.call_args.kwargs["price"] == Decimal("50.10")
+
+
+def test_maker_post_only_true_uses_limit_maker():
+    # Default (maker_post_only=True): strict post-only — a rung price that crosses the book
+    # is rejected by the venue (no fill), preserving pure-maker discipline.
+    ex = _make_executor([_target(Side.SELL, "50.40")], maker_post_only=True)
+
+    ex._reconcile_maker()
+
+    ex.place_order.assert_called_once()
+    assert ex.place_order.call_args.kwargs["order_type"] == OrderType.LIMIT_MAKER
+
+
+def test_maker_post_only_false_uses_plain_limit():
+    # maker_post_only=False: place a plain LIMIT at the SAME rung price. The price already
+    # bakes in (net + round_trip_cost), so it is the profitability floor — a crossing SELL
+    # fills at the bid (>= target, i.e. >= the intended edge) as a taker instead of being
+    # rejected. "Allow the immediate fill when it is still profitable."
+    ex = _make_executor([_target(Side.SELL, "50.40")], maker_post_only=False)
+
+    ex._reconcile_maker()
+
+    ex.place_order.assert_called_once()
+    assert ex.place_order.call_args.kwargs["order_type"] == OrderType.LIMIT
+    # The price (profitability floor) is unchanged — only the maker/taker discipline differs.
+    assert ex.place_order.call_args.kwargs["price"] == Decimal("50.40")

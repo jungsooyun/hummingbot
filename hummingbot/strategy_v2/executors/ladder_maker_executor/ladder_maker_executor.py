@@ -505,10 +505,19 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             # orders. The intended quote is surfaced by the _place_targets summary line.
             # Return None so the base records no _maker_placed_rung for a phantom order.
             return None
+        # maker_post_only=True (default): strict post-only (LIMIT_MAKER) — a rung whose price
+        # has crossed the (fast) maker book is rejected by the venue, preserving pure-maker
+        # discipline at the cost of missing the fill. =False: place a plain LIMIT at the SAME
+        # q_price. q_price = fair*(1 + (net + round_trip_cost_bps)/1e4) already bakes in the
+        # round-trip friction, so it is the profitability FLOOR: a crossing SELL fills at the
+        # bid (>= q_price >= the intended net edge) as a taker instead of being rejected, and a
+        # resting LIMIT is still a maker fill when it is hit. The limit price can never fill
+        # below the edge floor, so an immediate (taker) fill only happens when it is profitable.
+        _maker_post_only = getattr(self.config, "maker_post_only", True)
         order_id = self.place_order(
             connector_name=self.maker_connector,
             trading_pair=self.maker_trading_pair,
-            order_type=OrderType.LIMIT_MAKER,
+            order_type=OrderType.LIMIT_MAKER if _maker_post_only else OrderType.LIMIT,
             side=side,
             amount=q_amount,
             position_action=position_action,

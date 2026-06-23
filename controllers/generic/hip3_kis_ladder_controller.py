@@ -148,6 +148,7 @@ class Hip3KisLadderController(LadderHedgeControllerBase):
             hedge_max_slippage_bps=self.config.hedge_max_slippage_bps,
             min_reprice_interval_s=self.config.min_reprice_interval_s,
             min_reprice_delta_ticks=self.config.min_reprice_delta_ticks,
+            maker_post_only=self.config.maker_post_only,
             leverage=self.config.leverage,
             kill_switch=self.config.kill_switch,
             ws_staleness_kill_switch_enabled=self.config.ws_staleness_kill_switch_enabled,

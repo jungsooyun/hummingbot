@@ -52,6 +52,12 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
     share_per_unit: Decimal = Decimal("1")
     hedge_max_slippage_bps: Decimal = Decimal("30")
     hedge_order_type: OrderType = OrderType.LIMIT
+    # Maker leg order discipline. True (default): LIMIT_MAKER (post-only) — a rung price that
+    # crosses the fast maker book is rejected (no fill), pure-maker. False: plain LIMIT at the
+    # same rung price (= fair + net + round_trip_cost, the profitability floor) so a crossing
+    # rung fills as a taker at a price >= its edge instead of being rejected; resting orders are
+    # still maker fills. Only profitable immediate fills happen (the limit price is the floor).
+    maker_post_only: bool = True
 
     # Reprice guards
     min_reprice_interval_s: float = 0.75

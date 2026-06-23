@@ -22,6 +22,13 @@ class LadderHedgeControllerConfigBase(ControllerConfigBase):
     leverage: int = 1
     min_reprice_interval_s: float = 0.75
     min_reprice_delta_ticks: Decimal = Decimal("2")
+    # Maker-leg order discipline. True (default): LIMIT_MAKER (post-only) — a rung price that
+    # crosses the fast maker book is venue-rejected (no fill), pure-maker. False: plain LIMIT at
+    # the same rung price (= fair + net + round_trip_cost, the profitability floor), so a
+    # crossing rung fills as a taker at a price >= its edge instead of being rejected; resting
+    # orders are still maker fills. The limit price is the floor -> only profitable immediate
+    # (taker) fills occur. Runtime-togglable so post-only discipline can be restored without a redeploy.
+    maker_post_only: bool = Field(default=True, json_schema_extra={"is_updatable": True})
     kill_switch: bool = Field(default=False, json_schema_extra={"is_updatable": True})
     observe: bool = Field(default=False, json_schema_extra={"is_updatable": True})
     ws_staleness_kill_switch_enabled: bool = Field(default=True, json_schema_extra={"is_updatable": True})
