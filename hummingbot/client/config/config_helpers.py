@@ -700,11 +700,56 @@ def get_connector_config_yml_path(connector_name: str) -> Path:
 
 
 def list_connector_configs() -> List[Path]:
-    connector_configs = [
-        Path(f.path) for f in scandir(str(CONNECTORS_CONF_DIR_PATH))
-        if f.is_file() and not f.name.startswith("_") and not f.name.startswith(".")
-    ]
-    return connector_configs
+    # Restrict to *.yml files only (JEP-196). os.scandir order is OS/inode-dependent, so
+    # non-yml siblings (kis.yml.bak/.orig/.save, editor temp files, manual copies) could
+    # nondeterministically shadow the real connector config because the cache key is the
+    # internal `connector:` field, not the filename.
+    connector_configs = sorted(
+        (
+            Path(f.path) for f in scandir(str(CONNECTORS_CONF_DIR_PATH))
+            if f.is_file()
+            and f.name.endswith(".yml")
+            and not f.name.startswith("_")
+            and not f.name.startswith(".")
+        ),
+        key=lambda p: p.name,
+    )
+
+    # Deduplicate by `connector:` key: keep the lex-first file (deterministic winner) and
+    # warn about any ignored duplicates. This eliminates the last-write-wins ambiguity in
+    # Security.decrypt_all() and makes the warning accurate — the named winner is the only
+    # file returned and therefore the one that actually loads.
+    # Warn rather than raise to stay upstream-friendly.
+    seen: Dict[str, Path] = {}
+    duplicates: Dict[str, List[Path]] = {}
+    for path in connector_configs:
+        try:
+            connector_name = connector_name_from_file(path)
+        except Exception:
+            # Surface — don't silently drop. A malformed/unreadable *.yml here would
+            # otherwise make a connector vanish from _secure_configs with no signal,
+            # which is the same class of silent config failure JEP-196 targets.
+            logging.getLogger().warning(
+                f"Skipping connector config '{path.name}': could not resolve its "
+                f"'connector' field (unreadable or malformed yml)."
+            )
+            continue
+        if connector_name in seen:
+            duplicates.setdefault(connector_name, []).append(path)
+        else:
+            seen[connector_name] = path
+
+    for connector_name, dup_paths in duplicates.items():
+        ignored_names = ", ".join(f"'{p.name}'" for p in dup_paths)
+        logging.getLogger().warning(
+            f"Multiple connector config files resolve to connector '{connector_name}': "
+            f"keeping '{seen[connector_name].name}' (lex-first), "
+            f"ignoring {ignored_names}. "
+            f"Please remove the duplicate(s)."
+        )
+
+    # Return only the deduplicated winners (one file per connector key).
+    return list(seen.values())
 
 
 async def load_yml_into_dict(yml_path: str) -> Dict[str, Any]:
