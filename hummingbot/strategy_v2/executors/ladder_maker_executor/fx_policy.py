@@ -1,13 +1,15 @@
 """Pure USD/KRW fair-FX blend. Stdlib only — mirrors ladder_policy / gate_chain.
-blend = bank anchor (weight 4) + USDT-KRW crypto premium (weight 1), with the
+blend = bank anchor (weight 9) + USDT-KRW crypto premium (weight 1), with the
 USDT-KRW side CLAMPED into the bank band BEFORE blending (else the cap is a no-op).
+The bank (Toss) rate is the truer USD/KRW; the USDT-KRW leg carries a crypto/kimchi
+premium, so it is weighted at only 10% (9:1) to keep the blend near real FX.
 """
 from __future__ import annotations
 
 from decimal import Decimal
 from typing import Optional, Tuple
 
-W_BANK = Decimal("4")
+W_BANK = Decimal("9")
 W_USDT = Decimal("1")
 BAND_LO = Decimal("0.98")   # -2%
 BAND_HI = Decimal("1.03")   # +3%
