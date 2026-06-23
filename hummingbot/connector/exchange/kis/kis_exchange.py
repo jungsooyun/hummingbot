@@ -25,6 +25,7 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState,
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
@@ -49,6 +50,10 @@ class KisExchange(ExchangePyBase):
     POLL_INTERVAL = 1.0
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
     UPDATE_TRADE_STATUS_MIN_INTERVAL = 10.0
+    # JEP-203: consecutive check_network probe failures tolerated before reporting
+    # NOT_CONNECTED. Debounces transient REST blips so one balance-probe timeout does not
+    # tear down the healthy WS hub (the JEP-134 WS-staleness gate is the fast safety net).
+    _NET_CHECK_FAILURE_THRESHOLD = 3
 
     web_utils = web_utils
 
@@ -94,6 +99,7 @@ class KisExchange(ExchangePyBase):
         self._sh_hour_cls_code: Dict[str, str] = {}
         self._sh_prev_book_sig: Dict[str, tuple] = {}
         self._sh_last_book_change: Dict[str, float] = {}
+        self._net_check_consec_failures: int = 0  # JEP-203 check_network debounce counter
         # Phase-2 latches (populated only when kis_market_status_enabled)
         self._market_status_enabled = str(kis_market_status_enabled).strip().lower() == "true"
         if self._market_status_enabled and not CONSTANTS.KNOWN_NORMAL_MKOP:
@@ -182,6 +188,36 @@ class KisExchange(ExchangePyBase):
     @property
     def trading_pairs_request_path(self):
         return CONSTANTS.DOMESTIC_STOCK_TICKER_PATH
+
+    async def check_network(self) -> NetworkStatus:
+        # JEP-203: debounce transient transport blips on the balance-inquiry probe. The base
+        # ExchangePyBase.check_network swallows the exception with NO logging and reports
+        # NOT_CONNECTED on the FIRST failure; because the framework ties the WS lifecycle to
+        # NetworkStatus, a single REST timeout flips NOT_CONNECTED -> stop_network() and tears
+        # down the healthy KIS WS hub (observed as recurring ~10s hedge-feed gaps -> false
+        # WS-staleness). Tolerate up to (threshold - 1) CONSECUTIVE probe failures as transient;
+        # a genuine outage still trips after `threshold` consecutive failures. The JEP-134
+        # WS-staleness gate (3s) remains the fast hedge-readiness safety net independent of this.
+        try:
+            await self._make_network_check_request()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._net_check_consec_failures += 1
+            if self._net_check_consec_failures < self._NET_CHECK_FAILURE_THRESHOLD:
+                self.logger().warning(
+                    f"KIS check_network transient failure "
+                    f"{self._net_check_consec_failures}/{self._NET_CHECK_FAILURE_THRESHOLD} "
+                    f"— keeping CONNECTED (WS hub not torn down): {e!r}"
+                )
+                return NetworkStatus.CONNECTED
+            self.logger().warning(
+                f"KIS check_network sustained failure "
+                f"({self._net_check_consec_failures}x consecutive) — reporting NOT_CONNECTED: {e!r}"
+            )
+            return NetworkStatus.NOT_CONNECTED
+        self._net_check_consec_failures = 0
+        return NetworkStatus.CONNECTED
 
     @property
     def check_network_request_path(self):

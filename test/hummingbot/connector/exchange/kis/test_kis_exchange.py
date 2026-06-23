@@ -712,15 +712,22 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         )
 
     @aioresponses()
-    async def test_check_network_fails_closed_on_rt_cd_error(self, mock_api):
+    async def test_check_network_fails_closed_after_sustained_rt_cd_error(self, mock_api):
         """check_network probes the balance endpoint. KIS returns HTTP 200 with rt_cd != '0' on
-        logical auth/account errors; _make_network_check_request must raise so check_network reports
-        NOT_CONNECTED. Otherwise the readiness probe marks a broken account healthy while
-        _update_balances (fail-closed since JEP-161) raises — an inconsistency that hides it (JEP-182)."""
+        logical auth/account errors; _make_network_check_request raises. With the JEP-203 debounce a
+        SINGLE failure is tolerated (transient), but a SUSTAINED error (>= threshold consecutive)
+        still reports NOT_CONNECTED — the fail-closed readiness guard (JEP-182) holds, just debounced
+        so one transport blip cannot tear down the healthy WS hub."""
         regex_url = re.compile(f"{self.balance_url}.*")
         ex = self._authed_exchange()
-        mock_api.get(regex_url, body=json.dumps({"rt_cd": "1", "msg1": "EGW00304", "output1": [], "output2": []}))
-        self.assertEqual(NetworkStatus.NOT_CONNECTED, await ex.check_network())
+        mock_api.get(
+            regex_url,
+            body=json.dumps({"rt_cd": "1", "msg1": "EGW00304", "output1": [], "output2": []}),
+            repeat=True,
+        )
+        statuses = [await ex.check_network() for _ in range(ex._NET_CHECK_FAILURE_THRESHOLD)]
+        self.assertEqual(NetworkStatus.CONNECTED, statuses[0])        # single failure tolerated
+        self.assertEqual(NetworkStatus.NOT_CONNECTED, statuses[-1])   # sustained -> fail-closed
 
     @aioresponses()
     async def test_check_network_connected_on_healthy_balance(self, mock_api):
@@ -730,6 +737,49 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         ex = self._authed_exchange()
         mock_api.get(regex_url, body=json.dumps({"rt_cd": "0", "msg1": "ok", "output1": [], "output2": {}}))
         self.assertEqual(NetworkStatus.CONNECTED, await ex.check_network())
+
+    async def test_check_network_tolerates_single_transient_failure(self):
+        """JEP-203: a single transport blip (timeout/connection error) on the balance probe must NOT
+        flip NetworkStatus -> stop_network() -> tear down the healthy WS hub (the observed ~10s
+        hedge-feed gaps). One failure stays CONNECTED; the JEP-134 WS-staleness gate (3s) is the fast
+        hedge-readiness safety net."""
+        from unittest.mock import patch, AsyncMock
+        ex = self._authed_exchange()
+        with patch.object(ex, "_make_network_check_request", new=AsyncMock(side_effect=IOError("transient timeout"))):
+            self.assertEqual(NetworkStatus.CONNECTED, await ex.check_network())
+
+    async def test_check_network_not_connected_after_threshold_consecutive_failures(self):
+        """JEP-203: a genuine sustained outage (>= threshold consecutive probe failures) still reports
+        NOT_CONNECTED so the connector lifecycle reacts to a real KIS outage."""
+        from unittest.mock import patch, AsyncMock
+        ex = self._authed_exchange()
+        with patch.object(ex, "_make_network_check_request", new=AsyncMock(side_effect=IOError("down"))):
+            statuses = [await ex.check_network() for _ in range(ex._NET_CHECK_FAILURE_THRESHOLD)]
+        self.assertTrue(all(s == NetworkStatus.CONNECTED for s in statuses[:-1]))
+        self.assertEqual(NetworkStatus.NOT_CONNECTED, statuses[-1])
+
+    async def test_check_network_resets_failure_count_on_success(self):
+        """JEP-203: a successful probe resets the consecutive-failure counter, so the observed flap
+        pattern (isolated single failures with healthy probes between) never reaches the threshold."""
+        from unittest.mock import patch, AsyncMock
+        ex = self._authed_exchange()
+        seq = [IOError("blip"), IOError("blip"), None, IOError("blip")]  # fail, fail, success(reset), fail
+        with patch.object(ex, "_make_network_check_request", new=AsyncMock(side_effect=seq)):
+            results = [await ex.check_network() for _ in range(4)]
+        # Without the reset the final failure would be the 3rd cumulative -> NOT_CONNECTED (threshold=3).
+        self.assertEqual([NetworkStatus.CONNECTED] * 4, results)
+
+    @aioresponses()
+    async def test_check_network_failure(self, mock_api):
+        # JEP-203 override of the abstract base test: KIS debounces transient probe failures, so a
+        # SINGLE failed probe stays CONNECTED (one REST blip must not flip NetworkStatus ->
+        # stop_network() and tear down the healthy WS hub). A SUSTAINED failure (>= threshold
+        # consecutive) still reports NOT_CONNECTED.
+        regex_url = re.compile(f"{self.balance_url}.*")
+        mock_api.get(regex_url, status=500, repeat=True)
+        statuses = [await self.exchange.check_network() for _ in range(self.exchange._NET_CHECK_FAILURE_THRESHOLD)]
+        self.assertEqual(NetworkStatus.CONNECTED, statuses[0])
+        self.assertEqual(NetworkStatus.NOT_CONNECTED, statuses[-1])
 
     @aioresponses()
     async def test_request_order_status_no_op_on_rt_cd_error(self, mock_api):
