@@ -1516,6 +1516,58 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         # Omitted kis_hts_id -> empty (exec-notice WS skipped, REST fallback).
         self.assertEqual("", self._make_exchange()._hts_id)
 
+    def test_market_status_capture_only_flows_to_data_source(self):
+        # JEP-201 capture-only: flag parses + forwards to the orderbook DS, with the latch off.
+        ex = KisExchange(
+            kis_app_key="testAppKey",
+            kis_app_secret="testAppSecret",
+            kis_account_number="12345678-01",
+            trading_pairs=[self.trading_pair],
+            kis_market_routing="sor",
+            kis_market_status_capture_only="true",
+        )
+        self.assertTrue(ex._market_status_capture_only)
+        self.assertFalse(ex._market_status_enabled)
+        ds = ex._create_order_book_data_source()
+        self.assertTrue(ds._market_status_capture_only)
+        self.assertTrue(ds._market_status_subscribed)
+        self.assertFalse(ds._market_status_enabled)
+
+    def test_market_status_enabled_takes_precedence_over_capture_only(self):
+        # Both set -> full mode wins (latch active), capture-only suppressed.
+        ex = KisExchange(
+            kis_app_key="testAppKey",
+            kis_app_secret="testAppSecret",
+            kis_account_number="12345678-01",
+            trading_pairs=[self.trading_pair],
+            kis_market_routing="sor",
+            kis_market_status_enabled="true",
+            kis_market_status_capture_only="true",
+        )
+        self.assertTrue(ex._market_status_enabled)
+        self.assertFalse(ex._market_status_capture_only)
+
+    def test_capture_only_survives_config_map(self):
+        # is_connect_key=True is MANDATORY for the field to reach the constructor.
+        from hummingbot.client.config.config_helpers import (
+            ClientConfigAdapter,
+            api_keys_from_connector_config_map,
+        )
+        from hummingbot.connector.exchange.kis.kis_utils import KisConfigMap
+
+        cm = ClientConfigAdapter(
+            KisConfigMap(
+                kis_app_key="k",
+                kis_app_secret="s",
+                kis_account_number="12345678-01",
+                kis_market_status_capture_only="true",
+            )
+        )
+        api_keys = api_keys_from_connector_config_map(cm)
+        self.assertEqual("true", api_keys["kis_market_status_capture_only"])
+        ex = KisExchange(**api_keys, trading_pairs=[self.trading_pair])
+        self.assertTrue(ex._market_status_capture_only)
+
     def test_dollar_prefixed_hts_id_preserved_end_to_end(self):
         # REGRESSION (JEP-200 live, 2026-06-23): KIS provisions numeric HTS IDs
         # DOLLAR-PREFIXED — it SMSes "고객 ID : $1766930". The '$' is part of the

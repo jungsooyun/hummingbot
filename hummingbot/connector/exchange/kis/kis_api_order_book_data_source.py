@@ -58,6 +58,7 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         market_routing: str = CONSTANTS.MARKET_ROUTING_KRX,
         ws_enabled: bool = True,
         market_status_enabled: bool = False,
+        market_status_capture_only: bool = False,
     ):
         super().__init__(trading_pairs)
         self._connector = connector
@@ -71,6 +72,12 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._ob_tr_id = CONSTANTS.WS_ORDERBOOK_TR_ID_BY_ROUTING[market_routing]
         self._trade_tr_id = CONSTANTS.WS_TRADE_TR_ID_BY_ROUTING[market_routing]
         self._market_status_enabled = market_status_enabled
+        # JEP-201 capture-only: subscribe the H0?MKO0 market-status feed and LOG every raw
+        # frame for offline decode verification, but DO NOT feed the CB/VI/TRHT latch (no
+        # over-pause from the empty KNOWN_NORMAL_MKOP). Full ``market_status_enabled`` takes
+        # precedence (subscribe + latch); capture-only is the subscribe + log middle mode.
+        self._market_status_capture_only = market_status_capture_only
+        self._market_status_subscribed = market_status_enabled or market_status_capture_only
         self._market_status_tr_id = CONSTANTS.WS_MARKET_STATUS_TR_ID_BY_ROUTING[market_routing]
         # REST snapshot market-division code, routing-aware like the WS TR_IDs above.
         # NB: sor maps to 'UN' (통합) — unified KRX+NXT quotes stay live across the KRX
@@ -124,7 +131,7 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
             for _, symbol in pairs_symbols:
                 await self._hub.register(self._ob_tr_id, symbol, self._on_ws_frame)
                 await self._hub.register(self._trade_tr_id, symbol, self._on_ws_frame)
-                if self._market_status_enabled:
+                if self._market_status_subscribed:
                     await self._hub.register(self._market_status_tr_id, symbol, self._on_ws_frame)
             self.logger().info("Registered KIS market-data channels on the shared WS hub")
             while True:
@@ -134,9 +141,10 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 for trading_pair, symbol in pairs_symbols:
                     await self._hub.unregister(self._ob_tr_id, symbol)
                     await self._hub.unregister(self._trade_tr_id, symbol)
-                    if self._market_status_enabled:
+                    if self._market_status_subscribed:
                         await self._hub.unregister(self._market_status_tr_id, symbol)
-                        self._connector.discard_market_status_confirmed(trading_pair)
+                        if self._market_status_enabled:
+                            self._connector.discard_market_status_confirmed(trading_pair)
 
     async def _on_ws_frame(self, raw: str):
         """Hub dispatch entry-point: route a raw frame like the old socket loop."""
@@ -174,10 +182,20 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
             if parsed:
                 # JEP-202: see orderbook branch — resolve off the caret stock code.
                 await self._process_trade_data(parsed.get("MKSC_SHRN_ISCD") or tr_key, parsed)
-        elif self._market_status_enabled and tr_id == self._market_status_tr_id:
+        elif self._market_status_subscribed and tr_id == self._market_status_tr_id:
             fields = data_str.split("^")
             parsed = dict(zip(CONSTANTS.WS_MARKET_STATUS_COLUMNS, fields))
-            await self._process_market_status_data(tr_key, parsed)
+            if self._market_status_enabled:
+                await self._process_market_status_data(tr_key, parsed)
+            else:
+                # JEP-201 capture-only: record the raw frame for offline decode verification
+                # (normal-session / CB / VI / TRHT codes + frame width). NEVER feeds the latch,
+                # so the empty KNOWN_NORMAL_MKOP cannot over-pause. tr_key is parts[2] (record
+                # count, NOT the stock code) — logged verbatim for the capture, resolution is
+                # deferred to the decode step.
+                self.logger().info(
+                    f"JEP-201 H0STMKO0 CAPTURE tr_key={tr_key!r} raw={data_str!r} parsed={parsed!r}"
+                )
         elif tr_id in self._known_market_tr_ids:
             # A market-data channel for a different routing mode than configured —
             # subscription/dispatch drift. Surface it instead of dropping silently.
@@ -202,8 +220,12 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
             self.logger().warning(f"KIS WS subscription error: {msg1}")
             return
         header = data.get("header", {})
-        if self._market_status_enabled and rt_cd == "0" and header.get("tr_id") == self._market_status_tr_id:
+        if self._market_status_subscribed and rt_cd == "0" and header.get("tr_id") == self._market_status_tr_id:
             tr_key = header.get("tr_key", "")
+            if not self._market_status_enabled:
+                # JEP-201 capture-only: log the ack, do NOT confirm the latch.
+                self.logger().info(f"JEP-201 H0STMKO0 CAPTURE subscribe-ack tr_key={tr_key!r}")
+                return
             trading_pair = await self._resolve_trading_pair_exact(tr_key)
             if trading_pair in self._trading_pairs:
                 self._connector.mark_market_status_confirmed(trading_pair)

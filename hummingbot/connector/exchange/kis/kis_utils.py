@@ -155,6 +155,20 @@ class KisConfigMap(BaseConnectorConfigMap):
             "is_updatable": True,
         },
     )
+    # JEP-201 capture-only: subscribe the H0STMKO0 feed and LOG raw frames for decode
+    # verification WITHOUT feeding the latch (no over-pause from the empty KNOWN_NORMAL_MKOP).
+    # Ignored when kis_market_status_enabled=true (full mode wins). is_connect_key=True is
+    # MANDATORY (only is_connect_key fields reach the connector constructor — see above).
+    kis_market_status_capture_only: str = Field(
+        default="false",
+        json_schema_extra={
+            "prompt": lambda cm: "Capture-only H0STMKO0 (log frames, no halt latch)? (true/false)",
+            "is_secure": False,
+            "is_connect_key": True,
+            "prompt_on_new": False,
+            "is_updatable": True,
+        },
+    )
     # The customer HTS ID (고객 ID) is the tr_key required by the KIS execution-
     # notice realtime channel (H0STCNI0/H0STCNI9). It is NOT a stock code — KIS
     # rejects a stock symbol here with OPSP0017 "htsid가 잘못되었습니다", and the

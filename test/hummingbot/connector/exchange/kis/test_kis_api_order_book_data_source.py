@@ -1404,7 +1404,8 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
     # Test: SOR/NXT routing-aware subscription + dispatch
     # ------------------------------------------------------------------
 
-    def _make_ds(self, market_routing, market_status_enabled: bool = False):
+    def _make_ds(self, market_routing, market_status_enabled: bool = False,
+                 market_status_capture_only: bool = False):
         return KisAPIOrderBookDataSource(
             trading_pairs=[self.trading_pair],
             connector=self.connector,
@@ -1414,6 +1415,7 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
             domain=CONSTANTS.DEFAULT_DOMAIN,
             market_routing=market_routing,
             market_status_enabled=market_status_enabled,
+            market_status_capture_only=market_status_capture_only,
         )
 
     def _make_two_pair_market_status_ds(self):
@@ -1676,6 +1678,46 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual({"H0UNASP0", "H0UNCNT0", "H0UNMKO0"}, reg_trs)
         unreg_trs = {c.args[0] for c in hub.unregister.await_args_list}
         self.assertEqual({"H0UNASP0", "H0UNCNT0", "H0UNMKO0"}, unreg_trs)
+        self.assertNotIn(self.trading_pair, self.connector._sh_market_status_confirmed)
+
+    async def test_listen_registers_market_status_tr_when_capture_only(self):
+        # JEP-201 capture-only: subscribe H0?MKO0 to harvest frames, WITHOUT feeding the latch.
+        hub = MagicMock()
+        hub.register = AsyncMock()
+        hub.unregister = AsyncMock()
+        ds = self._make_ds("sor", market_status_capture_only=True)
+        ds._hub = hub
+        with patch.object(
+            self.connector,
+            "exchange_symbol_associated_to_pair",
+            new=AsyncMock(return_value="005930"),
+        ):
+            task = asyncio.create_task(ds.listen_for_subscriptions())
+            await asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        reg_trs = {c.args[0] for c in hub.register.await_args_list}
+        self.assertEqual({"H0UNASP0", "H0UNCNT0", "H0UNMKO0"}, reg_trs)   # subscribed for capture
+        # capture-only must NOT confirm the latch (Phase-1 status stays independent)
+        self.assertNotIn(self.trading_pair, self.connector._sh_market_status_confirmed)
+
+    async def test_capture_only_logs_frame_without_latching(self):
+        ds = self._make_ds("sor", market_status_capture_only=True)
+        raw = "0|H0UNMKO0|005930|" + self._ws_market_status_payload(TRHT_YN="Y", MKOP_CLS_CODE="174")
+        with patch.object(ds, "_process_market_status_data", new_callable=AsyncMock) as m:
+            await ds._handle_data_message(raw)
+            m.assert_not_awaited()   # capture-only NEVER feeds the latch path
+        # the connector latch is untouched (cb stays clear despite a CB-code frame)
+        self.assertFalse(self.connector.get_session_halt_signals(self.trading_pair).cb_latched)
+
+    async def test_capture_only_ack_does_not_confirm_latch(self):
+        ds = self._make_ds("sor", market_status_capture_only=True)
+        await ds._handle_control_message(
+            self._ws_market_status_subscription_success_raw(tr_id="H0UNMKO0", tr_key="005930")
+        )
         self.assertNotIn(self.trading_pair, self.connector._sh_market_status_confirmed)
 
     async def test_stale_listen_finally_skips_unregister_after_restart(self):

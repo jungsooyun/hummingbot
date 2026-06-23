@@ -70,6 +70,7 @@ class KisExchange(ExchangePyBase):
         kis_market_routing: str = CONSTANTS.MARKET_ROUTING_SOR,
         kis_ws_enabled: str = "true",
         kis_market_status_enabled: str = "false",
+        kis_market_status_capture_only: str = "false",
         kis_hts_id: str = "",
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
     ):
@@ -102,6 +103,17 @@ class KisExchange(ExchangePyBase):
         self._net_check_consec_failures: int = 0  # JEP-203 check_network debounce counter
         # Phase-2 latches (populated only when kis_market_status_enabled)
         self._market_status_enabled = str(kis_market_status_enabled).strip().lower() == "true"
+        # JEP-201 capture-only: subscribe H0?MKO0 + log raw frames for decode verification,
+        # WITHOUT feeding the latch (no over-pause). Full enabled takes precedence.
+        self._market_status_capture_only = (
+            str(kis_market_status_capture_only).strip().lower() == "true" and not self._market_status_enabled
+        )
+        if self._market_status_capture_only:
+            self.logger().info(
+                "JEP-201: kis_market_status_capture_only=True — subscribing the H0STMKO0 "
+                "market-status feed in LOG-ONLY mode (no latch, no gate effect) to capture "
+                "live CB/VI/normal frames for decode verification."
+            )
         if self._market_status_enabled and not CONSTANTS.KNOWN_NORMAL_MKOP:
             self.logger().warning(
                 "JEP-198: kis_market_status_enabled=True but KNOWN_NORMAL_MKOP is empty — "
@@ -332,6 +344,7 @@ class KisExchange(ExchangePyBase):
             market_routing=self._market_routing,
             ws_enabled=self._ws_enabled,
             market_status_enabled=self._market_status_enabled,
+            market_status_capture_only=self._market_status_capture_only,
         )
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
