@@ -42,7 +42,14 @@ def _target(side, price, size="1", edge="100"):
     return RungTarget(side=side, price=Decimal(str(price)), size=Decimal(str(size)), edge_bps=Decimal(str(edge)))
 
 
-def _make_executor(targets, observe=False, two_sided=True, maker_post_only=True):
+def _make_executor(
+    targets,
+    observe=False,
+    two_sided=True,
+    maker_post_only=True,
+    inflight_block_granular=False,
+    inflight_block_radius_ticks=Decimal("4"),
+):
     ex = LadderMakerExecutor.__new__(LadderMakerExecutor)
     ex.config = SimpleNamespace(
         observe=observe,
@@ -51,6 +58,8 @@ def _make_executor(targets, observe=False, two_sided=True, maker_post_only=True)
         min_reprice_delta_ticks=Decimal("2"),
         min_reprice_interval_s=0,
         maker_post_only=maker_post_only,
+        maker_inflight_block_rung_granular=inflight_block_granular,
+        maker_inflight_block_radius_ticks=inflight_block_radius_ticks,
     )
     ex.maker_connector = "hyperliquid_perpetual"
     ex.maker_trading_pair = "XYZ:SKHX-USD"
@@ -247,3 +256,58 @@ def test_maker_post_only_false_uses_plain_limit():
     assert ex.place_order.call_args.kwargs["order_type"] == OrderType.LIMIT
     # The price (profitability floor) is unchanged — only the maker/taker discipline differs.
     assert ex.place_order.call_args.kwargs["price"] == Decimal("50.40")
+
+
+# ----------------------------------------------- JEP-177 Fix #5: rung-granular in-flight defer
+
+
+def test_default_whole_side_block_defers_new_far_rung():
+    # Behavior-neutral baseline (flag OFF). tick 1: place one inflight SELL rung @ 50.10.
+    # tick 2: the fair MOVED that rung (now 50.40, > 2-tick thresh -> the inflight rung is now
+    # UNMATCHED, its cancel skipped) AND a genuinely-new far rung @ 55.00 appears. The whole-side
+    # block defers BOTH same-side targets (under-quote ~1 tick) — the pre-JEP-177 behavior we
+    # must preserve by default. Nothing is placed; the inflight rung is left to self-heal.
+    ex = _make_executor([_target(Side.SELL, "50.10")], inflight_block_granular=False)
+
+    ex._reconcile_maker()  # places OID-0 inflight @ 50.10
+    ex._compute_targets.return_value = [_target(Side.SELL, "50.40"), _target(Side.SELL, "55.00")]
+    ex._reconcile_maker()
+
+    ex._strategy.cancel.assert_not_called()  # inflight never cancelled
+    ex.place_order.assert_called_once()  # only OID-0; whole-side block deferred BOTH new targets
+    assert list(ex.maker_orders) == ["OID-0"]
+
+
+def test_granular_places_new_far_rung_alongside_unmatched_inflight():
+    # Flag ON: an unmatched inflight rung @ 50.10 with TWO new same-side targets — one that
+    # collides with it (50.13, within the 4-tick radius -> deferred) and one genuinely-new far
+    # rung (55.00 -> placed). Whole-side mode would defer both; granular frees the far one.
+    ex = _make_executor([_target(Side.SELL, "50.10")], inflight_block_granular=True)
+
+    ex._reconcile_maker()  # places OID-0 inflight @ 50.10
+    # 50.13 collides with the unmatched inflight 50.10 (3 ticks <= 4-tick radius) -> deferred.
+    # 55.00 is far from every unmatched inflight rung -> placed this tick.
+    ex._compute_targets.return_value = [_target(Side.SELL, "50.13"), _target(Side.SELL, "55.00")]
+    ex._reconcile_maker()
+
+    ex._strategy.cancel.assert_not_called()
+    assert ex.place_order.call_count == 2
+    assert list(ex.maker_orders) == ["OID-0", "OID-1"]
+    # The second placement is the far rung; the colliding 50.13 rung was deferred (NOT placed).
+    assert ex.place_order.call_args.kwargs["price"] == Decimal("55.00")
+
+
+def test_granular_still_defers_fair_move_within_radius():
+    # Round-2 fix preserved under granular mode: a fair-move that resizes/repositions the rung
+    # within the block radius (3 ticks < 4-tick radius) is still deferred — NO double-place that
+    # would leave two near-price SELL orders (over-close -> net-long).
+    ex = _make_executor([_target(Side.BUY, "50.10")], inflight_block_granular=True)
+
+    ex._reconcile_maker()  # places OID-0 inflight BUY @ 50.10
+    ex._compute_targets.return_value = [_target(Side.BUY, "50.13")]  # moved 3 ticks
+    ex._reconcile_maker()
+
+    ex._strategy.cancel.assert_not_called()
+    ex.place_order.assert_called_once()
+    assert list(ex.maker_orders) == ["OID-0"]
+    assert ex.maker_orders["OID-0"].order is None

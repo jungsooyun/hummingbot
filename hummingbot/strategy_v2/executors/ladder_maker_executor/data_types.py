@@ -62,6 +62,23 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
     # Reprice guards
     min_reprice_interval_s: float = 0.75
     min_reprice_delta_ticks: Decimal = Decimal("2")
+    # JEP-177 Fix #5: in-flight conflict-blocking granularity. When an unmatched (moved/resized)
+    # in-flight maker rung exists, the reconcile defers same-side placements so a moved/resized
+    # rung is not double-placed (over-close -> net-long, the round-2 JEP-172 #5 failure).
+    # False (default) = whole-side block (defer EVERY same-side target while any in-flight rung is
+    # unmatched; conservative, behavior-neutral, ~1-tick under-quote on a genuinely-new far rung).
+    # True = block only targets within maker_inflight_block_radius_ticks of an unmatched in-flight
+    # rung's price, so a genuinely-new far same-side rung is placed immediately. The radius must
+    # cover the round-2 cases (same-price/size-shift = 0 distance; fair-move up to the radius).
+    maker_inflight_block_rung_granular: bool = False
+    maker_inflight_block_radius_ticks: Decimal = Decimal("4")
+    # JEP-177 Fix #2: maker-side stuck-order reconcile. When a maker order's *created* event is
+    # permanently lost, it stays at order is None and freezes that side (under-quote only,
+    # restart-recoverable). True adopts the connector tracker's truth for such an order (adopt-only:
+    # never reaps/cancels an order the connector does not track, so a just-placed order is never
+    # orphaned). False (default) = current behavior (resolve only on a created/filled/cancelled
+    # event). Mirrors the hedge leg's always-on _reconcile_stuck_hedges.
+    reconcile_stuck_makers_enabled: bool = False
 
     # Perp leverage (HIP-3 markets: isolated only)
     leverage: int = 1

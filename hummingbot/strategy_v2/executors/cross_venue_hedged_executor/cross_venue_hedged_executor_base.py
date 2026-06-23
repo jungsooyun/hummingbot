@@ -87,6 +87,7 @@ from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.maker_reconcil
     RestingOrder,
     RungTarget,
     Side,
+    blocked_targets,
     diff_ladder_targets,
 )
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair, ExecutorConfigBase
@@ -441,6 +442,10 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             except Exception:
                 rec = None
         try:
+            # JEP-177 Fix #2: adopt any maker stuck at order is None (lost created event) BEFORE
+            # this tick's diff, so the adopted order is visible and the side unfreezes. No-op when
+            # reconcile_stuck_makers_enabled is off (default) -> behavior-neutral.
+            self._reconcile_stuck_makers()
             targets = self._compute_targets()
             if rec is not None:
                 rec.mark("compute")
@@ -480,12 +485,24 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             )
             unmatched_inflight = [oid for oid in diff.to_cancel if oid in inflight_ids]
             placed_rung = getattr(self, "_maker_placed_rung", {})
-            blocked_sides = {
-                placed_rung[oid][0]
+            # Each unmatched in-flight rung as (side, quantized_price). JEP-177 Fix #5:
+            # block_targets defaults to the round-2 whole-side block (granular=False), and
+            # only suppresses by (side, price-bucket) when maker_inflight_block_rung_granular
+            # is opted in — so a genuinely-new far same-side rung is no longer deferred.
+            inflight_conflicts = [
+                (placed_rung[oid][0], placed_rung[oid][1])
                 for oid in unmatched_inflight
                 if oid in placed_rung
-            }
-            to_place = [target for target in diff.to_place if target.side not in blocked_sides]
+            ]
+            granular = getattr(self.config, "maker_inflight_block_rung_granular", False)
+            radius_ticks = getattr(self.config, "maker_inflight_block_radius_ticks", Decimal("4"))
+            radius = Decimal(str(radius_ticks)) * self.config.maker_tick
+            to_place = blocked_targets(
+                diff.to_place,
+                inflight_conflicts,
+                radius=radius,
+                granular=bool(granular),
+            )
             for oid in diff.to_cancel:
                 if oid in inflight_ids:
                     continue
@@ -877,6 +894,51 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                     # it toward max_retries so a persistently failing hedge cannot loop.
                     self._current_retries += 1
                     self.evaluate_max_retries()
+
+    def _reconcile_stuck_makers(self) -> None:
+        """Resolve maker orders stuck with ``order is None`` (lost-created-event guard).
+
+        The maker analogue of ``_reconcile_stuck_hedges`` (JEP-177 Fix #2). A maker
+        ``order is None`` resolves only on a created/filled/cancelled event; if the *created*
+        event is PERMANENTLY lost on a genuinely-resting order, the order stays ``None`` forever
+        and freezes that side (the reprice diff never sees it, ``_open_maker_orders`` excludes it)
+        until a fill or restart — an under-quote-only gap, restart-recoverable. We consult the
+        connector's order tracker (``get_in_flight_order`` reads ``active_orders + cached_orders``)
+        and, for each ``order is None`` maker:
+
+          * **connector tracks it (``in_flight is not None``)** -> ADOPT it
+            (``tracked.order = in_flight``). The order becomes visible to the reprice diff and the
+            side unfreezes; the created event being lost no longer matters because we read the
+            tracker, not the event. Adopt-only: we do NOT credit fills here — maker fill accounting
+            stays exclusively in ``process_order_filled_event`` (so an already-filled-but-event-lost
+            order is made visible and its still-pending fill events flow normally; crediting here
+            would risk a double-count against the FX-bridged money path, JEP-185).
+
+          * **connector has no record (``in_flight is None``)** -> do NOT reap/cancel. ``buy()`` /
+            ``sell()`` schedule ``_create_order`` via ``safe_ensure_future`` and return the id
+            *before* ``start_tracking_order`` runs, so a just-placed maker is briefly absent from the
+            tracker; reaping or cancelling it could pop/cancel an order whose create task still runs
+            and places on the exchange -> orphan/naked order (the live-money "never reap an untracked
+            order" invariant). The next tick re-checks; the only case this leaves stuck is a create
+            task cancelled before it ever tracked the order (≈ teardown) -> a visible, conservative
+            freeze that is restart-recoverable and never over-places.
+
+        Gated behind ``reconcile_stuck_makers_enabled`` (default False = current behavior).
+
+        Net invariant: this only ever ADOPTS orders the connector is actually tracking; it never
+        places, re-places, or cancels a maker -> no over-quote, no orphan, no naked exposure.
+        """
+        if not getattr(self.config, "reconcile_stuck_makers_enabled", False):
+            return
+        for order_id, tracked in list(self.maker_orders.items()):
+            if tracked.order is not None:
+                continue
+            in_flight = self.get_in_flight_order(self.maker_connector, order_id)
+            if in_flight is None:
+                # Just-placed (tracker not yet populated) or create task cancelled.
+                # Never reap/cancel here — see docstring. Wait for the next tick.
+                continue
+            tracked.order = in_flight
 
     def _process_hedges(self) -> None:
         self._ensure_direction_accounting()
