@@ -4,7 +4,7 @@ import unittest
 from decimal import Decimal
 from unittest.mock import MagicMock
 
-from hummingbot.core.data_type.common import MarketDict
+from hummingbot.core.data_type.common import MarketDict, TradeType
 from hummingbot.strategy_v2.executors.as_maker_executor.data_types import AsMakerExecutorConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
 
@@ -37,6 +37,15 @@ class AsMakerControllerTests(unittest.TestCase):
     def test_update_markets_registers_pair(self):
         markets = self.cfg.update_markets(MarketDict())
         self.assertIn("BTC-USD", markets["hyperliquid_perpetual"])
+
+    def test_entry_side_accepts_string_name(self):
+        # YAML loads entry_side as the string "BUY"/"SELL"; the config must coerce it to TradeType
+        # (TradeType is an IntEnum 1/2/3 — pydantic would otherwise reject the name).
+        cfg = self.mod.AsMakerControllerConfig(
+            id="x", connector_name="hyperliquid_perpetual", trading_pair="BTC-USD",
+            gamma=Decimal("0.1"), kappa=Decimal("1.5"), order_amount=Decimal("0.001"),
+            max_inventory=Decimal("0.01"), maker_tick=Decimal("1"), entry_side="SELL")
+        self.assertEqual(cfg.entry_side, TradeType.SELL)
 
     def test_emits_one_create_action_when_idle(self):
         self.ctrl.executors_info = []
