@@ -68,6 +68,11 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
 
     # Safety
     kill_switch: bool = False
+    # JEP-133 approval-envelope per-order cap (port of stratops max_qty_per_order). When set,
+    # a maker order whose quantized size exceeds this many base units is REFUSED at the
+    # placement boundary (logged + skipped), never clamped down and never submitted oversized.
+    # None (default) = no cap = current behavior. Enforced in LadderMakerExecutor._place_maker.
+    max_maker_order_size: Optional[Decimal] = None
     ws_staleness_kill_switch_enabled: bool = True
     max_kis_ws_age_s: Optional[float] = 3.0
     max_hl_ws_age_s: Optional[float] = 12.0

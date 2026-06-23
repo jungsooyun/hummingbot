@@ -78,6 +78,30 @@ def _fmt_num(x) -> Optional[str]:
     return s
 
 
+def _as_decimal_or_none(x) -> Optional[Decimal]:
+    """Coerce a config value to Decimal, or None if it is unset / non-numeric.
+
+    Used by the JEP-133 approval-envelope cap: the production pydantic config
+    defaults ``max_maker_order_size`` to ``None`` (no cap), but a value of an
+    unexpected type (e.g. a test ``MagicMock`` config that auto-creates the
+    attribute) must fail OPEN to "no cap" rather than crash the placement path.
+    Real numerics (Decimal/int/float) and numeric strings convert; everything
+    else -> None.
+    """
+    if x is None or isinstance(x, bool):
+        return None
+    if isinstance(x, Decimal):
+        return x
+    if isinstance(x, (int, float)):
+        return Decimal(str(x))
+    if isinstance(x, str):
+        try:
+            return Decimal(x)
+        except Exception:
+            return None
+    return None
+
+
 class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
     """Ladder market-making on a perp (maker, post-only) hedged on KIS spot.
 
@@ -504,6 +528,27 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             # path no-ops) and no fills occur (so the hedge path never fires). Zero real
             # orders. The intended quote is surfaced by the _place_targets summary line.
             # Return None so the base records no _maker_placed_rung for a phantom order.
+            return None
+        # JEP-133 approval-envelope per-order cap (port of stratops max_qty_per_order). A
+        # live maker order whose QUANTIZED size exceeds the configured cap is REFUSED — not
+        # silently clamped down to the cap and not submitted oversized. Refusing (vs clamping)
+        # is the conservative choice: a misconfigured ladder rung larger than the approved
+        # envelope must surface as a skipped order + error log, never as an unapproved
+        # position. Default (None / attribute absent) = no cap = current behavior. Enforced
+        # against q_amount so a venue lot that rounds the request UP cannot smuggle past the
+        # cap. Returns None (like observe) so the base records no _maker_placed_rung for an
+        # order that was never placed.
+        max_maker_order_size = getattr(self.config, "max_maker_order_size", None)
+        cap = _as_decimal_or_none(max_maker_order_size)
+        if cap is not None and q_amount > cap:
+            self.logger().error(
+                "JEP-133 approval-envelope: refusing maker %s order size=%s > "
+                "max_maker_order_size=%s on %s (skipping; rung not placed).",
+                side.name,
+                q_amount,
+                cap,
+                self.maker_trading_pair,
+            )
             return None
         # maker_post_only=True (default): strict post-only (LIMIT_MAKER) — a rung whose price
         # has crossed the (fast) maker book is rejected by the venue, preserving pure-maker
