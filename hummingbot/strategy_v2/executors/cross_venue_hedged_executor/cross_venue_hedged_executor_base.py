@@ -175,6 +175,11 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         self._hedge_sell_base = ZERO
         self._hedge_order_side: Dict[str, Union[TradeType, tuple[TradeType, Decimal]]] = {}
         self._hedge_credited_base: Dict[str, Decimal] = {}
+        # JEP-186: per-order cumulative NATIVE (pre-FX) quote credited so far, used to
+        # reconstruct the marginal fill price when the lost-event reconcile path supplies a
+        # cumulative-AVERAGE price for a delta that follows an earlier, differently-priced
+        # partial. Keyed identically to _hedge_credited_base and evicted alongside it.
+        self._hedge_credited_native_quote: Dict[str, Decimal] = {}
         self._hedge_terminal_ids = OrderedDict()
         self._maker_placed_edge_bps: Dict[str, Decimal] = {}
         self._open_edge_base = ZERO
@@ -625,6 +630,8 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self._hedge_order_side = {}
         if not hasattr(self, "_hedge_credited_base"):
             self._hedge_credited_base = {}
+        if not hasattr(self, "_hedge_credited_native_quote"):
+            self._hedge_credited_native_quote = {}
         if not hasattr(self, "_hedge_terminal_ids"):
             self._hedge_terminal_ids = OrderedDict()
         if not hasattr(self, "_maker_placed_edge_bps"):
@@ -638,6 +645,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             oldest_order_id, _ = self._hedge_terminal_ids.popitem(last=False)
             self._hedge_order_side.pop(oldest_order_id, None)
             self._hedge_credited_base.pop(oldest_order_id, None)
+            self._hedge_credited_native_quote.pop(oldest_order_id, None)
 
     @staticmethod
     def _signed_base(side: TradeType, amount: Decimal) -> Decimal:
@@ -728,7 +736,25 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             return recorded[0]
         return recorded or self.hedge_side
 
-    def _credit_hedge_fill(self, order_id: str, observed_cumulative: Decimal, price: Optional[Decimal]) -> None:
+    def _credit_hedge_fill(
+        self,
+        order_id: str,
+        observed_cumulative: Decimal,
+        price: Optional[Decimal],
+        price_is_cumulative_avg: bool = False,
+    ) -> None:
+        """Credit a hedge fill's marginal base/quote once, watermarked by cumulative base.
+
+        ``price`` is normally the per-fill MARGINAL price (the event path). The
+        lost-lifecycle-event reconcile path can only read the order's cumulative AVERAGE
+        price (``average_executed_price``); it passes ``price_is_cumulative_avg=True`` so
+        this method reconstructs the marginal price for the new ``delta``. Without that, a
+        ``delta`` that follows an earlier, differently-priced partial would be credited at
+        the blended average, mis-attributing quote/PnL (JEP-186). The reconstruction backs
+        out the marginal native quote = ``avg * observed_cumulative - already_native``, then
+        ``marginal_px = marginal_native / delta``; with no prior credit it reduces to the
+        average exactly, so the clean lost-then-filled case is byte-identical.
+        """
         already = self._hedge_credited_base.get(order_id, ZERO)
         if order_id not in self.hedge_orders and observed_cumulative <= already:
             observed_cumulative = already + observed_cumulative
@@ -742,14 +768,29 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         # _spot_net nets against _perp_net in one unit (see _hedge_base_to_maker_base).
         self._hedge_executed_base += delta
         if price is not None and not price.is_nan():
+            already_native = self._hedge_credited_native_quote.get(order_id, ZERO)
+            marginal_price = price
+            if price_is_cumulative_avg and already > ZERO:
+                # Reconstruct the marginal native price for this delta from the cumulative
+                # average and what was already credited natively. Guard the rare case where
+                # a prior delta was credited base-only (NaN price, no native baseline): if
+                # the back-out yields a non-positive marginal price, fall back to the
+                # average (current behavior) rather than crediting a negative/zero price.
+                marginal_native = price * observed_cumulative - already_native
+                reconstructed = marginal_native / delta
+                if reconstructed > ZERO:
+                    marginal_price = reconstructed
             # JEP-185: convert the hedge fill price to the maker quote unit ONCE and use it
             # for BOTH notional accumulators, so neither carries the hedge's native
             # currency. Base default is identity (generic two-venue / fx=1); the ladder
             # override divides KRW by the side-aware FX. This keeps the matched
             # (single-sided) ``hedge_avg`` AND the two-sided ``_spot_cash`` single-currency.
-            quote_px = self._hedge_price_to_maker_quote(price, side)
+            quote_px = self._hedge_price_to_maker_quote(marginal_price, side)
             self._hedge_executed_quote += delta * quote_px
             self._spot_cash += quote_px * delta * (ONE if side == TradeType.SELL else -ONE)
+            # Track the native (pre-FX) quote credited so a later reconcile can back out the
+            # next marginal price correctly.
+            self._hedge_credited_native_quote[order_id] = already_native + marginal_price * delta
         maker_base = self._hedge_base_to_maker_base(delta)
         self._record_hedge_fill_side(side, maker_base)
         self._pending_hedge_signed += self._signed_base(side, maker_base)
@@ -811,11 +852,20 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             filled_base = in_flight.amount if in_flight.is_filled else (in_flight.executed_amount_base or ZERO)
             if filled_base > ZERO:
                 price = in_flight.average_executed_price
-                if price is None or price.is_nan():
+                # JEP-186: average_executed_price is a CUMULATIVE-AVERAGE over all fills of
+                # this order. If an earlier partial was already credited at a different
+                # (marginal) price, crediting the recovered delta at this blended average
+                # mis-attributes quote/PnL. Flag it so _credit_hedge_fill reconstructs the
+                # marginal price for the delta. The in_flight.price fallback is the order's
+                # limit price (a per-order constant), so it is NOT a cumulative average.
+                price_is_cumulative_avg = price is not None and not price.is_nan()
+                if not price_is_cumulative_avg:
                     price = in_flight.price
                 # Guard the maker hedge's NaN market price from poisoning quote/PnL;
                 # crediting base-only slightly under-reports quote for this rare order.
-                self._credit_hedge_fill(order_id, filled_base, price)
+                self._credit_hedge_fill(
+                    order_id, filled_base, price, price_is_cumulative_avg=price_is_cumulative_avg
+                )
             if in_flight.is_done:
                 # No completion event will arrive (its events were lost): credit fees here
                 # (for a still-open order the normal completion event credits them instead).
