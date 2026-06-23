@@ -114,6 +114,9 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
     # escalates from "hold + keep retrying" to a hard FAILED stop (dead-venue backstop).
     _HEDGE_HARD_STOP_FACTOR = 3
     _HEDGE_TERMINAL_ID_CAP = 128
+    # Same cap, but for MAKER orders that were popped (cancel/fail) and may still emit a
+    # late cross fill (cancel/fill race). See _maker_terminal_ids below.
+    _MAKER_TERMINAL_ID_CAP = 128
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -182,6 +185,13 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         # partial. Keyed identically to _hedge_credited_base and evicted alongside it.
         self._hedge_credited_native_quote: Dict[str, Decimal] = {}
         self._hedge_terminal_ids = OrderedDict()
+        # MONEY-CRITICAL (cancel/fill race): a maker order popped on cancel/fail can still
+        # emit a late cross fill. _maker_terminal_ids records those popped ids so the fill
+        # is ACCOUNTED (not dropped as "unknown") -> the hedge fires. _maker_credited_base
+        # watermarks the cumulative base already credited (via maker_orders OR terminal
+        # branch) so a fill is never double-counted across the popped transition.
+        self._maker_terminal_ids = OrderedDict()
+        self._maker_credited_base: Dict[str, Decimal] = {}
         self._maker_placed_edge_bps: Dict[str, Decimal] = {}
         self._open_edge_base = ZERO
         self._open_edge_notional_bps = ZERO
@@ -651,6 +661,10 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self._hedge_credited_native_quote = {}
         if not hasattr(self, "_hedge_terminal_ids"):
             self._hedge_terminal_ids = OrderedDict()
+        if not hasattr(self, "_maker_terminal_ids"):
+            self._maker_terminal_ids = OrderedDict()
+        if not hasattr(self, "_maker_credited_base"):
+            self._maker_credited_base = {}
         if not hasattr(self, "_maker_placed_edge_bps"):
             self._maker_placed_edge_bps = {}
 
@@ -663,6 +677,21 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self._hedge_order_side.pop(oldest_order_id, None)
             self._hedge_credited_base.pop(oldest_order_id, None)
             self._hedge_credited_native_quote.pop(oldest_order_id, None)
+
+    def _remember_terminal_maker_order(self, order_id: str) -> None:
+        """Record a popped MAKER order so a late cross fill (cancel/fill race) is accounted.
+
+        Mirrors _remember_terminal_hedge_order: record the id, cap-evict the oldest along
+        with its credited-base watermark. Without this a maker order popped on cancel/fail
+        whose fill arrives afterwards falls through to the "unknown order" else-branch and
+        is DROPPED, leaving the perp position change unhedged.
+        """
+        self._ensure_direction_accounting()
+        self._maker_terminal_ids.pop(order_id, None)
+        self._maker_terminal_ids[order_id] = True
+        while len(self._maker_terminal_ids) > self._MAKER_TERMINAL_ID_CAP:
+            oldest_order_id, _ = self._maker_terminal_ids.popitem(last=False)
+            self._maker_credited_base.pop(oldest_order_id, None)
 
     @staticmethod
     def _signed_base(side: TradeType, amount: Decimal) -> Decimal:
@@ -1067,6 +1096,12 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self._record_maker_fill_side(maker_side, amount)
             self._record_open_edge(event.order_id, maker_side, amount)
             self._pending_hedge_signed += self._signed_base(maker_side, amount)
+            # Advance the credited watermark so that if this order is later popped
+            # (cancel/fail) the terminal-maker branch credits only NEW base beyond what
+            # was already counted here — no double-count across the popped transition.
+            self._maker_credited_base[event.order_id] = (
+                self._maker_credited_base.get(event.order_id, ZERO) + amount
+            )
         elif event.order_id in self.hedge_orders:
             self._update_tracked(self.hedge_connector, event.order_id)
             # Decrement the hedge queue by what ACTUALLY hedged (fill), not what was
@@ -1103,9 +1138,43 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                 )
                 self._credit_hedge_fill(event.order_id, observed, Decimal(event.price))
                 self._current_retries = 0
+        elif event.order_id in self._maker_terminal_ids:
+            # MONEY-CRITICAL: a MAKER order popped on cancel/fail (cancel/fill race) still
+            # filled on the venue. Account the cross fill IDENTICALLY to the in-maker_orders
+            # branch so the perp position change is reflected and the hedge fires — but
+            # credit only the NEW delta beyond what was already counted (watermark) so the
+            # fill is never double-counted across the maker_orders -> terminal transition.
+            in_flight = self.get_in_flight_order(self.maker_connector, event.order_id)
+            observed = getattr(in_flight, "executed_amount_base", None)
+            already = self._maker_credited_base.get(event.order_id, ZERO)
+            if observed is None:
+                # Lagging/absent connector cumulative: fall back to cumulative-delta =
+                # prior watermark + this fill (matches the hedge-terminal fallback).
+                observed = already + amount
+            observed = Decimal(observed)
+            delta = observed - already
+            if delta > ZERO:
+                self.logger().warning(
+                    "Crediting post-cancel cross fill on terminal maker order %s: "
+                    "observed cumulative %s, prior credited %s.",
+                    event.order_id,
+                    observed,
+                    already,
+                )
+                maker_side = self._maker_fill_side(event)
+                self._maker_credited_base[event.order_id] = observed
+                self._maker_executed_base += delta
+                self._maker_executed_quote += delta * Decimal(event.price)
+                self._perp_cash += delta * Decimal(event.price) * (
+                    ONE if maker_side == TradeType.SELL else -ONE
+                )
+                self._record_maker_fill_side(maker_side, delta)
+                self._record_open_edge(event.order_id, maker_side, delta)
+                self._pending_hedge_signed += self._signed_base(maker_side, delta)
         else:
             self.logger().warning(
-                "Ignoring fill for unknown order %s: not tracked as maker, active hedge, or terminal hedge.",
+                "Ignoring fill for unknown order %s: not tracked as maker, active hedge, "
+                "terminal hedge, or terminal maker.",
                 event.order_id,
             )
 
@@ -1127,7 +1196,11 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
 
     def process_order_canceled_event(self, _, market, event: OrderCancelledEvent):
         self._ensure_direction_accounting()
-        self.maker_orders.pop(event.order_id, None)
+        if event.order_id in self.maker_orders:
+            self.maker_orders.pop(event.order_id, None)
+            # Record the popped maker order: a cancel/fill race can still emit a late
+            # cross fill that would otherwise be dropped as "unknown" (naked exposure).
+            self._remember_terminal_maker_order(event.order_id)
         # Pop a cancelled hedge too (no leak / no stale in-flight block). Its unfilled
         # base stays in _pending_hedge_base and is re-hedged on the next tick.
         if event.order_id in self.hedge_orders:
@@ -1138,6 +1211,9 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         self._ensure_direction_accounting()
         if event.order_id in self.maker_orders:
             self.maker_orders.pop(event.order_id, None)
+            # Same cancel/fill-race protection on the FAIL path: a maker order can fail its
+            # cancel/replace yet still have filled on the venue first.
+            self._remember_terminal_maker_order(event.order_id)
         elif event.order_id in self.hedge_orders:
             self.hedge_orders.pop(event.order_id, None)
             self._remember_terminal_hedge_order(event.order_id, allow_event_delta_fallback=True)
