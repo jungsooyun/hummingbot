@@ -854,8 +854,12 @@ class KisExchange(ExchangePyBase):
                 trade_type = TradeType.SELL if str(row.get("sll_buy_dvsn_cd", "")) == "01" else TradeType.BUY
                 eoid = str(row.get("odno", ""))
                 tracked = by_eoid.get(eoid)
-                # VERIFY: inquire-daily-ccld remaining-qty field name (rmn_qty/ord_psbl_qty) + ord_unpr unit-price key against the connector's existing parser / KIS docs
-                remaining = row.get("rmn_qty", row.get("ord_psbl_qty"))
+                # rmn_qty (잔여수량) is the inquire-daily-ccld remaining field — verified against the
+                # Intrect-io/kis-agent community client (responses/order.py:113 + test fixture) and KIS
+                # docs (TR TTTC8001R). ord_psbl_qty is NOT a field of this endpoint (it belongs to the
+                # balance/orderable-qty endpoints), so a row lacking rmn_qty falls back to
+                # ord_qty - tot_ccld_qty — never an unrelated orderable-qty field. (JEP-135)
+                remaining = row.get("rmn_qty")
                 remaining_amount = Decimal(str(remaining)) if remaining is not None else (ord_qty - ccld_qty)
                 records.append(OpenOrderRecord(
                     trading_pair=tp,
@@ -866,7 +870,9 @@ class KisExchange(ExchangePyBase):
                     amount=ord_qty,
                     remaining_amount=remaining_amount,
                 ))
-            # VERIFY: pagination (ctx_area_nk100/tr_cont) + after-15:30 resting-order visibility against KIS live response
+            # Pagination keys (ctx_area_nk100/fk100, tr_cont) verified against the Intrect-io/kis-agent
+            # community client (account/profit_api.py) + KIS docs. NOTE (live-only, not a field-name
+            # question): confirm resting-order visibility in a live after-15:30 NXT response. (JEP-135)
             nk100 = str(result.get("ctx_area_nk100", "")).strip()
             fk100 = str(result.get("ctx_area_fk100", "")).strip()
             if not nk100 and not str(result.get("tr_cont", "")).strip():

@@ -519,6 +519,29 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         self.assertEqual(sell.remaining_amount, Decimal("2"))
 
     @aioresponses()
+    async def test_get_open_orders_remaining_ignores_non_ccld_ord_psbl_qty(self, mock_api):
+        """rmn_qty (잔여수량) is the inquire-daily-ccld remaining field — verified against the
+        Intrect-io/kis-agent community client (responses/order.py:113) + its fixture and KIS docs
+        (TR TTTC8001R). ord_psbl_qty is NOT a field of this endpoint (it belongs to balance/
+        orderable-qty endpoints), so when rmn_qty is absent the remaining must fall back to
+        ord_qty - tot_ccld_qty, never an orderable-qty field that happens to be on the row."""
+        symbol = self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)
+        ex = self._make_exchange()
+        ex._auth._access_token = "test_access_token"
+        ex._auth._token_expires_at = time.time() + 86400
+        ex._set_trading_pair_symbol_map(bidict({symbol: self.trading_pair}))
+        rows = [
+            # No rmn_qty; a bogus ord_psbl_qty must be ignored (it is not a daily-ccld field).
+            {"odno": "no-rmn", "pdno": symbol, "sll_buy_dvsn_cd": "02",
+             "ord_unpr": "1", "ord_qty": "10", "tot_ccld_qty": "3", "ord_psbl_qty": "99", "cncl_yn": "N"},
+        ]
+        url = re.compile(f"^{re.escape(web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH))}.*")
+        mock_api.get(url, body=json.dumps(self._open_orders_response(rows)))
+        records = await ex.get_open_orders()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].remaining_amount, Decimal("7"))  # ord_qty - ccld_qty, not 99
+
+    @aioresponses()
     async def test_get_open_orders_excludes_terminal_rows(self, mock_api):
         symbol = self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)
         ex = self._make_exchange()
