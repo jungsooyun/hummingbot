@@ -291,9 +291,13 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
     @staticmethod
     def _ws_orderbook_raw(hour_cls_code: str = "0") -> str:
-        """Raw WS orderbook message (H0UNASP0) with pipe + caret format."""
+        """Raw WS orderbook message (H0UNASP0) with pipe + caret format.
+
+        JEP-202: parts[2] is the KIS record count ("데이터건수"), NOT the stock code —
+        the stock code is the first caret field (MKSC_SHRN_ISCD). The fixture uses the
+        realistic record count so it cannot re-mask the parts[2] resolution bug."""
         return (
-            "0|H0UNASP0|005930|"
+            "0|H0UNASP0|001|"
             f"005930^093000^{hour_cls_code}"
             "^67800^67900^68000^68100^68200^68300^68400^68500^68600^68700"
             "^67700^67600^67500^67400^67300^67200^67100^67000^66900^66800"
@@ -304,9 +308,11 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
     @staticmethod
     def _ws_trade_raw() -> str:
-        """Raw WS trade message (H0UNCNT0) with pipe + caret format."""
+        """Raw WS trade message (H0UNCNT0) with pipe + caret format.
+
+        JEP-202: parts[2] is the record count ("데이터건수"), not the stock code."""
         return (
-            "0|H0UNCNT0|005930|"
+            "0|H0UNCNT0|001|"
             "005930^093001^67800^2^-200^-0.29^67750^68000^68200^67600"
             "^67900^67700^100^500000^33900000000^1234^5678^-4444^25.5"
             "^617^383^1^38.3^3.5^090000^2^200^091500^2^200^093000^2^-200"
@@ -1076,6 +1082,25 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
             sig = self.connector.get_session_halt_signals(self.trading_pair)
         self.assertLessEqual(sig.book_static_sec, 0.001)
 
+    async def test_depth_change_with_static_top_resets_book_change(self):
+        # JEP-198/202: the best bid/ask can hold static for many seconds in a quiet
+        # market while deeper levels keep moving. book_static must track the full
+        # depth (the data source feeds the whole book), so a deeper-level change on
+        # an unchanged top still proves the feed is live -> no false book_frozen.
+        raw = self._ws_orderbook_raw()
+        base = KisAPIOrderBookDataSource._parse_caret_fields(
+            raw.split("|")[3], CONSTANTS.WS_ORDERBOOK_COLUMNS
+        )
+        a = dict(base)
+        b = dict(base)
+        # Top of book unchanged; only a deeper bid-level size moves (BIDP_RSQN2).
+        b["BIDP_RSQN2"] = str(int(float(base["BIDP_RSQN2"])) + 100)
+        with patch("time.perf_counter", side_effect=[100.0, 100.0, 110.0, 110.0, 110.0]):
+            await self.data_source._process_orderbook_data("005930", a)
+            await self.data_source._process_orderbook_data("005930", b)
+            sig = self.connector.get_session_halt_signals(self.trading_pair)
+        self.assertLessEqual(sig.book_static_sec, 0.001)
+
     async def test_hour_cls_code_auction_flag(self):
         raw = self._ws_orderbook_raw(hour_cls_code="C")
         parsed = KisAPIOrderBookDataSource._parse_caret_fields(
@@ -1301,6 +1326,62 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertFalse(queue.empty())
         msg = queue.get_nowait()
         self.assertEqual(OrderBookMessageType.TRADE, msg.type)
+
+    # ------------------------------------------------------------------
+    # JEP-202: real KIS frames carry the record count ("데이터건수") in parts[2],
+    # NOT the stock code. The stock code is the first caret field (MKSC_SHRN_ISCD).
+    # Keying freshness/resolution off parts[2] permanently failed the JEP-134 stamp
+    # guard (age=None) and misattributed frames to _trading_pairs[0] under multi-pair.
+    # The shared _ws_*_raw() fixtures happen to put the stock code in parts[2], which
+    # masked the bug; these tests use the realistic wire layout instead.
+    # ------------------------------------------------------------------
+
+    async def test_jep202_orderbook_freshness_stamped_from_caret_symbol(self):
+        """A healthy WS orderbook frame must stamp JEP-134 freshness off MKSC_SHRN_ISCD,
+        even though parts[2] is the record count ('001'), not the stock code."""
+        # Realistic frame: parts[2] = record count "001"; stock code lives in the caret data.
+        raw = "0|H0UNASP0|001|" + self._ws_orderbook_raw().split("|", 3)[3]
+
+        self.assertIsNone(self.data_source.last_ws_orderbook_time(self.trading_pair))
+        await self.data_source._handle_data_message(raw)
+
+        self.assertIsNotNone(
+            self.data_source.last_ws_orderbook_time(self.trading_pair),
+            "JEP-134 freshness must be stamped from MKSC_SHRN_ISCD, not the parts[2] "
+            "record count — otherwise a healthy feed is judged stale forever.",
+        )
+
+    async def test_jep202_orderbook_attributed_to_caret_symbol_not_fallback(self):
+        """Under multiple pairs, the orderbook snapshot must be attributed to the frame's
+        own MKSC_SHRN_ISCD, not the _trading_pairs[0] fallback."""
+        self.data_source._trading_pairs = ["000660-KRW", self.trading_pair]
+        self.connector._set_trading_pair_symbol_map(
+            bidict({"000660": "000660-KRW", "005930": self.trading_pair})
+        )
+        raw = "0|H0UNASP0|001|" + self._ws_orderbook_raw().split("|", 3)[3]
+
+        await self.data_source._handle_data_message(raw)
+
+        queue = self.data_source._message_queue[self.data_source._snapshot_messages_queue_key]
+        self.assertFalse(queue.empty())
+        msg = queue.get_nowait()
+        self.assertEqual(self.trading_pair, msg.content["trading_pair"])
+
+    async def test_jep202_trade_attributed_to_caret_symbol_not_fallback(self):
+        """Under multiple pairs, the trade message must be attributed to the frame's own
+        MKSC_SHRN_ISCD, not the _trading_pairs[0] fallback."""
+        self.data_source._trading_pairs = ["000660-KRW", self.trading_pair]
+        self.connector._set_trading_pair_symbol_map(
+            bidict({"000660": "000660-KRW", "005930": self.trading_pair})
+        )
+        raw = "0|H0UNCNT0|001|" + self._ws_trade_raw().split("|", 3)[3]
+
+        await self.data_source._handle_data_message(raw)
+
+        queue = self.data_source._message_queue[self.data_source._trade_messages_queue_key]
+        self.assertFalse(queue.empty())
+        msg = queue.get_nowait()
+        self.assertEqual(self.trading_pair, msg.content["trading_pair"])
 
     async def test_handle_data_message_invalid_format(self):
         """A data message with fewer than 4 pipe-delimited parts should log a warning."""

@@ -92,7 +92,7 @@ class KisExchange(ExchangePyBase):
         self._ws_hub = None
         # JEP-198 session-halt per-pair state (perf_counter clock)
         self._sh_hour_cls_code: Dict[str, str] = {}
-        self._sh_prev_top: Dict[str, tuple] = {}
+        self._sh_prev_book_sig: Dict[str, tuple] = {}
         self._sh_last_book_change: Dict[str, float] = {}
         # Phase-2 latches (populated only when kis_market_status_enabled)
         self._market_status_enabled = str(kis_market_status_enabled).strip().lower() == "true"
@@ -314,10 +314,18 @@ class KisExchange(ExchangePyBase):
         if code is not None:
             self._sh_hour_cls_code[trading_pair] = code
 
-    def note_top_of_book(self, trading_pair: str, best_bid: float, best_ask: float) -> None:
-        top = (best_bid, best_ask)
-        if self._sh_prev_top.get(trading_pair) != top:
-            self._sh_prev_top[trading_pair] = top
+    def note_book_snapshot(self, trading_pair: str, bids: list, asks: list) -> None:
+        # JEP-198/202: detect a genuinely frozen book by comparing the FULL depth
+        # snapshot (every level's price + size), not just the top of book. A quiet
+        # but live market routinely holds the best bid/ask static for many seconds
+        # (the touch can persist for tens of minutes) while deeper levels and sizes
+        # keep moving; keying "book static" off the top alone false-trips the
+        # session-halt gate's book_frozen rule on a perfectly healthy feed. A real
+        # halt (CB / 거래정지) freezes every level, so an unchanged full-depth
+        # signature is the correct freeze signal.
+        sig = (tuple(bids), tuple(asks))
+        if self._sh_prev_book_sig.get(trading_pair) != sig:
+            self._sh_prev_book_sig[trading_pair] = sig
             self._sh_last_book_change[trading_pair] = time.perf_counter()
 
     def mark_market_status_confirmed(self, trading_pair: str) -> None:

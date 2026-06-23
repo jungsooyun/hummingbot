@@ -127,6 +127,14 @@ class LadderMakerInitTest(unittest.TestCase):
         self.assertIs(fields["session_halt_gate_enabled"].default, True)
         self.assertIs(fields["ws_staleness_kill_switch_enabled"].default, True)
 
+    def test_session_halt_book_static_default_is_15s(self):
+        # JEP-198/202: a quiet equity top-of-book holds static for many seconds in a
+        # healthy market, so book_frozen detection now tracks the FULL depth and the
+        # default window is widened 8s -> 15s. A real CB/거래정지 freeze lasts minutes,
+        # so 15s still catches it while no longer false-tripping on a calm live book.
+        fields = LadderHedgeControllerConfigBase.model_fields
+        self.assertEqual(15.0, fields["session_halt_max_book_static_s"].default)
+
 
 @unittest.skipUnless(_EXECUTOR_IMPORTABLE, "ladder_maker_executor requires the V2 stack (paho) — run in Docker/CI")
 class LadderMakerBalanceValidationTest(unittest.TestCase):

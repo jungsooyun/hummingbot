@@ -153,17 +153,27 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
             return
 
         tr_id = parts[1]
+        # NB: parts[2] is the KIS realtime record count ("데이터건수"), NOT the stock code.
+        # The stock code is the first caret field (MKSC_SHRN_ISCD). JEP-202 fixes the
+        # orderbook/trade branches below to resolve off the caret field. The H0STMKO0
+        # market-status branch is left untouched here (JEP-198/201 owns it — its data-frame
+        # path has the same parts[2] hazard and should be reconciled there).
         tr_key = parts[2]
         data_str = parts[3]
 
         if tr_id == self._ob_tr_id:
             parsed = self._parse_caret_fields(data_str, CONSTANTS.WS_ORDERBOOK_COLUMNS)
             if parsed:
-                await self._process_orderbook_data(tr_key, parsed)
+                # JEP-202: key off the caret stock code, not parts[2] (record count).
+                # Using parts[2] permanently failed the JEP-134 freshness stamp guard
+                # (age=None -> healthy WS misjudged stale -> kill-switch tripped forever)
+                # and misattributed frames to _trading_pairs[0] under multi-pair.
+                await self._process_orderbook_data(parsed.get("MKSC_SHRN_ISCD") or tr_key, parsed)
         elif tr_id == self._trade_tr_id:
             parsed = self._parse_caret_fields(data_str, CONSTANTS.WS_TRADE_COLUMNS)
             if parsed:
-                await self._process_trade_data(tr_key, parsed)
+                # JEP-202: see orderbook branch — resolve off the caret stock code.
+                await self._process_trade_data(parsed.get("MKSC_SHRN_ISCD") or tr_key, parsed)
         elif self._market_status_enabled and tr_id == self._market_status_tr_id:
             fields = data_str.split("^")
             parsed = dict(zip(CONSTANTS.WS_MARKET_STATUS_COLUMNS, fields))
@@ -264,7 +274,7 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 symbol_map = getattr(self._connector, "_trading_pair_symbol_map", None)
             if symbol_map and symbol_map.get(tr_key) == trading_pair:
                 self._mark_ws_orderbook_frame(trading_pair)
-                self._connector.note_top_of_book(trading_pair, bids[0][0], asks[0][0])
+                self._connector.note_book_snapshot(trading_pair, bids, asks)
                 self._connector.note_hour_cls_code(trading_pair, data.get("HOUR_CLS_CODE"))
 
     async def _process_trade_data(self, tr_key: str, data: Dict[str, str]):
@@ -430,14 +440,17 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
     # ------------------------------------------------------------------
 
     async def _resolve_trading_pair(self, stock_code: str) -> Optional[str]:
-        """Resolve stock code to hummingbot trading pair."""
-        try:
-            symbol_map = self._connector._trading_pair_symbol_map
-            if symbol_map and stock_code in symbol_map:
-                return symbol_map[stock_code]
-        except Exception:
-            pass
-        # Fallback: return first trading pair
+        """Resolve stock code to hummingbot trading pair.
+
+        JEP-202: prefer an exact symbol-map hit (via the public async getter). The
+        connector's ``_trading_pair_symbol_map`` is a Cython cdef attribute that is NOT
+        readable from Python, so the old direct-attribute read always raised and silently
+        fell back to ``_trading_pairs[0]`` — misattributing every frame to the first pair
+        under multi-pair. Fall back to the single configured pair only when the map has no
+        hit (bootstrap window / single-pair deployments such as the live HIP3-KIS bot)."""
+        resolved = await self._resolve_trading_pair_exact(stock_code)
+        if resolved:
+            return resolved
         if self._trading_pairs:
             return self._trading_pairs[0]
         return None

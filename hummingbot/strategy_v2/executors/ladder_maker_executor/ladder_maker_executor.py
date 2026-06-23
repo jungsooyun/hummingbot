@@ -195,7 +195,7 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             self.hedge_trading_pair,
             in_auction=self._calendar.in_auction_window(self._strategy.current_timestamp),
             max_ws_age_s=getattr(self.config, "session_halt_max_ws_age_s", 3.0),
-            max_book_static_s=getattr(self.config, "session_halt_max_book_static_s", 8.0),
+            max_book_static_s=getattr(self.config, "session_halt_max_book_static_s", 15.0),
         )
         ctx = GateContext(
             now_kst=self._calendar.now(self._strategy.current_timestamp),
