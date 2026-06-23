@@ -93,6 +93,9 @@ class _Harness(CrossVenueHedgedExecutorBase):
         # _reconcile_stuck_hedges consults via get_in_flight_order.
         self.connector_orders = {}
         self._strategy = SimpleNamespace(cancel=MagicMock())
+        # JEP-205: _process_hedges now reads config.observe (fail-closed guard);
+        # the live path requires observe=False so cancel/place run as before.
+        self.config = SimpleNamespace(observe=False)
 
     def _update_tracked(self, *_):
         pass

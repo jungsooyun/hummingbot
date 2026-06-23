@@ -970,6 +970,12 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             tracked.order = in_flight
 
     def _process_hedges(self) -> None:
+        if getattr(self.config, "observe", False):
+            # JEP-205: observe makes ZERO hedge order-API calls (no reconcile-cancel, no place).
+            # Returning here closes the latent placement leak AND the cancel side-effect (the
+            # cancel loop runs before the pending==0 return). Live KIS (observe=false) is
+            # byte-identical; KIS observe never had hedges to reconcile/place anyway.
+            return
         self._ensure_direction_accounting()
         self._reconcile_stuck_hedges()
         if self.status == RunnableStatus.TERMINATED:
