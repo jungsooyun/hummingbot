@@ -12,6 +12,7 @@ logic - those stay in the data-source handlers.
 """
 
 import asyncio
+import inspect
 import json
 import logging
 from typing import Awaitable, Callable, Dict, Optional, Set, Tuple, TYPE_CHECKING
@@ -26,6 +27,22 @@ if TYPE_CHECKING:
     from hummingbot.connector.exchange.kis.kis_auth import KisAuth
 
 Handler = Callable[[str], Awaitable[None]]
+
+
+def _same_handler(a: Handler, b: Handler) -> bool:
+    """Whether two handlers are the SAME logical handler for the overwrite guard.
+
+    A bound method (e.g. a data source's ``self._on_ws_frame``) is a FRESH object on every
+    attribute access — ``a.m is a.m`` is False in CPython — yet it represents one logical
+    handler. Compare real bound methods by their (``__self__``, ``__func__``) identity so a
+    source re-registering a tr_id (one DS sharing a tr_id across symbols, or a stop/start
+    restart) is recognised as the same handler. For anything that is NOT a bound method, fall
+    back to STRICT identity: we deliberately do NOT delegate to arbitrary callable ``__eq__``,
+    so a callable with broad/custom equality cannot be mistaken for an already-registered
+    handler and silently steal its tr_id (JEP-207 review)."""
+    if inspect.ismethod(a) and inspect.ismethod(b):
+        return a.__self__ is b.__self__ and a.__func__ is b.__func__
+    return a is b
 
 
 class KisWsHub:
@@ -79,26 +96,31 @@ class KisWsHub:
             # stop_network() FIRST (exchange_py_base.py:676), which runs hub.stop() and
             # sets _stopped=True; without this reset the hub would be permanently dead and
             # never reconnect on the (re)start that immediately follows. Clear it BEFORE the
-            # overwrite guard so the guard stays armed across restarts. The guard compares by
-            # EQUALITY, not identity: a bound method (e.g. a data source's self._on_ws_frame) is
-            # a FRESH object on every attribute access (`a.m is a.m` is False in CPython), so the
-            # same source re-registering a tr_id — one DS subscribing one tr_id for several
-            # symbols (H0UNASP0 demuxes by tr_key), or a stop/start restart — passes an
-            # equal-but-not-identical handler that MUST be a no-op. A genuinely different source
-            # (different __self__) compares unequal and still raises (JEP-207: identity here
-            # wrongly rejected the 2nd symbol and kill-switched the 2-symbol live run).
+            # overwrite guard so the guard stays armed across restarts. The guard uses
+            # _same_handler (bound-method __self__/__func__ identity, strict identity otherwise):
+            # a bound method (e.g. a data source's self._on_ws_frame) is a FRESH object on every
+            # attribute access (`a.m is a.m` is False in CPython), so the same source
+            # re-registering a tr_id — one DS subscribing one tr_id for several symbols
+            # (H0UNASP0 demuxes by tr_key), or a stop/start restart — MUST be a no-op. A
+            # genuinely different source (different __self__) still raises (JEP-207: identity
+            # here wrongly rejected the 2nd symbol and kill-switched the 2-symbol live run).
             self._stopped = False
             existing = self._dispatch.get(tr_id)
-            if existing is not None and existing != handler:
+            if existing is not None and not _same_handler(existing, handler):
                 raise ValueError(
                     f"KisWsHub: tr_id {tr_id} is already registered to a different handler; "
                     f"refusing to overwrite (would silently drop frames)."
                 )
             self._dispatch[tr_id] = handler
+            # Track whether this (tr_id, tr_key) is genuinely new so a same-key re-register is a
+            # no-op ON THE WIRE too, not just in _dispatch. Re-sending tr_type="1" for an already
+            # subscribed key risks a KIS duplicate-subscribe rejection, which _is_failed_subscribe_ack
+            # would treat as a failed ack and recycle the whole shared socket (JEP-207 review).
+            newly_added = (tr_id, tr_key) not in self._subs
             self._subs.add((tr_id, tr_key))
             live = self._ws is not None and not self._ws.closed
             self._ensure_running()
-        if live:
+        if live and newly_added:
             await self._safe_send_sub(tr_id, tr_key, "1")
 
     async def unregister(self, tr_id: str, tr_key: str) -> None:

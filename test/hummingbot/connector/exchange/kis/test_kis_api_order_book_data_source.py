@@ -1709,6 +1709,50 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
             except asyncio.CancelledError:
                 pass
 
+    async def test_listen_two_symbols_market_status_registers_without_collision(self):
+        """JEP-207 review (Finding 1 coverage): with market status on, H0UNMKO0 is ALSO
+        registered once per symbol and would hit the same identity collision. Prove the fix
+        covers all THREE doubly-registered tr_ids (orderbook/trade/market-status). NB: the
+        H0UNMKO0 DATA path still has the separate parts[2] record-count hazard owned by
+        JEP-198/201 — out of scope here; this only asserts collision-free registration."""
+        from hummingbot.connector.exchange.kis.kis_ws_hub import KisWsHub
+
+        hub = KisWsHub(auth=self.mock_auth, domain=CONSTANTS.DEFAULT_DOMAIN,
+                       ws_enabled=True, sleep=AsyncMock())
+        hub._ensure_running = lambda: None
+        ds = KisAPIOrderBookDataSource(
+            trading_pairs=["005930-KRW", "000660-KRW"],
+            connector=self.connector,
+            api_factory=self.connector._web_assistants_factory,
+            auth=self.mock_auth,
+            hub=hub,
+            domain=CONSTANTS.DEFAULT_DOMAIN,
+            market_routing=CONSTANTS.MARKET_ROUTING_SOR,
+            market_status_capture_only=True,
+        )
+        sym_map = {"005930-KRW": "005930", "000660-KRW": "000660"}
+        with patch.object(
+            self.connector,
+            "exchange_symbol_associated_to_pair",
+            new=AsyncMock(side_effect=lambda trading_pair: sym_map[trading_pair]),
+        ):
+            task = asyncio.create_task(ds.listen_for_subscriptions())
+            for _ in range(60):
+                if task.done() or ("H0UNMKO0", "000660") in hub._subs:
+                    break
+                await asyncio.sleep(0)
+            if task.done() and task.exception() is not None:
+                raise AssertionError(
+                    "market-status 2-symbol listen collided (JEP-207)"
+                ) from task.exception()
+            self.assertIn(("H0UNMKO0", "005930"), hub._subs)
+            self.assertIn(("H0UNMKO0", "000660"), hub._subs)   # 3rd tr_id, 2nd symbol
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
     async def test_listen_registers_market_status_tr_when_enabled(self):
         hub = MagicMock()
         hub.register = AsyncMock()

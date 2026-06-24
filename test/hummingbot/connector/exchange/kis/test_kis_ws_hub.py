@@ -127,6 +127,25 @@ class KisWsHubTests(IsolatedAsyncioWrapperTestCase):
             await hub.register("H0UNASP0", "000660", b._on_ws_frame)  # different __self__
         await hub.stop()
 
+    async def test_register_same_key_while_live_does_not_resubscribe(self):
+        """JEP-207 review (Finding 2): re-registering an already-subscribed (tr_id, tr_key)
+        while the socket is live must NOT re-send tr_type='1'. A duplicate subscribe can trip
+        a KIS duplicate-rejection that _is_failed_subscribe_ack would recycle the whole shared
+        socket on. A genuinely new key (the 2nd symbol, same tr_id) MUST still subscribe."""
+        hub = KisWsHub(auth=_make_auth(), domain="real", ws_enabled=True, sleep=AsyncMock())
+        hub._ensure_running = lambda: None          # don't spawn the real connect loop
+        hub._safe_send_sub = AsyncMock()
+        fake_ws = MagicMock()
+        fake_ws.closed = False
+        hub._ws = fake_ws                           # simulate an already-open socket
+        h = AsyncMock()
+        await hub.register("H0UNASP0", "005930", h)   # new tuple while live -> one subscribe
+        await hub.register("H0UNASP0", "005930", h)   # duplicate tuple -> NO extra subscribe
+        self.assertEqual(1, hub._safe_send_sub.await_count)
+        self.assertEqual(("H0UNASP0", "005930", "1"), hub._safe_send_sub.await_args_list[0].args)
+        await hub.register("H0UNASP0", "000660", h)   # 2nd symbol, same tr_id -> new -> subscribe
+        self.assertEqual(2, hub._safe_send_sub.await_count)
+
     async def test_unregister_drops_handler_only_when_last_key_gone(self):
         hub = KisWsHub(auth=_make_auth(), domain="real", ws_enabled=True, sleep=AsyncMock())
         h = AsyncMock()
