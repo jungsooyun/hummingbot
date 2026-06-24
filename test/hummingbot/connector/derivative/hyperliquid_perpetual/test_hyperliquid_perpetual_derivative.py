@@ -400,6 +400,102 @@ class HyperliquidPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpe
         self.assertNotIn("OLD", self.exchange.available_balances)
         self.assertNotIn("OLD", self.exchange.get_all_balances())
 
+    @aioresponses()
+    def test_update_balances_uses_spot_when_abstraction_mode_unresolved(self, mock_api):
+        # JEP-209: when the userAbstraction lookup cannot be resolved (starved under
+        # multi-symbol /info load -> non-string/None), a unified account has 0 perp
+        # `withdrawable` but free spot USDC. The connector must report the spot balance,
+        # not 0, otherwise the maker leg is falsely INSUFFICIENT_BALANCE.
+        account_response = deepcopy(self.balance_request_mock_response_for_base_and_quote)
+        account_response["withdrawable"] = "0.0"
+        account_response["crossMarginSummary"]["accountValue"] = "0.0"  # real unified account: empty perp wallet
+        spot_response = {
+            "balances": [
+                {"coin": "USDC", "token": 0, "hold": "1217.0", "total": "3554.0", "entryNtl": "0.0"},
+            ]
+        }
+        self._configure_balance_response(
+            response=account_response,
+            abstraction_response={"unexpected": "payload"},  # non-string -> mode unresolved (None)
+            spot_response=spot_response,
+            mock_api=mock_api,
+        )
+
+        self.async_run_with_timeout(self.exchange._update_balances())
+
+        available_balances = self.exchange.available_balances
+        total_balances = self.exchange.get_all_balances()
+        self.assertEqual(Decimal("2337.0"), available_balances[self.quote_asset])
+        self.assertEqual(Decimal("3554.0"), total_balances[self.quote_asset])
+        # mode stays unresolved (not cached) — fallback is a per-poll safety net.
+        self.assertIsNone(self.exchange._user_abstraction_mode)
+
+    @aioresponses()
+    def test_update_balances_unresolved_falls_back_to_withdrawable_without_spot_usdc(self, mock_api):
+        # JEP-209: abstraction unresolved AND no spot USDC -> keep the legacy perp
+        # `withdrawable` (correct for a genuine legacy account whose funds sit in the perp
+        # wallet). Guards the unified-safe fallback against breaking legacy accounts.
+        account_response = deepcopy(self.balance_request_mock_response_for_base_and_quote)
+        spot_response = {
+            "balances": [
+                {"coin": "PURR", "token": 1, "hold": "0", "total": "2000", "entryNtl": "0.0"},
+            ]
+        }
+        self._configure_balance_response(
+            response=account_response,
+            abstraction_response={"unexpected": "payload"},
+            spot_response=spot_response,
+            mock_api=mock_api,
+        )
+
+        self.async_run_with_timeout(self.exchange._update_balances())
+
+        self.assertEqual(Decimal("13104.514502"), self.exchange.available_balances[self.quote_asset])
+        self.assertEqual(Decimal("13104.514502"), self.exchange.get_all_balances()[self.quote_asset])
+
+    @aioresponses()
+    def test_update_balances_unresolved_keeps_withdrawable_when_perp_funded(self, mock_api):
+        # JEP-209 (review F1): a genuine legacy account funds the PERP wallet
+        # (crossMarginSummary.accountValue > 0, withdrawable > 0). Even if the abstraction mode is
+        # unresolved AND spot USDC is present, the spot fallback must NOT fire — spot USDC is not
+        # perp margin for a legacy account, so over-reporting it could submit unfunded orders.
+        account_response = deepcopy(self.balance_request_mock_response_for_base_and_quote)
+        account_response["crossMarginSummary"]["accountValue"] = "500.0"
+        account_response["withdrawable"] = "500.0"
+        spot_response = {
+            "balances": [
+                {"coin": "USDC", "token": 0, "hold": "0.0", "total": "9999.0", "entryNtl": "0.0"},
+            ]
+        }
+        self._configure_balance_response(
+            response=account_response,
+            abstraction_response={"unexpected": "payload"},  # unresolved (None)
+            spot_response=spot_response,
+            mock_api=mock_api,
+        )
+
+        self.async_run_with_timeout(self.exchange._update_balances())
+
+        # perp wallet is funded -> use withdrawable, NOT the 9999 spot USDC.
+        self.assertEqual(Decimal("500.0"), self.exchange.available_balances[self.quote_asset])
+
+    def test_update_balances_unresolved_spot_fetch_failure_falls_back_to_withdrawable(self):
+        # JEP-209 (review F2/F3): under real /info 429 pressure the follow-up spotClearinghouseState
+        # request can also fail. The spot fetch must be caught so the balance poll degrades to the
+        # legacy perp `withdrawable` instead of raising out of _update_balances.
+        account_response = deepcopy(self.balance_request_mock_response_for_base_and_quote)
+        api_post_mock = AsyncMock(side_effect=[
+            account_response,                  # clearinghouseState
+            {"unexpected": "payload"},         # userAbstraction -> non-string -> mode unresolved
+            IOError("HTTP 429 rate limited"),  # spotClearinghouseState raises
+        ])
+        self.exchange._api_post = api_post_mock
+
+        self.async_run_with_timeout(self.exchange._update_balances())
+
+        self.assertEqual(Decimal("13104.514502"), self.exchange.available_balances[self.quote_asset])
+        self.assertEqual(3, api_post_mock.await_count)
+
     def configure_failed_set_position_mode(
             self,
             position_mode: PositionMode,

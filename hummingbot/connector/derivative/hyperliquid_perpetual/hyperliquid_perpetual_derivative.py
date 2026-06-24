@@ -69,6 +69,9 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         self._dex_markets: List[Dict] = []  # Store HIP-3 DEX market info separately
         self._is_hip3_market: Dict[str, bool] = {}  # Track which coins are HIP-3
         self._user_abstraction_mode: Optional[str] = None
+        # JEP-209: latch so the unified-account-safe balance fallback warns once per degraded
+        # episode (abstraction mode unresolved) instead of every balance poll.
+        self._abstraction_fallback_warned: bool = False
         # Builder code (HGP-87). Fee starts at 0 and is resolved at startup (_initialize_builder_fee).
         self._builder_address: str = CONSTANTS.FOUNDATION_BUILDER_ADDRESS.lower()
         self._builder_fee_tenths_bps: int = 0
@@ -1159,36 +1162,74 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
                 self._account_balances.pop(asset_name, None)
                 self._account_available_balances.pop(asset_name, None)
 
-        use_spot_balances = await self._uses_spot_balances()
+        abstraction_mode = await self._get_user_abstraction_mode()
+        use_spot_balances = abstraction_mode in CONSTANTS.SPOT_BALANCE_ABSTRACTION_MODES
+        abstraction_unresolved = abstraction_mode is None
+        perp_account_value = Decimal((account_info.get("crossMarginSummary") or {}).get("accountValue", "0"))
+
+        spot_usdc_balance = None
+        if use_spot_balances or abstraction_unresolved:
+            # JEP-209: wrap the spot fetch+parse so a failure (e.g. the same /info 429 that
+            # starved the abstraction lookup, or a malformed response) degrades to the legacy
+            # perp `withdrawable` path below instead of raising out of the balance poll.
+            try:
+                spot_account_info = await self._api_post(path_url=CONSTANTS.ACCOUNT_INFO_URL,
+                                                         data={"type": CONSTANTS.SPOT_USER_STATE_TYPE,
+                                                               "user": self.hyperliquid_perpetual_address},
+                                                         )
+                spot_usdc_balance = next(
+                    (balance_entry for balance_entry in spot_account_info["balances"]
+                     if balance_entry["coin"].upper() == "USDC"),
+                    None,
+                )
+            except Exception:
+                self.logger().debug("Hyperliquid spot balance fetch failed.", exc_info=True)
+                spot_usdc_balance = None
+
+        spot_total = None
+        spot_free = None
+        if spot_usdc_balance is not None:
+            try:
+                spot_total = Decimal(spot_usdc_balance["total"])
+                spot_free = spot_total - Decimal(spot_usdc_balance.get("hold", "0"))
+            except Exception:
+                spot_total = None
+                spot_free = None
+        spot_usdc_present = spot_total is not None and spot_total > Decimal("0")
 
         if use_spot_balances:
-            spot_account_info = await self._api_post(path_url=CONSTANTS.ACCOUNT_INFO_URL,
-                                                     data={"type": CONSTANTS.SPOT_USER_STATE_TYPE,
-                                                           "user": self.hyperliquid_perpetual_address},
-                                                     )
-
-            usdc_balance = next(
-                (balance_entry for balance_entry in spot_account_info["balances"]
-                 if balance_entry["coin"].upper() == "USDC"),
-                None,
-            )
-            if usdc_balance is None:
+            # Confirmed unified / portfolio-margin account: spot USDC is the authoritative
+            # cross-spot-and-perp trading balance.
+            if spot_total is None:
                 self._account_balances.pop(quote, None)
                 self._account_available_balances.pop(quote, None)
             else:
-                total_balance = Decimal(usdc_balance["total"])
-                free_balance = total_balance - Decimal(usdc_balance["hold"])
-                self._account_balances[quote] = total_balance
-                self._account_available_balances[quote] = free_balance
+                self._account_balances[quote] = spot_total
+                self._account_available_balances[quote] = spot_free
+        elif abstraction_unresolved and spot_usdc_present and perp_account_value <= Decimal("0"):
+            # JEP-209 unified-account-safe fallback: the abstraction mode could not be resolved
+            # (e.g. the userAbstraction lookup is starved under multi-symbol /info load). Only
+            # override the legacy perp source when the perp account is EMPTY (accountValue <= 0,
+            # so `withdrawable` is ~0 anyway) AND spot USDC is present — i.e. the collateral lives
+            # in the spot wallet. A genuine legacy account funds the perp wallet (accountValue > 0)
+            # and therefore keeps the `withdrawable` path; this fallback can only raise a 0 to the
+            # real spot balance, never over-report a funded perp account.
+            self._account_balances[quote] = spot_total
+            self._account_available_balances[quote] = spot_free
+            if not self._abstraction_fallback_warned:
+                self.logger().warning(
+                    "Hyperliquid user abstraction mode unresolved; using spot USDC balance "
+                    "(unified-account-safe) until it resolves. See JEP-209."
+                )
+                self._abstraction_fallback_warned = True
         else:
-            self._account_balances[quote] = Decimal(account_info["crossMarginSummary"]["accountValue"])
-            self._account_available_balances[quote] = Decimal(account_info["withdrawable"])
+            self._account_balances[quote] = perp_account_value
+            self._account_available_balances[quote] = Decimal(account_info.get("withdrawable", "0"))
 
-    async def _uses_spot_balances(self) -> bool:
-        abstraction_mode = await self._get_user_abstraction_mode()
-        if abstraction_mode in CONSTANTS.SPOT_BALANCE_ABSTRACTION_MODES:
-            return True
-        return False
+        if abstraction_mode is not None:
+            # Mode resolved (unified or legacy) — clear the degraded-fallback warning latch so a
+            # later unresolved episode warns once again.
+            self._abstraction_fallback_warned = False
 
     async def _get_user_abstraction_mode(self) -> Optional[str]:
         try:
