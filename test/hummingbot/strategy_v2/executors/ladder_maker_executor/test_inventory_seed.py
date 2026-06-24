@@ -20,6 +20,7 @@ def test_seed_fail_closed_on_half_read_perp_empty_spot_present():
     maker = ex.connectors[ex.maker_connector]
     maker.account_positions = {}
     ex._seed_readiness_timeout = 0
+    ex._seed_grace_seconds = 0  # JEP-210: no retry grace -> fail-close on the first miss
 
     async def update_positions():
         return None
@@ -57,6 +58,7 @@ def test_seed_fail_closed_on_half_read_perp_present_spot_zero():
     ex = _make_observe_executor(adopt=True)
     hedge = ex.connectors[ex.hedge_connector]
     hedge.get_balance = lambda asset: Decimal("0")
+    ex._seed_grace_seconds = 0  # JEP-210: no retry grace -> fail-close on the first miss
 
     asyncio.run(ex._seed_inventory_from_connector())
 

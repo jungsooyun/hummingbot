@@ -109,6 +109,8 @@ def test_seed_flag_off_returns_before_touching_ledgers():
 def test_seed_flag_on_empty_after_fresh_fail_closes_without_mutating_ledgers():
     h = _SeedHarness(adopt=True)
     h.connectors[h.hedge_connector].get_balance = lambda asset: ZERO
+    h._seed_readiness_timeout = 0
+    h._seed_grace_seconds = 0  # JEP-210: collapse the retry grace so an empty seed fail-closes at once
 
     asyncio.run(h._seed_inventory_from_connector())
 
@@ -316,6 +318,7 @@ def test_seed_fail_closes_on_not_ready_timeout_and_resting_orders():
     h.connectors[h.maker_connector].ready = False
     h.connectors[h.hedge_connector].get_balance = lambda asset: Decimal("1")
     h._seed_readiness_timeout = 0
+    h._seed_grace_seconds = 0  # JEP-210: no retry grace -> fail-close on the first not-ready miss
 
     asyncio.run(h._seed_inventory_from_connector())
 
@@ -324,7 +327,17 @@ def test_seed_fail_closes_on_not_ready_timeout_and_resting_orders():
     assert h._maker_sell_base == ZERO
 
     h = _SeedHarness(adopt=True)
+    h.connectors[h.maker_connector].account_positions = {  # fresh -> readiness passes, reach resting check
+        "short": SimpleNamespace(
+            trading_pair=h.maker_trading_pair,
+            position_side=PositionSide.SHORT,
+            amount=Decimal("1"),
+            entry_price=Decimal("101"),
+        )
+    }
     h.connectors[h.hedge_connector].get_balance = lambda asset: Decimal("1")
+    h._seed_readiness_timeout = 0
+    h._seed_grace_seconds = 0
 
     async def _open_orders(pair):
         return [SimpleNamespace(client_order_id="resting")]
@@ -340,7 +353,17 @@ def test_seed_fail_closes_on_not_ready_timeout_and_resting_orders():
 def test_seed_fail_closes_on_hedge_position_mode():
     h = _SeedHarness(adopt=True)
     h.connectors[h.maker_connector].position_mode = PositionMode.HEDGE
+    h.connectors[h.maker_connector].account_positions = {  # fresh -> readiness passes, reach the HEDGE check
+        "x": SimpleNamespace(
+            trading_pair=h.maker_trading_pair,
+            position_side=PositionSide.SHORT,
+            amount=Decimal("1"),
+            entry_price=Decimal("100"),
+        )
+    }
     h.connectors[h.hedge_connector].get_balance = lambda asset: Decimal("1")
+    h._seed_readiness_timeout = 0
+    # HEDGE mode is an unrecoverable config error -> immediate permanent fail-close (no retry grace).
 
     asyncio.run(h._seed_inventory_from_connector())
 
@@ -378,3 +401,122 @@ def test_ladder_gates_close_when_seed_fail_closed_without_other_state():
     h._seed_fail_closed = True
 
     assert h._gates_open() is False
+
+
+def test_seed_pending_true_while_adopt_seed_in_progress():
+    # JEP-210: control_task suppresses quoting (every subclass) while _seed_pending() is true,
+    # so no opens are placed before the held inventory is recognized.
+    h = _SeedHarness(adopt=True)
+    h._seed_adopted = False
+    h._seed_fail_closed = False
+
+    assert h._seed_pending() is True
+
+
+def test_seed_pending_false_when_adopted_failclosed_or_adopt_off():
+    h = _SeedHarness(adopt=True)
+    h._seed_adopted = True
+    h._seed_fail_closed = False
+    assert h._seed_pending() is False
+
+    h._seed_adopted = False
+    h._seed_fail_closed = True
+    assert h._seed_pending() is False
+
+    h = _SeedHarness(adopt=False)
+    h._seed_adopted = False
+    h._seed_fail_closed = False
+    assert h._seed_pending() is False
+
+
+def test_seed_hedge_mode_fail_closes_immediately_even_with_cold_snapshots():
+    # JEP-210 (review F3): HEDGE position mode is unrecoverable -> fail-close on the FIRST tick,
+    # before the readiness wait / retry grace, even when snapshots are still cold (empty positions).
+    h = _SeedHarness(adopt=True)
+    h.connectors[h.maker_connector].position_mode = PositionMode.HEDGE
+    h.connectors[h.maker_connector].account_positions = {}
+    h.connectors[h.hedge_connector].get_balance = lambda asset: Decimal("1")
+
+    asyncio.run(h._seed_inventory_from_connector())
+
+    assert h._seed_fail_closed is True
+    assert getattr(h, "_seed_adopted", False) is False
+
+
+def test_seed_retries_when_update_positions_hangs_without_wedging():
+    # JEP-210 (review F2): a hung _update_positions REST call must time out and retry, not wedge
+    # the seed (which would leave _seed_adopting stuck and block the control loop forever).
+    h = _SeedHarness(adopt=True)
+    h.connectors[h.hedge_connector].get_balance = lambda asset: Decimal("1")
+    h._seed_op_timeout = 0.01
+
+    async def _hang(*args, **kwargs):
+        await asyncio.sleep(5)
+
+    h.connectors[h.maker_connector]._update_positions = _hang
+
+    asyncio.run(h._seed_inventory_from_connector())
+
+    assert h._seed_fail_closed is False
+    assert getattr(h, "_seed_adopted", False) is False
+    assert h._seed_adopting is False
+
+
+def test_seed_retries_on_transient_readiness_then_adopts():
+    # JEP-210: a cold-boot snapshot race (connector not ready / positions not yet populated)
+    # must NOT permanently fail-close adoption. The seed retries on the next control tick and
+    # adopts once the snapshot becomes fresh.
+    h = _SeedHarness(adopt=True)
+    h.connectors[h.hedge_connector].get_balance = lambda asset: Decimal("1")
+    h._seed_readiness_timeout = 0
+
+    # Tick 1: maker not ready yet (startup race) -> retry, NOT a permanent fail-close.
+    h.connectors[h.maker_connector].ready = False
+    asyncio.run(h._seed_inventory_from_connector())
+    assert h._seed_fail_closed is False
+    assert getattr(h, "_seed_adopted", False) is False
+    assert h._maker_sell_base == ZERO
+
+    # Tick 2: snapshot now fresh -> adopt the held position.
+    h.connectors[h.maker_connector].ready = True
+    h.connectors[h.maker_connector].account_positions = {
+        "short": SimpleNamespace(
+            trading_pair=h.maker_trading_pair,
+            position_side=PositionSide.SHORT,
+            amount=Decimal("1"),
+            entry_price=Decimal("101"),
+        )
+    }
+    asyncio.run(h._seed_inventory_from_connector())
+    assert h._seed_adopted is True
+    assert h._seed_fail_closed is False
+    assert h._maker_sell_base == Decimal("1")
+    assert h._hedge_buy_base == Decimal("1")
+
+
+def test_seed_fail_closes_after_grace_window_when_inventory_stays_empty():
+    # JEP-210: a genuinely empty adopt:true position still fail-closes, but only after the grace
+    # window expires -- not on the first transient miss (here: spot leg never lands).
+    h = _SeedHarness(adopt=True)
+    h.connectors[h.maker_connector].account_positions = {
+        "short": SimpleNamespace(
+            trading_pair=h.maker_trading_pair,
+            position_side=PositionSide.SHORT,
+            amount=Decimal("1"),
+            entry_price=Decimal("101"),
+        )
+    }
+    h.connectors[h.hedge_connector].get_balance = lambda asset: ZERO
+    h._seed_readiness_timeout = 0
+
+    # Within the grace window: retries, no permanent fail-close.
+    asyncio.run(h._seed_inventory_from_connector())
+    assert h._seed_fail_closed is False
+    assert getattr(h, "_seed_adopted", False) is False
+
+    # Grace exhausted -> fail-close, ledgers untouched.
+    h._seed_grace_seconds = 0
+    asyncio.run(h._seed_inventory_from_connector())
+    assert h._seed_fail_closed is True
+    assert h._maker_sell_base == ZERO
+    assert h._hedge_buy_base == ZERO

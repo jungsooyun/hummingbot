@@ -379,6 +379,14 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
     async def control_task(self):
         if self.status == RunnableStatus.RUNNING:
             await self._seed_inventory_from_connector()
+            if self._seed_pending():
+                # JEP-210: an adopt:true seed is still in progress (not yet adopted, not yet
+                # fail-closed). Do not quote -- otherwise the executor would place opens before
+                # recognizing the held inventory, over-exposing during the cold-boot retry grace.
+                # Lives here (base) so every subclass -- ladder AND A&S -- is covered.
+                self._cancel_all_maker()
+                self._process_hedges()
+                return
             self._evaluate_ws_staleness()
             if not self._gates_open():
                 self._cancel_all_maker()
@@ -1271,6 +1279,33 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self.close_type = CloseType.INSUFFICIENT_BALANCE
             self.stop()
 
+    # JEP-210: grace window for cold-boot seed retries before permanently fail-closing adoption,
+    # and a per-REST-op timeout so a hung connector call cannot wedge the seed (and the control loop).
+    _SEED_GRACE_SECONDS = 180.0
+    _SEED_OP_TIMEOUT = 10.0
+
+    def _seed_pending(self) -> bool:
+        # JEP-210: True while an adopt:true seed has neither adopted nor permanently fail-closed.
+        # control_task() uses this to suppress quoting during the cold-boot retry grace window.
+        return (
+            getattr(self.config, "adopt_existing_inventory", False)
+            and not getattr(self, "_seed_adopted", False)
+            and not getattr(self, "_seed_fail_closed", False)
+        )
+
+    def _note_seed_retry(self) -> None:
+        # JEP-210: a transient seed precondition (connector snapshots not fresh yet, a balance
+        # poll not landed, a get_open_orders blip, _update_positions error) must NOT permanently
+        # fail-close adoption -- the cold-boot startup race resolves within seconds once the
+        # control loop runs, and the seed is re-attempted on the next control tick. Only fail-close
+        # after a grace window so a genuinely empty adopt:true position still stops quoting.
+        now = time.monotonic()
+        if getattr(self, "_seed_first_attempt_ts", None) is None:
+            self._seed_first_attempt_ts = now
+        grace = getattr(self, "_seed_grace_seconds", self._SEED_GRACE_SECONDS)
+        if now - self._seed_first_attempt_ts >= grace:
+            self._seed_fail_closed = True
+
     async def _seed_inventory_from_connector(self) -> None:
         if not getattr(self.config, "adopt_existing_inventory", False):
             return
@@ -1286,31 +1321,41 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             or getattr(self, "_seed_adopting", False)
         ):
             return
+        maker = self.connectors[self.maker_connector]
+        if getattr(maker, "position_mode", PositionMode.ONEWAY) == PositionMode.HEDGE:
+            # JEP-210: HEDGE position mode is an unrecoverable config error -> fail-close
+            # immediately, before the retry grace and regardless of snapshot freshness.
+            self._seed_fail_closed = True
+            return
         self._seed_adopting = True
         try:
-            update_positions = getattr(self.connectors[self.maker_connector], "_update_positions", None)
+            op_timeout = getattr(self, "_seed_op_timeout", self._SEED_OP_TIMEOUT)
+            update_positions = getattr(maker, "_update_positions", None)
             if callable(update_positions):
                 try:
                     positions = update_positions()
                     if inspect.isawaitable(positions):
-                        await positions
+                        # JEP-210: bound the REST call so a hang cannot wedge the seed (which would
+                        # leave _seed_adopting stuck and block control_task forever).
+                        await asyncio.wait_for(positions, timeout=op_timeout)
                 except Exception:
-                    self._seed_fail_closed = True
+                    self._note_seed_retry()
                     return
 
             if not await self._await_connector_readiness():
-                self._seed_fail_closed = True
+                self._note_seed_retry()
                 return
             if await self._has_resting_orders():
-                self._seed_fail_closed = True
+                self._note_seed_retry()
                 return
 
             perp_signed, perp_entry_price = self._read_perp_position_signed()
             if getattr(self, "_seed_fail_closed", False):
+                # Unrecoverable (e.g. HEDGE position mode) -- permanent, set by the reader.
                 return
             spot_base = self._read_spot_balance_base()
             if perp_signed == ZERO or spot_base == ZERO:
-                self._seed_fail_closed = True
+                self._note_seed_retry()
                 return
 
             self._apply_seed(perp_signed, spot_base, perp_entry_price)
@@ -1403,7 +1448,10 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             try:
                 orders = get_open_orders(trading_pair)
                 if inspect.isawaitable(orders):
-                    orders = await orders
+                    # JEP-210: bound the REST call (a hang here would otherwise wedge the seed).
+                    orders = await asyncio.wait_for(
+                        orders, timeout=getattr(self, "_seed_op_timeout", self._SEED_OP_TIMEOUT)
+                    )
             except Exception:
                 return True
             if orders:
