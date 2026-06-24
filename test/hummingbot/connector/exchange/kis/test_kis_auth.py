@@ -629,6 +629,49 @@ class TestKisAuth(unittest.TestCase):
         self.assertIn("openapivts.koreainvestment.com:29443", captured["calls"][0]["url"])
         self.assertIn("/oauth2/Approval", captured["calls"][0]["url"])
 
+    # ------------------------------------------------------------------
+    # JEP-206: invalidate_token (error-driven re-auth primitive)
+    # ------------------------------------------------------------------
+
+    def test_invalidate_token_zeroes_expiry_and_forces_refetch(self):
+        """invalidate_token nulls the cached token and zeroes the expiry under the lock, so the
+        very next _get_access_token falls through its TTL guard and POSTs oauth2/tokenP for a new
+        token — even though the OLD expiry was still in the future by the local clock (the exact
+        server-side-early-expiry / EGW00123 deadlock condition)."""
+        auth = self._new_auth()
+        auth._access_token = "live_token"
+        auth._token_expires_at = time.time() + 86400   # local clock still says VALID
+        future = (datetime.now() + timedelta(hours=23)).strftime("%Y-%m-%d %H:%M:%S")
+        session_cls, captured = _make_mock_session(
+            lambda url, json=None, **kw: _make_mock_response(
+                {"access_token": "reissued_token", "access_token_token_expired": future}
+            )
+        )
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(auth.invalidate_token())
+        self.assertIsNone(auth._access_token)
+        self.assertEqual(0.0, auth._token_expires_at)
+        with patch("aiohttp.ClientSession", session_cls):
+            token = loop.run_until_complete(auth._get_access_token())
+        self.assertEqual("reissued_token", token)
+        self.assertEqual(1, len(captured["calls"]),
+                         "invalidated token must force exactly one tokenP re-issue")
+
+    def test_invalidate_token_single_flight_under_lock(self):
+        """invalidate_token mutates the token store under _token_lock (mirroring _get_access_token),
+        so concurrent invalidations are serialized and leave a consistent zeroed state — no TOCTOU."""
+        auth = self._new_auth()
+        auth._access_token = "x"
+        auth._token_expires_at = time.time() + 86400
+
+        async def _drive():
+            await asyncio.gather(auth.invalidate_token(), auth.invalidate_token())
+
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(_drive())
+        self.assertIsNone(auth._access_token)
+        self.assertEqual(0.0, auth._token_expires_at)
+
 
 class TestKisAuthDiskPersistence(unittest.TestCase):
     """Tests for the on-disk persistence of the KIS daily OAuth token and the

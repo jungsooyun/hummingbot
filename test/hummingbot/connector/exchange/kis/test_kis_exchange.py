@@ -2277,3 +2277,210 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
             price=int(self.expected_partial_fill_price),
             ord_qty=partial * 2,  # real partial: filled < ordered -> PARTIALLY_FILLED
         )
+
+    # ------------------------------------------------------------------
+    # JEP-206: EGW00123 expired-token deadlock break
+    # (check_network refresh + single retry; EGW00215 stays on the debounce;
+    #  >=60s forced-reauth cooldown; classify on structured msg_cd + buried-500 substring)
+    # ------------------------------------------------------------------
+
+    def _egw_ioerror(self, code: str) -> IOError:
+        # Mirrors the live HTTP-500 surface: the EGW code is buried as a SUBSTRING
+        # inside the IOError message the shared REST layer raises on a 500. A plain
+        # IOError (no .msg_cd attr) forces classification down the substring fallback.
+        body = json.dumps(self._rejection_response("1", code, f"err {code}"))
+        return IOError(
+            f"Error executing request GET .../inquire-balance. "
+            f"HTTP status is 500. Error: {body}"
+        )
+
+    def _token_post_handler(self, fresh: str = "fresh_token") -> dict:
+        from datetime import datetime as _dt, timedelta as _td
+        future = (_dt.now() + _td(hours=23)).strftime("%Y-%m-%d %H:%M:%S")
+        return {"access_token": fresh, "access_token_token_expired": future}
+
+    # --- injected-error branch tests (logic) -------------------------------------
+
+    async def test_check_network_egw00123_refreshes_token_and_recovers(self):
+        """JEP-206: a SUSTAINED expired-token signal (EGW00123) must NOT deadlock at
+        NOT_CONNECTED. check_network invalidates the cached token and retries the probe
+        ONCE; the retry succeeds (fresh token) -> CONNECTED, counter reset, WS hub stays
+        up. RED before the fix: today both the probe and its (nonexistent) retry funnel
+        into the debounce; after 3x consecutive it flips NOT_CONNECTED -> deadlock."""
+        from unittest.mock import patch, AsyncMock
+        ex = self._authed_exchange()
+        ex._auth.invalidate_token = AsyncMock()
+        # First call: expired-token error. Retry (2nd call): success (returns None).
+        probe = AsyncMock(side_effect=[self._egw_ioerror(CONSTANTS.KIS_ERR_TOKEN_EXPIRED), None])
+        with patch.object(ex, "_make_network_check_request", new=probe):
+            status = await ex.check_network()
+        self.assertEqual(NetworkStatus.CONNECTED, status)
+        self.assertEqual(0, ex._net_check_consec_failures)       # no failure counted on recovery
+        ex._auth.invalidate_token.assert_awaited_once()          # token was force-refreshed
+        self.assertEqual(2, probe.await_count)                   # probe retried exactly once
+
+    async def test_check_network_egw00123_retry_also_fails_counts_one(self):
+        """JEP-206: if the refresh+retry ALSO fails, it counts as exactly ONE failure and
+        falls through to the unchanged JEP-204 debounce (stays CONNECTED on the first, not
+        NOT_CONNECTED). Guards against double-counting the probe + the retry."""
+        from unittest.mock import patch, AsyncMock
+        ex = self._authed_exchange()
+        ex._auth.invalidate_token = AsyncMock()
+        probe = AsyncMock(side_effect=self._egw_ioerror(CONSTANTS.KIS_ERR_TOKEN_EXPIRED))
+        with patch.object(ex, "_make_network_check_request", new=probe):
+            status = await ex.check_network()
+        self.assertEqual(NetworkStatus.CONNECTED, status)        # debounce still tolerates the 1st
+        self.assertEqual(1, ex._net_check_consec_failures)       # counted exactly once (not twice)
+        ex._auth.invalidate_token.assert_awaited_once()
+        self.assertEqual(2, probe.await_count)                   # probe + one retry
+
+    async def test_check_network_egw00123_reauth_cooldown_skips_second_refresh(self):
+        """JEP-206 (review fix #2/#4): a genuinely revoked appkey keeps returning EGW00123.
+        The first cycle re-auths once; a second cycle WITHIN the 60s cooldown must NOT re-auth
+        again (no tokenP thrash) and instead applies the plain debounce. So invalidate_token is
+        awaited exactly ONCE across two cycles, and the probe is hit probe+retry (cycle 1) +
+        probe-only (cycle 2) = 3 times. Counter advances to 2 (one failure per cycle)."""
+        from unittest.mock import patch, AsyncMock
+        ex = self._authed_exchange()
+        ex._auth.invalidate_token = AsyncMock()
+        probe = AsyncMock(side_effect=self._egw_ioerror(CONSTANTS.KIS_ERR_TOKEN_EXPIRED))
+        with patch.object(ex, "_make_network_check_request", new=probe):
+            await ex.check_network()   # cycle 1: re-auth + retry (retry fails) -> count 1
+            await ex.check_network()   # cycle 2: within cooldown -> no re-auth -> count 2
+        self.assertEqual(1, ex._auth.invalidate_token.await_count)  # cooldown blocked the 2nd re-auth
+        self.assertEqual(3, probe.await_count)                      # 2 (cycle1) + 1 (cycle2)
+        self.assertEqual(2, ex._net_check_consec_failures)
+
+    async def test_check_network_egw00215_throttle_does_not_refresh(self):
+        """JEP-206: EGW00215 (per-second throttle) is a TRANSIENT non-auth failure — it must
+        NOT force a token refresh (which would hammer the 1/min tokenP limit) and must stay on
+        the existing debounce. First throttle stays CONNECTED, no invalidate_token call, no retry."""
+        from unittest.mock import patch, AsyncMock
+        ex = self._authed_exchange()
+        ex._auth.invalidate_token = AsyncMock()
+        probe = AsyncMock(side_effect=self._egw_ioerror(CONSTANTS.KIS_ERR_THROTTLE))
+        with patch.object(ex, "_make_network_check_request", new=probe):
+            status = await ex.check_network()
+        self.assertEqual(NetworkStatus.CONNECTED, status)        # debounced as transient
+        self.assertEqual(1, ex._net_check_consec_failures)
+        ex._auth.invalidate_token.assert_not_awaited()           # NO refresh on throttle
+        self.assertEqual(1, probe.await_count)                   # NO retry on throttle
+
+    # --- REAL-PATH tests (review fix #3): drive the genuine
+    #     check_network -> _make_network_check_request -> _api_get chain via aioresponses,
+    #     mocking ONLY the tokenP POST. These prove the LIVE error string/field is actually
+    #     classifiable — not just a hand-crafted IOError the matcher was written to catch.
+
+    @aioresponses()
+    async def test_check_network_http200_egw00123_real_path_refreshes(self, mock_api):
+        """JEP-206 review #2/#6: the HTTP-200 + rt_cd=1 expired-token variant carries the code
+        ONLY in msg_cd (msg1 is Korean text with no 'EGW00123' substring). The connector's own
+        raise must surface msg_cd structurally so check_network classifies it, re-auths via the
+        REAL _api_get -> rest_authenticate -> _get_access_token -> tokenP POST chain, and recovers.
+        RED before the fix: the old raise dropped msg_cd, so EGW00123 was invisible here."""
+        from hummingbot.connector.exchange.kis.kis_auth import _REST_URL, _TOKEN_PATH
+        ex = self._authed_exchange()
+        import tempfile as _tf, shutil as _sh
+        _d = _tf.mkdtemp(prefix="kis_reauth_iso_"); self.addCleanup(_sh.rmtree, _d, True)
+        ex._auth._token_cache_path = _tf.mkstemp(dir=_d, suffix=".json")[1]
+        # Server has invalidated the token early; local clock still says valid.
+        ex._auth._access_token = "server_dead_token"
+        ex._auth._token_expires_at = time.time() + 86400
+        balance_regex = re.compile(f"^{re.escape(self.balance_url)}.*")
+        # Probe #1 (HTTP 200, rt_cd=1, msg_cd=EGW00123, no code in msg1) -> raises KisNetworkCheckError.
+        mock_api.get(
+            balance_regex,
+            body=json.dumps({
+                "rt_cd": "1",
+                "msg_cd": CONSTANTS.KIS_ERR_TOKEN_EXPIRED,
+                "msg1": "기간이 만료된 token 입니다.",
+            }),
+        )
+        # Forced re-auth: tokenP POST returns a fresh token.
+        mock_api.post(
+            f"{_REST_URL}/{_TOKEN_PATH}",
+            body=json.dumps(self._token_post_handler()),
+        )
+        # Probe #2 (retry) succeeds.
+        mock_api.get(
+            balance_regex,
+            body=json.dumps(self.network_status_request_successful_mock_response),
+        )
+        status = await ex.check_network()
+        self.assertEqual(NetworkStatus.CONNECTED, status)
+        self.assertEqual("fresh_token", ex._auth._access_token)  # token was actually re-issued
+        self.assertEqual(0, ex._net_check_consec_failures)
+
+    @aioresponses()
+    async def test_check_network_http500_egw00123_real_path_refreshes(self, mock_api):
+        """JEP-206 review #3: the live incident shape — EGW00123 returned as HTTP 500 with the
+        code BURIED in the IOError body string (no structured msg_cd on the raised exception).
+        The substring fallback must classify it, re-auth via the real chain, and recover."""
+        from hummingbot.connector.exchange.kis.kis_auth import _REST_URL, _TOKEN_PATH
+        ex = self._authed_exchange()
+        import tempfile as _tf, shutil as _sh
+        _d = _tf.mkdtemp(prefix="kis_reauth_iso_"); self.addCleanup(_sh.rmtree, _d, True)
+        ex._auth._token_cache_path = _tf.mkstemp(dir=_d, suffix=".json")[1]
+        ex._auth._access_token = "server_dead_token"
+        ex._auth._token_expires_at = time.time() + 86400
+        balance_regex = re.compile(f"^{re.escape(self.balance_url)}.*")
+        # Probe #1 (HTTP 500, EGW00123 in body) -> shared REST layer raises plain IOError w/ body text.
+        mock_api.get(
+            balance_regex,
+            status=500,
+            body=json.dumps(self._rejection_response(
+                "1", CONSTANTS.KIS_ERR_TOKEN_EXPIRED, "기간이 만료된 token 입니다.")),
+        )
+        mock_api.post(
+            f"{_REST_URL}/{_TOKEN_PATH}",
+            body=json.dumps(self._token_post_handler()),
+        )
+        # Probe #2 (retry) succeeds.
+        mock_api.get(
+            balance_regex,
+            body=json.dumps(self.network_status_request_successful_mock_response),
+        )
+        status = await ex.check_network()
+        self.assertEqual(NetworkStatus.CONNECTED, status)
+        self.assertEqual("fresh_token", ex._auth._access_token)
+        self.assertEqual(0, ex._net_check_consec_failures)
+
+    @aioresponses()
+    async def test_check_network_http500_egw00215_real_path_no_refresh(self, mock_api):
+        """JEP-206 review #3: real-path EGW00215 throttle (HTTP 500) must NOT re-auth — the token
+        is untouched and the failure stays on the debounce (CONNECTED on the first). No tokenP POST
+        is registered, so a spurious re-auth would raise an aioresponses 'no mock' error."""
+        ex = self._authed_exchange()
+        ex._auth._access_token = "live_token"
+        ex._auth._token_expires_at = time.time() + 86400
+        balance_regex = re.compile(f"^{re.escape(self.balance_url)}.*")
+        mock_api.get(
+            balance_regex,
+            status=500,
+            body=json.dumps(self._rejection_response(
+                "1", CONSTANTS.KIS_ERR_THROTTLE, "초당 거래건수를 초과하였습니다.")),
+            repeat=True,
+        )
+        status = await ex.check_network()
+        self.assertEqual(NetworkStatus.CONNECTED, status)        # transient -> debounced
+        self.assertEqual(1, ex._net_check_consec_failures)
+        self.assertEqual("live_token", ex._auth._access_token)   # token NOT re-issued
+
+    # --- structured-error + invalidate primitive ---------------------------------
+
+    def test_make_network_check_request_raises_with_msg_cd_attr(self):
+        """JEP-206 review #2: the HTTP-200 rt_cd!=0 raise must carry msg_cd as a structured
+        attribute (KisNetworkCheckError) so check_network classifies on the field, not free text."""
+        from hummingbot.connector.exchange.kis.kis_exchange import KisNetworkCheckError
+        err = KisNetworkCheckError("boom", msg_cd=CONSTANTS.KIS_ERR_TOKEN_EXPIRED)
+        self.assertEqual(CONSTANTS.KIS_ERR_TOKEN_EXPIRED, err.msg_cd)
+        self.assertIsInstance(err, IOError)   # still an IOError -> base fail-closed paths unchanged
+
+    async def test_invalidate_token_forces_refetch(self):
+        """KisAuth.invalidate_token zeroes the cached token + expiry so the next
+        _get_access_token re-issues (the primitive the check_network fix relies on)."""
+        ex = self._authed_exchange()
+        self.assertIsNotNone(ex._auth._access_token)
+        await ex._auth.invalidate_token()
+        self.assertIsNone(ex._auth._access_token)
+        self.assertEqual(0.0, ex._auth._token_expires_at)

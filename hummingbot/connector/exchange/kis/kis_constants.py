@@ -104,6 +104,21 @@ DOMESTIC_STOCK_ORDER_DETAIL_PATH = "uapi/domestic-stock/v1/trading/inquire-daily
 DOMESTIC_STOCK_ORDER_DETAIL_TR_ID = "TTTC8001R"
 
 # --------------------------------------------------------------------------- #
+# KIS gateway error codes (msg_cd) — auth-relevant subset
+# --------------------------------------------------------------------------- #
+# EGW00123 "기간이 만료된 token 입니다": the access token expired SERVER-SIDE while the
+#   local TTL clock still believes it is valid. Recoverable re-auth signal: force a
+#   token refresh + retry the probe once. KIS surfaces this BOTH as HTTP 200 + rt_cd=1
+#   (msg_cd present as a structured field) AND as HTTP 500 (code buried in the body
+#   string), so callers classify on the STRUCTURED msg_cd when available and fall back
+#   to a qualified substring on the buried HTTP-500 shape.
+KIS_ERR_TOKEN_EXPIRED = "EGW00123"
+# EGW00215 "초당 거래건수 초과": per-second throttle. TRANSIENT, NOT an auth failure — it
+#   must NEVER trigger a token refresh (would hammer the 1/min tokenP issuance limit);
+#   let the JEP-204 check_network debounce absorb it.
+KIS_ERR_THROTTLE = "EGW00215"
+
+# --------------------------------------------------------------------------- #
 # WebSocket TR_IDs — Domestic Stock
 # --------------------------------------------------------------------------- #
 WS_DOMESTIC_STOCK_ORDERBOOK_TR_ID = "H0STASP0"   # 국내주식 실시간호가 (KRX)

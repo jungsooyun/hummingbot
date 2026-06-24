@@ -30,6 +30,18 @@ from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
+class KisNetworkCheckError(IOError):
+    """Raised by ``_make_network_check_request`` on an HTTP-200 KIS logical error
+    (rt_cd != "0"). Carries the structured ``msg_cd`` so ``check_network`` can
+    classify an EGW00123 expired-token signal (which appears ONLY in msg_cd on the
+    HTTP-200 shape — msg1 has no code) without fragile free-text matching (JEP-206).
+    """
+
+    def __init__(self, message: str, msg_cd: str = "") -> None:
+        super().__init__(message)
+        self.msg_cd = msg_cd
+
+
 class KisExchange(ExchangePyBase):
     """
     KisExchange connects with Korea Investment & Securities (KIS) exchange
@@ -54,6 +66,12 @@ class KisExchange(ExchangePyBase):
     # NOT_CONNECTED. Debounces transient REST blips so one balance-probe timeout does not
     # tear down the healthy WS hub (the JEP-134 WS-staleness gate is the fast safety net).
     _NET_CHECK_FAILURE_THRESHOLD = 3
+    # JEP-206: minimum interval between two FORCED token re-auths driven by an EGW00123
+    # expired-token signal on the balance probe. KIS rate-limits oauth2/tokenP issuance to
+    # ~1/min; a genuinely revoked appkey keeps returning EGW00123, so without a cooldown the
+    # connector would POST tokenP on every check_network cycle. >=60s bounds tokenP pressure
+    # to KIS's ceiling while still recovering instantly from a normal early expiry.
+    _FORCED_REAUTH_COOLDOWN_S = 60.0
 
     web_utils = web_utils
 
@@ -101,6 +119,7 @@ class KisExchange(ExchangePyBase):
         self._sh_prev_book_sig: Dict[str, tuple] = {}
         self._sh_last_book_change: Dict[str, float] = {}
         self._net_check_consec_failures: int = 0  # JEP-203 check_network debounce counter
+        self._last_forced_reauth_ts: float = 0.0  # JEP-206 EGW00123 forced-reauth cooldown clock
         # Phase-2 latches (populated only when kis_market_status_enabled)
         self._market_status_enabled = str(kis_market_status_enabled).strip().lower() == "true"
         # JEP-201 capture-only: subscribe H0?MKO0 + log raw frames for decode verification,
@@ -215,6 +234,54 @@ class KisExchange(ExchangePyBase):
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            # JEP-206: an expired access token (KIS msg_cd EGW00123) is a SERVER-authoritative
+            # "your token is dead now" signal the local TTL clock cannot see — _get_access_token
+            # refreshes by expiry only, so the cached (server-dead) token is re-sent on every probe,
+            # check_network reports NOT_CONNECTED, the strategy halts, and no order/auth call ever
+            # fires the refresh path -> deadlock until a manual restart. Break it here: on EGW00123,
+            # force-invalidate the cached token and retry the probe ONCE before counting the failure.
+            #
+            # Classification is on the STRUCTURED msg_cd first (KisNetworkCheckError carries it from
+            # the HTTP-200 rt_cd!=0 raise below) and falls back to a qualified substring on the
+            # HTTP-500 shape, where the shared REST layer buries the code in the IOError text. The
+            # qualified `"EGW00123"` form (the raw code) is matched only when no structured msg_cd
+            # is present. EGW00215 (per-second throttle) is a transient NON-auth failure and is
+            # explicitly excluded so it stays on the debounce below (refreshing on throttle would
+            # hammer the 1/min tokenP limit). A >=60s cooldown bounds re-auth against a genuinely
+            # revoked appkey to KIS's issuance ceiling.
+            msg_cd = getattr(e, "msg_cd", "") or ""
+            err_text = repr(e)
+            is_throttle = (
+                msg_cd == CONSTANTS.KIS_ERR_THROTTLE
+                or CONSTANTS.KIS_ERR_THROTTLE in err_text
+            )
+            is_expired = not is_throttle and (
+                msg_cd == CONSTANTS.KIS_ERR_TOKEN_EXPIRED
+                or (not msg_cd and CONSTANTS.KIS_ERR_TOKEN_EXPIRED in err_text)
+            )
+            now = self.current_timestamp if self.current_timestamp > 0 else time.time()
+            if is_expired and (now - self._last_forced_reauth_ts) >= self._FORCED_REAUTH_COOLDOWN_S:
+                self.logger().warning(
+                    f"KIS check_network: expired-token signal ({CONSTANTS.KIS_ERR_TOKEN_EXPIRED}) "
+                    f"on the balance probe — forcing a token re-auth and retrying once: {e!r}"
+                )
+                self._last_forced_reauth_ts = now
+                try:
+                    await self._auth.invalidate_token()
+                    await self._make_network_check_request()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as retry_exc:
+                    e = retry_exc  # refresh+retry also failed -> fall through to the debounce
+                else:
+                    self._net_check_consec_failures = 0
+                    return NetworkStatus.CONNECTED
+            elif is_expired:
+                self.logger().warning(
+                    f"KIS check_network: expired-token signal ({CONSTANTS.KIS_ERR_TOKEN_EXPIRED}) "
+                    f"but within the {self._FORCED_REAUTH_COOLDOWN_S:.0f}s re-auth cooldown — "
+                    f"skipping re-auth, applying debounce: {e!r}"
+                )
             self._net_check_consec_failures += 1
             if self._net_check_consec_failures < self._NET_CHECK_FAILURE_THRESHOLD:
                 self.logger().warning(
@@ -256,11 +323,15 @@ class KisExchange(ExchangePyBase):
         # The base check_network() treats a non-exception as CONNECTED, so an un-inspected
         # logical error would mark the connector healthy while _update_balances (fail-closed
         # since JEP-161) raises — a readiness/balance inconsistency that hides a broken account.
-        # Raise so check_network() reports NOT_CONNECTED instead (JEP-182).
+        # Raise so check_network() reports NOT_CONNECTED instead (JEP-182). Carry msg_cd as a
+        # STRUCTURED attribute (KisNetworkCheckError) so check_network classifies EGW00123 vs
+        # EGW00215 on the field, not free text — the HTTP-200 variant has no code in msg1 (JEP-206).
         if result.get("rt_cd") != "0":
-            raise IOError(
+            raise KisNetworkCheckError(
                 f"KIS network check failed: "
-                f"rt_cd={result.get('rt_cd')} msg={result.get('msg1')}"
+                f"rt_cd={result.get('rt_cd')} "
+                f"msg_cd={result.get('msg_cd')} msg={result.get('msg1')}",
+                msg_cd=str(result.get("msg_cd") or ""),
             )
 
     @property

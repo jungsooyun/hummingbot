@@ -321,6 +321,30 @@ class KisAuth(AuthBase):
             self._persist_to_disk()
             return token
 
+    async def invalidate_token(self) -> None:
+        """Force the next ``_get_access_token`` call to re-issue a fresh token.
+
+        ``_get_access_token`` refreshes purely by the local TTL clock; it has no
+        error-driven re-auth path. When the SERVER invalidates the token early
+        (KIS msg_cd EGW00123 "기간이 만료된 token") the cached ``_access_token`` is
+        still non-None and ``_token_expires_at`` is still in the future by the
+        local clock, so the fast-path guard returns the dead token verbatim —
+        a deadlock the connector cannot escape without a restart.
+
+        Zeroing ``_token_expires_at`` (under ``_token_lock``, mirroring every
+        other token-store mutation) makes the next ``_get_access_token`` fall
+        through its guard and POST ``oauth2/tokenP`` for a new token. Single-flight
+        is preserved: ``_get_access_token`` re-checks the guard inside the lock,
+        so concurrent callers still share one fetch.
+
+        Note: the disk cache is intentionally NOT cleared here — ``_get_access_token``
+        overwrites it (``_persist_to_disk``) on the very next successful fetch, and the
+        forced-reauth cooldown in the connector bounds re-issue to KIS's 1/min ceiling.
+        """
+        async with self._token_lock:
+            self._access_token = None
+            self._token_expires_at = 0.0
+
     # ------------------------------------------------------------------
     # WebSocket approval key
     # ------------------------------------------------------------------
