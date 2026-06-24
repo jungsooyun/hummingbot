@@ -1283,6 +1283,10 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
     # and a per-REST-op timeout so a hung connector call cannot wedge the seed (and the control loop).
     _SEED_GRACE_SECONDS = 180.0
     _SEED_OP_TIMEOUT = 10.0
+    # JEP-210: min seconds between seed-driven hedge balance polls, so actively refreshing
+    # the hedge balance (below) does not hammer a throttled endpoint (KIS EGW00215) every
+    # 1s control tick across the up-to-180s seed window.
+    _SEED_BALANCE_REFRESH_INTERVAL = 5.0
 
     def _seed_pending(self) -> bool:
         # JEP-210: True while an adopt:true seed has neither adopted nor permanently fail-closed.
@@ -1304,6 +1308,14 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self._seed_first_attempt_ts = now
         grace = getattr(self, "_seed_grace_seconds", self._SEED_GRACE_SECONDS)
         if now - self._seed_first_attempt_ts >= grace:
+            if not getattr(self, "_seed_fail_closed", False):
+                self.logger().warning(
+                    "JEP-210 adopt seed gave up after %.0fs grace for %s "
+                    "(perp/spot snapshot never both landed); fail-closing -> executor will not quote. "
+                    "last hedge-balance refresh error: %s",
+                    grace, getattr(self, "maker_trading_pair", "?"),
+                    getattr(self, "_seed_last_balance_error", None),
+                )
             self._seed_fail_closed = True
 
     async def _seed_inventory_from_connector(self) -> None:
@@ -1353,6 +1365,20 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             if getattr(self, "_seed_fail_closed", False):
                 # Unrecoverable (e.g. HEDGE position mode) -- permanent, set by the reader.
                 return
+            if perp_signed != ZERO:
+                # JEP-210: there IS a perp leg to match -- drive a fresh hedge balance poll
+                # (rate-limited) so the spot read reflects a successful fetch instead of a
+                # cache the throttled background poll (KIS EGW00215) never populated.
+                # Review F1: a FAILED/unconfirmed refresh must retry, never fall through to a
+                # possibly-stale positive cache (that would over-adopt a wrong balance).
+                if not await self._refresh_hedge_balance(op_timeout):
+                    self._note_seed_retry()
+                    return
+                # Review F5: re-read the perp leg after the hedge-refresh await so the adopted
+                # pair is a tight snapshot (a position update landing during the await is seen).
+                perp_signed, perp_entry_price = self._read_perp_position_signed()
+                if getattr(self, "_seed_fail_closed", False):
+                    return
             spot_base = self._read_spot_balance_base()
             if perp_signed == ZERO or spot_base == ZERO:
                 self._note_seed_retry()
@@ -1360,6 +1386,10 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
 
             self._apply_seed(perp_signed, spot_base, perp_entry_price)
             self._seed_adopted = True
+            self.logger().info(
+                "JEP-210 adopt seed complete for %s: perp signed=%s entry=%s, hedge spot_base=%s.",
+                self.maker_trading_pair, perp_signed, perp_entry_price, spot_base,
+            )
         finally:
             self._seed_adopting = False
 
@@ -1396,6 +1426,68 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         else:
             balance = ZERO
         return max(Decimal(str(balance)), ZERO)
+
+    async def _refresh_hedge_balance(self, op_timeout: float) -> bool:
+        """JEP-210: actively drive a hedge balance poll during seeding (rate-limited).
+
+        ``_read_spot_balance_base`` reads the hedge spot balance from the connector cache
+        (``get_balance``), which is filled by the hedge connector's background balance poll.
+        On KIS under multi-symbol load that poll is starved by per-second throttle
+        (EGW00215), so the cache never lands within the grace window and the seed read 0 ->
+        fail-closed a *real* held hedge. Mirroring the perp ``_update_positions()`` refresh,
+        drive the balance poll ourselves so a real holding adopts once any throttle-free
+        window lands.
+
+        Returns ``True`` only when the cache may be trusted for adoption: either the
+        connector has no balance hook (other venues / stubs -> passive read), or a poll just
+        succeeded, or a poll succeeded within the rate-limit interval (possibly driven by a
+        sibling executor sharing the same connector). Returns ``False`` when a poll is needed
+        but has not confirmed -- the caller then retries instead of adopting a possibly-stale
+        cache (review F1).
+
+        Rate-limit + success state live on the *hedge connector* (shared singleton), not the
+        executor, so multiple symbols sharing one KIS connector do not each burst the
+        throttled endpoint and one successful poll serves all (review F2). A failed poll is
+        not fatal here -- it just withholds trust for this attempt; the seed's grace/retry
+        machinery eventually fail-closes a genuinely unreachable hedge.
+        """
+        hedge = self.connectors[self.hedge_connector]
+        update_balances = getattr(hedge, "_update_balances", None)
+        if not callable(update_balances):
+            return True  # no driver (other venues / test stubs) -> passive cache read
+        now = time.monotonic()
+        interval = getattr(self, "_seed_balance_refresh_interval", self._SEED_BALANCE_REFRESH_INTERVAL)
+
+        def _trust_recent_success() -> bool:
+            ok_ts = getattr(hedge, "_seed_balance_ok_ts", None)
+            return ok_ts is not None and (time.monotonic() - ok_ts) < interval
+
+        # Single-flight (review rev2 F1): if a sibling executor's poll is already in flight on
+        # this shared connector, do not start a second overlapping _update_balances() -- the
+        # op timeout (10s) exceeds the rate-limit interval (5s), so a timestamp gate alone would
+        # let a second call overlap a slow/hung one. Trust only a recent confirmed success.
+        if getattr(hedge, "_seed_balance_inflight", False):
+            return _trust_recent_success()
+        last_attempt = getattr(hedge, "_seed_balance_refresh_ts", None)
+        if last_attempt is not None and (now - last_attempt) < interval:
+            # Not due (a recent attempt -- possibly a sibling executor -- already polled).
+            # Trust the cache only if a poll actually SUCCEEDED within the interval.
+            return _trust_recent_success()
+        hedge._seed_balance_refresh_ts = now  # record the attempt (bounds persistent failure too)
+        hedge._seed_balance_inflight = True
+        try:
+            result = update_balances()
+            if inspect.isawaitable(result):
+                await asyncio.wait_for(result, timeout=op_timeout)
+        except Exception as e:
+            # Transient (EGW00215 throttle) or a harder error (auth/account). Either way do
+            # NOT adopt this tick; surface the latest cause for the fail-close log (review F3).
+            self._seed_last_balance_error = repr(e)
+            return False
+        finally:
+            hedge._seed_balance_inflight = False
+        hedge._seed_balance_ok_ts = time.monotonic()
+        return True
 
     def _apply_seed(self, perp_signed: Decimal, spot_base: Decimal, perp_entry_price: Decimal) -> None:
         self._ensure_direction_accounting()

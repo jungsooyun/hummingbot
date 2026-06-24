@@ -520,3 +520,226 @@ def test_seed_fail_closes_after_grace_window_when_inventory_stays_empty():
     assert h._seed_fail_closed is True
     assert h._maker_sell_base == ZERO
     assert h._hedge_buy_base == ZERO
+
+
+def _seeded_short_harness():
+    h = _SeedHarness(adopt=True)
+    h.connectors[h.maker_connector].account_positions = {
+        "short": SimpleNamespace(
+            trading_pair=h.maker_trading_pair,
+            position_side=PositionSide.SHORT,
+            amount=Decimal("1"),
+            entry_price=Decimal("101"),
+        )
+    }
+    h._seed_readiness_timeout = 0
+    return h
+
+
+def test_seed_actively_refreshes_hedge_balance_so_throttled_cache_adopts():
+    # JEP-210: the hedge (KIS) background balance poll is starved by per-second throttle
+    # (EGW00215) under multi-symbol load, so get_balance() reads 0 from an unpopulated
+    # cache and a REAL held hedge fail-closed. The seed must actively DRIVE the hedge
+    # _update_balances() (mirroring the perp _update_positions() refresh) so a real
+    # holding adopts once a poll lands -- not sit reading an empty cache until grace.
+    h = _seeded_short_harness()
+    hedge = h.connectors[h.hedge_connector]
+    cache = {"qty": ZERO}  # starts empty (throttled background poll never populated it)
+    hedge.get_balance = lambda asset: cache["qty"]
+
+    async def _update_balances():
+        cache["qty"] = Decimal("1")  # a fresh successful poll populates the holding
+
+    hedge._update_balances = _update_balances
+
+    asyncio.run(h._seed_inventory_from_connector())
+
+    assert h._seed_adopted is True
+    assert h._seed_fail_closed is False
+    assert h._maker_sell_base == Decimal("1")
+    assert h._hedge_buy_base == Decimal("1")
+
+
+def test_seed_hedge_balance_refresh_is_rate_limited():
+    # The active hedge poll must be rate-limited so it does not hammer the throttled KIS
+    # balance endpoint every 1s control tick across the (up to 180s) seed window.
+    h = _seeded_short_harness()
+    hedge = h.connectors[h.hedge_connector]
+    calls = {"n": 0}
+    hedge.get_balance = lambda asset: ZERO  # stays empty -> keeps retrying, never adopts
+
+    async def _update_balances():
+        calls["n"] += 1
+
+    hedge._update_balances = _update_balances
+    h._seed_balance_refresh_interval = 1000.0  # large -> only the first attempt polls
+
+    for _ in range(3):  # three back-to-back attempts within the interval
+        asyncio.run(h._seed_inventory_from_connector())
+
+    assert calls["n"] == 1
+    assert getattr(h, "_seed_adopted", False) is False
+
+
+def test_seed_hedge_balance_refresh_failure_is_non_fatal():
+    # A throttled _update_balances (EGW00215) must NOT crash or immediately fail-close;
+    # the existing spot==0 -> _note_seed_retry + grace path handles it.
+    h = _seeded_short_harness()
+    hedge = h.connectors[h.hedge_connector]
+    hedge.get_balance = lambda asset: ZERO
+
+    async def _raises():
+        raise IOError("EGW00215 throttle")
+
+    hedge._update_balances = _raises
+
+    asyncio.run(h._seed_inventory_from_connector())  # within grace
+
+    assert h._seed_fail_closed is False
+    assert getattr(h, "_seed_adopted", False) is False
+
+
+def test_seed_without_update_balances_hook_falls_back_to_passive_cache_read():
+    # Backward-compat: a hedge connector without _update_balances (other venues / stubs)
+    # still adopts from the cache exactly as before -- the active refresh is a no-op.
+    h = _seeded_short_harness()
+    h.connectors[h.hedge_connector].get_balance = lambda asset: Decimal("1")
+
+    asyncio.run(h._seed_inventory_from_connector())
+
+    assert h._seed_adopted is True
+    assert h._hedge_buy_base == Decimal("1")
+
+
+def test_seed_does_not_adopt_stale_positive_cache_when_refresh_fails():
+    # Review F1 (the dangerous regression the active refresh could introduce): if the active
+    # _update_balances() FAILS (throttle/auth) but get_balance() still returns a STALE positive
+    # value (prior poll / wrong-account / partial state), the seed must NOT adopt it. A failed
+    # refresh withholds trust -> retry, never fall through to an unverified positive balance.
+    h = _seeded_short_harness()
+    hedge = h.connectors[h.hedge_connector]
+    hedge.get_balance = lambda asset: Decimal("31")  # stale-positive cache
+
+    async def _raises():
+        raise IOError("EGW00215 throttle")
+
+    hedge._update_balances = _raises
+
+    asyncio.run(h._seed_inventory_from_connector())
+
+    assert getattr(h, "_seed_adopted", False) is False  # did NOT adopt the unverified 31
+    assert h._seed_fail_closed is False                 # within grace -> retry, not permanent
+    assert h._maker_sell_base == ZERO
+    assert h._hedge_buy_base == ZERO
+
+
+def test_seed_adopts_stale_cache_only_after_a_confirmed_poll():
+    # Companion to F1: once a poll SUCCEEDS, the (now-confirmed) cache may be adopted.
+    h = _seeded_short_harness()
+    hedge = h.connectors[h.hedge_connector]
+    hedge.get_balance = lambda asset: Decimal("31")
+
+    async def _ok():
+        return None  # success, leaves the (already-populated) cache in place
+
+    hedge._update_balances = _ok
+
+    asyncio.run(h._seed_inventory_from_connector())
+
+    assert h._seed_adopted is True
+    assert h._hedge_buy_base == Decimal("31")
+
+
+def test_seed_shared_connector_gate_prevents_duplicate_polls_across_executors():
+    # Review F2: the rate-limit + success state live on the hedge CONNECTOR, so two symbols
+    # sharing one KIS connector do not each burst the throttled endpoint -- one poll serves both.
+    h1 = _seeded_short_harness()
+    h2 = _seeded_short_harness()
+    shared = h1.connectors[h1.hedge_connector]
+    h2.connectors[h2.hedge_connector] = shared  # both executors share the one hedge connector
+
+    cache = {"qty": ZERO}
+    calls = {"n": 0}
+    shared.get_balance = lambda asset: cache["qty"]
+
+    async def _update_balances():
+        calls["n"] += 1
+        cache["qty"] = Decimal("1")
+
+    shared._update_balances = _update_balances
+    for h in (h1, h2):
+        h._seed_balance_refresh_interval = 1000.0
+
+    asyncio.run(h1._seed_inventory_from_connector())
+    asyncio.run(h2._seed_inventory_from_connector())
+
+    assert calls["n"] == 1            # h1 polled; h2 reused the shared confirmed cache
+    assert h1._seed_adopted is True
+    assert h2._seed_adopted is True   # adopted from the sibling's successful poll
+
+
+def test_seed_hedge_balance_refresh_is_single_flight_across_executors():
+    # Review rev2 F1: while one executor's _update_balances() is in flight on the shared
+    # connector, a sibling must NOT start a second overlapping poll -- it trusts a recent
+    # confirmed success or retries. Prevents overlapping balance mutations / endpoint bursts
+    # when op_timeout (10s) > rate-limit interval (5s).
+    h1 = _seeded_short_harness()
+    h2 = _seeded_short_harness()
+    shared = h1.connectors[h1.hedge_connector]
+    h2.connectors[h2.hedge_connector] = shared
+
+    calls = {"n": 0}
+    cache = {"qty": ZERO}
+    shared.get_balance = lambda asset: cache["qty"]
+
+    async def _run():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _update_balances():
+            calls["n"] += 1
+            started.set()
+            await release.wait()  # hold the poll in flight
+            cache["qty"] = Decimal("1")
+
+        shared._update_balances = _update_balances
+
+        t1 = asyncio.ensure_future(h1._seed_inventory_from_connector())
+        await started.wait()  # h1's poll is now in flight
+        await h2._seed_inventory_from_connector()  # h2 attempts while h1 in flight
+        assert calls["n"] == 1                      # h2 did NOT start a second poll
+        assert getattr(h2, "_seed_adopted", False) is False  # no confirmed success yet -> retry
+        release.set()
+        await t1
+        assert h1._seed_adopted is True
+
+    asyncio.run(_run())
+    assert calls["n"] == 1
+
+
+def test_seed_fail_closes_after_grace_on_persistent_refresh_failure():
+    # Test gap (Codex): a hedge whose _update_balances() never succeeds must fail-close after
+    # the grace window (not adopt), and the per-attempt poll stays rate-limited meanwhile.
+    h = _seeded_short_harness()
+    hedge = h.connectors[h.hedge_connector]
+    hedge.get_balance = lambda asset: Decimal("31")  # stale positive, but never confirmed
+    calls = {"n": 0}
+
+    async def _raises():
+        calls["n"] += 1
+        raise IOError("EGW00215 throttle")
+
+    hedge._update_balances = _raises
+    h._seed_balance_refresh_interval = 1000.0  # only the first attempt polls
+
+    asyncio.run(h._seed_inventory_from_connector())  # attempt 1 (polls, fails) -> retry
+    assert h._seed_fail_closed is False
+    asyncio.run(h._seed_inventory_from_connector())  # attempt 2 (not due) -> retry
+    assert calls["n"] == 1                            # rate-limited: only one poll
+
+    h._seed_grace_seconds = 0  # grace exhausted
+    asyncio.run(h._seed_inventory_from_connector())
+    assert h._seed_fail_closed is True
+    assert getattr(h, "_seed_adopted", False) is False
+    assert h._maker_sell_base == ZERO
+    assert h._hedge_buy_base == ZERO
