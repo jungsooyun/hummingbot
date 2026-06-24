@@ -1655,6 +1655,60 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         unreg_trs = {c.args[0] for c in hub.unregister.await_args_list}
         self.assertEqual({"H0UNASP0", "H0UNCNT0"}, unreg_trs)
 
+    async def test_listen_two_symbols_one_hub_no_dispatch_collision(self):
+        """JEP-207 regression. Two symbols on ONE shared connector => ONE orderbook DS whose
+        listen loop registers the SAME orderbook tr_id (H0UNASP0) once per symbol, passing
+        ``self._on_ws_frame`` (a bound method = a FRESH object on each access). Against a REAL
+        hub the old identity guard rejected the 2nd symbol as a 'different handler', the KIS
+        hedge orderbook WS never went fresh, and the JEP-134 staleness kill-switch halted the
+        live 2-symbol run. With the equality guard both symbols subscribe on the one hub.
+        The other listen tests use a MagicMock hub, so they never exercised the real guard —
+        this one deliberately uses the real KisWsHub, which is why the bug escaped CI."""
+        from hummingbot.connector.exchange.kis.kis_ws_hub import KisWsHub
+
+        hub = KisWsHub(auth=self.mock_auth, domain=CONSTANTS.DEFAULT_DOMAIN,
+                       ws_enabled=True, sleep=AsyncMock())
+        hub._ensure_running = lambda: None  # unit test: never spawn the real connect loop
+
+        ds = KisAPIOrderBookDataSource(
+            trading_pairs=["005930-KRW", "000660-KRW"],
+            connector=self.connector,
+            api_factory=self.connector._web_assistants_factory,
+            auth=self.mock_auth,
+            hub=hub,
+            domain=CONSTANTS.DEFAULT_DOMAIN,
+            market_routing=CONSTANTS.MARKET_ROUTING_SOR,
+        )
+        sym_map = {"005930-KRW": "005930", "000660-KRW": "000660"}
+        with patch.object(
+            self.connector,
+            "exchange_symbol_associated_to_pair",
+            new=AsyncMock(side_effect=lambda trading_pair: sym_map[trading_pair]),
+        ):
+            task = asyncio.create_task(ds.listen_for_subscriptions())
+            # settle until the last registration lands (or the task errors out on collision)
+            for _ in range(50):
+                if task.done() or ("H0UNCNT0", "000660") in hub._subs:
+                    break
+                await asyncio.sleep(0)
+            if task.done() and task.exception() is not None:
+                raise AssertionError(
+                    "2-symbol listen raised instead of registering cleanly (JEP-207 collision)"
+                ) from task.exception()
+            # assert WHILE the listen task is parked on the idle wait (post-register,
+            # pre-teardown); the finally-block unregisters everything on cancel.
+            self.assertIn(("H0UNASP0", "005930"), hub._subs)
+            self.assertIn(("H0UNASP0", "000660"), hub._subs)   # 2nd symbol — the collision case
+            self.assertIn(("H0UNCNT0", "005930"), hub._subs)
+            self.assertIn(("H0UNCNT0", "000660"), hub._subs)
+            # one handler per tr_id (it demuxes both symbols by tr_key), equal to the DS entry
+            self.assertEqual(hub._dispatch["H0UNASP0"], ds._on_ws_frame)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
     async def test_listen_registers_market_status_tr_when_enabled(self):
         hub = MagicMock()
         hub.register = AsyncMock()

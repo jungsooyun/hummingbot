@@ -79,12 +79,17 @@ class KisWsHub:
             # stop_network() FIRST (exchange_py_base.py:676), which runs hub.stop() and
             # sets _stopped=True; without this reset the hub would be permanently dead and
             # never reconnect on the (re)start that immediately follows. Clear it BEFORE the
-            # overwrite guard so the guard stays armed across restarts; the legitimate
-            # same-handler re-register is a no-op via the identity check below (a DS instance
-            # and its bound _on_ws_frame persist across start/stop cycles).
+            # overwrite guard so the guard stays armed across restarts. The guard compares by
+            # EQUALITY, not identity: a bound method (e.g. a data source's self._on_ws_frame) is
+            # a FRESH object on every attribute access (`a.m is a.m` is False in CPython), so the
+            # same source re-registering a tr_id — one DS subscribing one tr_id for several
+            # symbols (H0UNASP0 demuxes by tr_key), or a stop/start restart — passes an
+            # equal-but-not-identical handler that MUST be a no-op. A genuinely different source
+            # (different __self__) compares unequal and still raises (JEP-207: identity here
+            # wrongly rejected the 2nd symbol and kill-switched the 2-symbol live run).
             self._stopped = False
             existing = self._dispatch.get(tr_id)
-            if existing is not None and existing is not handler:
+            if existing is not None and existing != handler:
                 raise ValueError(
                     f"KisWsHub: tr_id {tr_id} is already registered to a different handler; "
                     f"refusing to overwrite (would silently drop frames)."

@@ -88,6 +88,45 @@ class KisWsHubTests(IsolatedAsyncioWrapperTestCase):
             await hub.register("H0UNASP0", "005930", AsyncMock())  # different handler
         await hub.stop()
 
+    async def test_register_same_source_multi_symbol_bound_method_no_collision(self):
+        """JEP-207: ONE data source registering the SAME tr_id for multiple symbols passes
+        ``self._on_ws_frame`` — a bound method that is a FRESH object on every attribute
+        access (``a.m is a.m`` is False in CPython). The overwrite guard must compare by
+        EQUALITY (same __self__/__func__), not identity, or the 2nd symbol's register is
+        wrongly rejected as a 'different handler'. This is the live 2-symbol H0UNASP0
+        collision that kill-switched the bot; the old AsyncMock-based test missed it because
+        a reused mock has stable identity, unlike a real re-accessed bound method."""
+        class _Source:
+            async def _on_ws_frame(self, raw):
+                pass
+
+        src = _Source()
+        # sanity: the two accesses really are distinct objects (the trap), but equal
+        self.assertIsNot(src._on_ws_frame, src._on_ws_frame)
+        self.assertEqual(src._on_ws_frame, src._on_ws_frame)
+
+        hub = KisWsHub(auth=_make_auth(), domain="real", ws_enabled=True, sleep=AsyncMock())
+        await hub.register("H0UNASP0", "005930", src._on_ws_frame)   # fresh bound method A
+        await hub.register("H0UNASP0", "000660", src._on_ws_frame)   # fresh bound method B (== A)
+        self.assertIn(("H0UNASP0", "005930"), hub._subs)
+        self.assertIn(("H0UNASP0", "000660"), hub._subs)             # both symbols subscribed
+        self.assertEqual(hub._dispatch["H0UNASP0"], src._on_ws_frame)
+        await hub.stop()
+
+    async def test_register_different_source_same_tr_id_still_raises(self):
+        """The overwrite guard must still fire for genuinely different sources (different
+        __self__): two DS instances fighting over one tr_id would silently drop one feed."""
+        class _Source:
+            async def _on_ws_frame(self, raw):
+                pass
+
+        a, b = _Source(), _Source()
+        hub = KisWsHub(auth=_make_auth(), domain="real", ws_enabled=True, sleep=AsyncMock())
+        await hub.register("H0UNASP0", "005930", a._on_ws_frame)
+        with self.assertRaises(ValueError):
+            await hub.register("H0UNASP0", "000660", b._on_ws_frame)  # different __self__
+        await hub.stop()
+
     async def test_unregister_drops_handler_only_when_last_key_gone(self):
         hub = KisWsHub(auth=_make_auth(), domain="real", ws_enabled=True, sleep=AsyncMock())
         h = AsyncMock()
