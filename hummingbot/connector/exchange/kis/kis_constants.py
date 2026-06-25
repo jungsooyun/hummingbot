@@ -306,7 +306,15 @@ RATE_LIMITS = [
     RateLimit(limit_id=OVERSEAS_OPTIONS_ORDERBOOK_PATH, limit=20, time_interval=1),
     RateLimit(limit_id=DOMESTIC_STOCK_ORDER_PATH, limit=5, time_interval=1),
     RateLimit(limit_id=DOMESTIC_STOCK_CANCEL_PATH, limit=5, time_interval=1),
-    RateLimit(limit_id=DOMESTIC_STOCK_BALANCE_PATH, limit=10, time_interval=1),
+    # EGW00215 fix: inquire-balance hits a per-second account-LEDGER limit far below 10/s.
+    # Both _update_balances (poll) and the check_network probe call _api_get on this PATH with
+    # no explicit limit_id, so the throttler keys them here (limit_id = limit_id or path_url).
+    # Serialize ALL balance inquiries (probe + poll + JEP-210 _refresh_hedge_balance) to 1/s so
+    # coincident calls spread across seconds instead of bursting past KIS's ledger limit -> no
+    # more HTTP 500 "초당 거래건수 초과". Avg balance demand is ~0.3/s so 1/s never bottlenecks.
+    # Also the leading trigger for the JEP-218 cold-boot throttle-storm freeze. (The TR_ID
+    # balance RateLimit above is dead config — calls never pass limit_id=TR_ID.)
+    RateLimit(limit_id=DOMESTIC_STOCK_BALANCE_PATH, limit=1, time_interval=1),
     RateLimit(limit_id=DOMESTIC_STOCK_ORDER_DETAIL_PATH, limit=10, time_interval=1),
     # WebSocket
     RateLimit(limit_id=WS_APPROVAL_PATH_URL, limit=1, time_interval=60),
