@@ -547,8 +547,18 @@ class KisExchange(ExchangePyBase):
         else:
             tr_id = CONSTANTS.DOMESTIC_STOCK_ORDER_SELL_TR_ID
 
-        # ORD_DVSN: "00" = limit, "01" = market
-        ord_dvsn = "00" if order_type == OrderType.LIMIT else "01"
+        # ORD_DVSN order-type code. A LIMIT carries an explicit price (지정가, "00").
+        # A non-LIMIT (MARKET) order maps to 최유리지정가 ("03", best-price marketable),
+        # NOT 시장가 ("01"): true MARKET is REJECTED on the NXT after-market (15:40-20:00 KST)
+        # while 03 fills at the best opposite quote on BOTH KRX continuous and NXT (the unwind
+        # tooling hardcodes 03 for the same reason). 03 ignores the price, so ORD_UNPR="0" —
+        # this also fixes a latent crash: price is NaN for a market order and str(int(NaN)) raises.
+        if order_type == OrderType.LIMIT:
+            ord_dvsn = "00"
+            ord_unpr = str(int(price))
+        else:
+            ord_dvsn = "03"
+            ord_unpr = "0"
 
         body = {
             "CANO": self._cano,
@@ -556,7 +566,7 @@ class KisExchange(ExchangePyBase):
             "PDNO": symbol,
             "ORD_DVSN": ord_dvsn,
             "ORD_QTY": str(int(amount)),
-            "ORD_UNPR": str(int(price)),
+            "ORD_UNPR": ord_unpr,
             "EXCG_ID_DVSN_CD": self._excg_for_routing(),
         }
 

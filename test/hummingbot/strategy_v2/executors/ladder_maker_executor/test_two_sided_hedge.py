@@ -119,6 +119,19 @@ class LadderMakerTwoSidedHedgeTest(unittest.TestCase):
             "000660-KRW", PriceType.BestBid
         )
 
+    def test_size_hedge_market_carries_real_price_for_framework(self):
+        # JEP-219: a MARKET (KIS 최유리/03) hedge must still carry a REAL marketable price (NOT NaN)
+        # so the framework budget/quantize path that runs BEFORE the connector does not choke; the
+        # connector ignores this price for 03 (ORD_UNPR=0). Same price as the LIMIT path -- only
+        # order_type differs -- so the new MARKET path stays as close as possible to the proven one.
+        from hummingbot.core.data_type.common import OrderType
+        ex = self._make_executor(pending_signed=Decimal("-1"))
+        ex.config.hedge_order_type = OrderType.MARKET
+        spec = ex._size_hedge(Decimal("1"))
+        self.assertEqual(OrderType.MARKET, spec["order_type"])
+        self.assertEqual(Decimal("70311"), spec["price"])
+        self.assertFalse(spec["price"].is_nan())
+
     def test_hedge_base_to_maker_base_divides_by_share_per_unit(self):
         ex = self._make_executor(share_per_unit=Decimal("2"))
         self.assertEqual(Decimal("2"), ex._hedge_base_to_maker_base(Decimal("4")))

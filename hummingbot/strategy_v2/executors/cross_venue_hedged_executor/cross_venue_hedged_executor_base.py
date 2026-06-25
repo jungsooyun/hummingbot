@@ -171,6 +171,17 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         # magnitude alias for legacy callers and characterization snapshots.
         self._pending_hedge_signed = ZERO
 
+        # JEP-219: bounded naked-exposure on a parked hedge. A marketable hedge that does not
+        # fill (thin/empty book, no contra) rests OPEN; _hedge_in_flight() then blocks every
+        # re-hedge and pending only decrements on a real fill, so the perp leg stays naked for
+        # the resting order's whole lifetime. _reconcile_open_hedges cancels a hedge open longer
+        # than this so the next tick re-prices it. 0 (default) disables -> behavior-neutral.
+        self._hedge_fill_timeout_s = float(getattr(config, "hedge_fill_timeout_s", 0.0) or 0.0)
+        # oid -> last cancel-request timestamp. A dict (not a set) so a LOST/FAILED cancel REST
+        # call does not permanently suppress re-cancel: we re-issue every _hedge_fill_timeout_s
+        # while the order stays open (else one dropped cancel re-opens the naked window forever).
+        self._hedge_cancel_requested: Dict[str, float] = {}
+
         # Direction-aware inventory ledgers. Legacy executed-base/quote totals above
         # stay as magnitudes because get_net_pnl_quote intentionally remains unchanged.
         self._maker_buy_base = ZERO
@@ -932,6 +943,54 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                     self._current_retries += 1
                     self.evaluate_max_retries()
 
+    def _reconcile_open_hedges(self) -> None:
+        """JEP-219: cancel a hedge order that has rested OPEN past ``_hedge_fill_timeout_s``.
+
+        ``_reconcile_stuck_hedges`` only resolves ``order is None`` (lost-created-event) hedges;
+        a hedge that is TRACKED and OPEN but not filling (a marketable limit parked on a thin or
+        momentarily-empty book) is invisible to it, yet ``_hedge_in_flight`` keeps blocking every
+        new hedge while it rests and ``_pending_hedge`` only decrements on a real fill -> the perp
+        leg stays naked for the resting order's whole lifetime. Cancelling it frees the in-flight
+        slot; pending is untouched (it only drops on fills) so the next tick re-prices the hedge at
+        the current book. No double-hedge: a fill that races the cancel still decrements pending via
+        its fill event, and the canceled-unfilled case re-hedges the same pending. The guard set
+        suppresses re-issuing cancel every tick while the cancel is in flight.
+        ``_hedge_fill_timeout_s`` <= 0 (the default) disables this entirely (behavior-neutral)."""
+        timeout = getattr(self, "_hedge_fill_timeout_s", 0.0) or 0.0
+        if timeout <= 0:
+            return
+        requested = getattr(self, "_hedge_cancel_requested", None)
+        if not isinstance(requested, dict):
+            requested = {}
+            self._hedge_cancel_requested = requested
+        # Drop ids no longer tracked so the map cannot grow unbounded.
+        for oid in [o for o in requested if o not in self.hedge_orders]:
+            requested.pop(oid, None)
+        now = self._strategy.current_timestamp
+        for oid, tracked in list(self.hedge_orders.items()):
+            order = getattr(tracked, "order", None)
+            if order is None or getattr(order, "is_done", False):
+                continue
+            created = getattr(order, "creation_timestamp", None)
+            if created is None:
+                continue
+            age = now - float(created)
+            if age <= timeout:
+                continue
+            # RETRY the cancel every ``timeout`` seconds while the order stays open: a lost or
+            # failed cancel REST call must NOT permanently suppress re-hedging (that would re-open
+            # the exact naked-exposure window this guards). last-cancel-ts only rate-limits the
+            # retry so we do not spam cancel every tick.
+            last = requested.get(oid)
+            if last is not None and (now - last) < timeout:
+                continue
+            requested[oid] = now
+            self.logger().warning(
+                "JEP-219: hedge %s open %.1fs > timeout %.1fs without filling - cancelling to "
+                "re-hedge (retry every %.1fs until terminal; pending held).", oid, age, timeout, timeout,
+            )
+            self._strategy.cancel(self.hedge_connector, self.hedge_trading_pair, oid)
+
     def _reconcile_stuck_makers(self) -> None:
         """Resolve maker orders stuck with ``order is None`` (lost-created-event guard).
 
@@ -980,6 +1039,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
     def _process_hedges(self) -> None:
         self._ensure_direction_accounting()
         self._reconcile_stuck_hedges()
+        self._reconcile_open_hedges()
         if self.status == RunnableStatus.TERMINATED:
             # _reconcile_stuck_hedges may trip evaluate_max_retries() -> stop() (e.g. a
             # terminal stuck hedge exceeding max_retries). Never place a hedge after the

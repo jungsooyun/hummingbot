@@ -701,11 +701,12 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         amount = kis.quantize_order_amount(self.hedge_trading_pair, hedge.size)
         if amount <= ZERO:
             return None
-        price = (
-            Decimal("NaN")
-            if self.config.hedge_order_type == OrderType.MARKET
-            else kis.quantize_order_price(self.hedge_trading_pair, hedge.price)
-        )
+        # Always carry the marketable price -- even for a MARKET (KIS 최유리/03) hedge. The
+        # framework budget/quantize path runs BEFORE the connector and a NaN price there fails
+        # the budget check (NaN*amount on a BUY) / quantize; the KIS connector then IGNORES this
+        # price for a market order (ORD_DVSN=03 -> ORD_UNPR=0). This keeps the MARKET hedge path
+        # identical to the proven LIMIT path except for order_type (which only flips ord_dvsn).
+        price = kis.quantize_order_price(self.hedge_trading_pair, hedge.price)
         return {
             "amount": amount,
             "price": price,

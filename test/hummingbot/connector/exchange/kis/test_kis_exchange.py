@@ -1239,6 +1239,49 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         req = self._all_executed_requests(mock_api, url)[0]
         self._assert_request_authenticated(req, CONSTANTS.DOMESTIC_STOCK_ORDER_SELL_TR_ID)
 
+    async def test_place_order_market_maps_to_best_price_ord_dvsn_03(self):
+        # JEP-219: a MARKET hedge must transmit KIS 최유리지정가 ("03"), NOT 시장가 ("01")
+        # (rejected on the NXT after-market), with ORD_UNPR="0". The NaN market price must
+        # also NOT crash (the old str(int(price)) raised on NaN).
+        captured = {}
+
+        async def _capture(path_url, data, is_auth_required, headers):
+            captured["data"] = data
+            return self.order_creation_request_successful_mock_response
+
+        self.exchange._api_post = _capture
+        oid, _ts = await self.exchange._place_order(
+            order_id="HBOT-MKT",
+            trading_pair=self.trading_pair,
+            amount=Decimal("1"),
+            trade_type=TradeType.SELL,
+            order_type=OrderType.MARKET,
+            price=Decimal("NaN"),
+        )
+        self.assertEqual(captured["data"]["ORD_DVSN"], "03")
+        self.assertEqual(captured["data"]["ORD_UNPR"], "0")
+        self.assertEqual(captured["data"]["ORD_QTY"], "1")
+
+    async def test_place_order_limit_maps_to_ord_dvsn_00_with_price(self):
+        # Regression: a LIMIT order is unchanged — 지정가 ("00") at the integer KRW price.
+        captured = {}
+
+        async def _capture(path_url, data, is_auth_required, headers):
+            captured["data"] = data
+            return self.order_creation_request_successful_mock_response
+
+        self.exchange._api_post = _capture
+        await self.exchange._place_order(
+            order_id="HBOT-LMT",
+            trading_pair=self.trading_pair,
+            amount=Decimal("2"),
+            trade_type=TradeType.BUY,
+            order_type=OrderType.LIMIT,
+            price=Decimal("72000"),
+        )
+        self.assertEqual(captured["data"]["ORD_DVSN"], "00")
+        self.assertEqual(captured["data"]["ORD_UNPR"], "72000")
+
     @aioresponses()
     async def test_cancel_order_request_is_authenticated(self, mock_api):
         order = self._track_order(self.exchange)

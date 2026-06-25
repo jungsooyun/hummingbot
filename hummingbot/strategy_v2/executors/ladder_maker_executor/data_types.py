@@ -52,6 +52,9 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
     share_per_unit: Decimal = Decimal("1")
     hedge_max_slippage_bps: Decimal = Decimal("30")
     hedge_order_type: OrderType = OrderType.LIMIT
+    # JEP-219: cancel + re-price a hedge order that rests OPEN (unfilled) longer than this many
+    # seconds (a marketable hedge parked on a thin/empty book). 0 disables (behavior-neutral).
+    hedge_fill_timeout_s: float = 0.0
     # Maker leg order discipline. True (default): LIMIT_MAKER (post-only) — a rung price that
     # crosses the fast maker book is rejected (no fill), pure-maker. False: plain LIMIT at the
     # same rung price (= fair + net + round_trip_cost, the profitability floor) so a crossing

@@ -13,9 +13,9 @@ One controller instance per symbol; the V2 framework runs them concurrently.
 from decimal import Decimal
 from typing import List, Optional
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
-from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.ladder_hedge_controller_base import (
     LadderHedgeControllerBase,
@@ -78,6 +78,14 @@ class Hip3KisLadderControllerConfig(LadderHedgeControllerConfigBase):
     # Hedge
     share_per_unit: Decimal = Decimal("1")
     hedge_max_slippage_bps: Decimal = Field(default=Decimal("30"), json_schema_extra={"is_updatable": True})
+    # Hedge order type. LIMIT (지정가, "00") posts at the computed marketable price (price-protected
+    # by hedge_max_slippage_bps). MARKET maps to KIS 최유리지정가 ("03", best-price marketable), the
+    # reliable fill type on the NXT after-market (true 시장가 is rejected there) and on KRX continuous.
+    # Per-config so only NXT-exposed controllers switch; default LIMIT preserves existing behavior.
+    hedge_order_type: OrderType = OrderType.LIMIT
+    # JEP-219: cancel + re-price a hedge that rests OPEN (unfilled) past this many seconds. Bounds
+    # naked exposure when a marketable hedge parks on a thin/empty book. 0 disables (behavior-neutral).
+    hedge_fill_timeout_s: float = 0.0
 
     # Two-sided MM
     two_sided: bool = False
@@ -88,6 +96,25 @@ class Hip3KisLadderControllerConfig(LadderHedgeControllerConfigBase):
     max_close_cost_bps: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
     wind_down: bool = Field(default=False, json_schema_extra={"is_updatable": True})
     flatten_timeout_s: float = Field(default=30.0, json_schema_extra={"is_updatable": True})
+
+    @field_validator("hedge_order_type", mode="before")
+    @classmethod
+    def _validate_hedge_order_type(cls, value):
+        # YAML supplies a string ("MARKET"/"LIMIT"); pydantic coerces an Enum by VALUE only,
+        # so accept the NAME (and int / int-string / passthrough) like the XEMM controller does.
+        if isinstance(value, OrderType):
+            return value
+        if isinstance(value, int):
+            return OrderType(value)
+        if isinstance(value, str):
+            normalized = value.strip().upper()
+            if normalized.isdigit():
+                return OrderType(int(normalized))
+            try:
+                return OrderType[normalized]
+            except KeyError as e:
+                raise ValueError(f"Invalid hedge_order_type: {value}") from e
+        raise ValueError(f"Invalid hedge_order_type type: {type(value)}")
 
     @model_validator(mode="after")
     def _validate_config(self):
@@ -146,6 +173,8 @@ class Hip3KisLadderController(LadderHedgeControllerBase):
             max_inventory=self.config.max_inventory,
             share_per_unit=self.config.share_per_unit,
             hedge_max_slippage_bps=self.config.hedge_max_slippage_bps,
+            hedge_order_type=self.config.hedge_order_type,
+            hedge_fill_timeout_s=self.config.hedge_fill_timeout_s,
             min_reprice_interval_s=self.config.min_reprice_interval_s,
             min_reprice_delta_ticks=self.config.min_reprice_delta_ticks,
             maker_post_only=self.config.maker_post_only,
