@@ -204,6 +204,18 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         self._maker_terminal_ids = OrderedDict()
         self._maker_credited_base: Dict[str, Decimal] = {}
         self._maker_placed_edge_bps: Dict[str, Decimal] = {}
+
+        # JEP-221 #2: HARD per-boot order-rate circuit breaker. A live-confirmed runaway
+        # (2026-06-25 NXT) churned ~6 maker placements/s for ~72s because close fills were
+        # dropped as "unknown" (Q never converged) and _should_reprice bypasses the reprice
+        # rate limit when no maker order rests. This latch is a backstop INDEPENDENT of that
+        # root cause: more than max_placements_per_window real maker placements within
+        # placement_rate_window_s latches a per-boot HALT (cancel all makers + suppress all
+        # further placement until restart). Defaults are generous (won't trip normal reprice,
+        # which is itself rate-limited while orders rest) but catch sustained churn. The
+        # JEP-218 clock watchdog cannot catch this (the clock keeps advancing).
+        self._maker_placement_ts: list = []
+        self._rate_halt_latched = False
         self._open_edge_base = ZERO
         self._open_edge_notional_bps = ZERO
         self._open_edge_vwap = ZERO
@@ -459,6 +471,9 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         Cancel-all is retained on ``_cancel_all_maker`` for the gates-closed (kill-switch)
         and wind_down paths, which deliberately do NOT partial-diff.
         """
+        if self._rate_halted:
+            # JEP-221 breaker latched: makers already cancelled on trip; place nothing.
+            return
         rec = getattr(self, "_latency_recorder", None)
         if rec is not None:
             try:
@@ -597,6 +612,9 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         raise NotImplementedError
 
     def _place_target_one(self, target: RungTarget) -> None:
+        if self._rate_halted:
+            # JEP-221 breaker latched -> never place again this boot.
+            return
         if self._is_two_sided():
             side = TradeType.SELL if target.side == Side.SELL else TradeType.BUY
             position_action = PositionAction.OPEN if side == self.entry_side else PositionAction.CLOSE
@@ -610,6 +628,9 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         else:
             order_id = self._place_maker(target.price, target.size, target.edge_bps)
         self._record_placed_rung(order_id, target)
+        if order_id is not None:
+            # JEP-221: count only REAL placements (observe / sub-min / refused return None).
+            self._note_maker_placement()
 
     def _record_placed_rung(self, order_id: Optional[str], target: RungTarget) -> None:
         """Record a just-placed rung so the next reconcile's partial-diff sees it while inflight.
@@ -640,6 +661,59 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
     def _cancel_all_maker(self) -> None:
         for order in self._open_maker_orders():
             self._strategy.cancel(self.maker_connector, self.maker_trading_pair, order.order_id)
+
+    # ============================================ JEP-221 #2 order-rate circuit breaker
+
+    def _placement_rate_config(self) -> tuple:
+        """(enabled, window_s, cap). Read lazily via getattr so configs/harnesses missing
+        the keys default to ON with generous bounds (safety backstop, default-on)."""
+        cfg = getattr(self, "config", None)
+        enabled = getattr(cfg, "placement_rate_breaker_enabled", True)
+        window = float(getattr(cfg, "placement_rate_window_s", 30.0) or 30.0)
+        cap = int(getattr(cfg, "max_placements_per_window", 80) or 80)
+        return enabled, window, cap
+
+    @property
+    def _rate_halted(self) -> bool:
+        return getattr(self, "_rate_halt_latched", False)
+
+    def _note_maker_placement(self) -> None:
+        """Record one REAL maker placement and latch the breaker if the rolling rate within
+        ``placement_rate_window_s`` exceeds ``max_placements_per_window``. Call only for a
+        submitted order (order_id is not None); observe/no-submit must not count."""
+        enabled, window, cap = self._placement_rate_config()
+        if not enabled:
+            return
+        now = self._strategy.current_timestamp
+        ts = getattr(self, "_maker_placement_ts", None)
+        if ts is None:
+            ts = self._maker_placement_ts = []
+        ts.append(now)
+        cutoff = now - window
+        if ts and ts[0] < cutoff:
+            ts = self._maker_placement_ts = [t for t in ts if t >= cutoff]
+        if len(ts) > cap:
+            self._trip_rate_halt(len(ts), window)
+
+    def _trip_rate_halt(self, count: int, window: float) -> None:
+        # INTENTIONALLY a terminal per-boot halt: cancel resting makers + suppress all further
+        # placement, leave the process ALIVE, and require an operator restart. Do NOT wire this
+        # to os._exit / self-heal (cf. the JEP-218 clock watchdog) — a placement STORM that
+        # survived an auto-restart would just re-trip and crash-loop the live book. Halting in
+        # place is the correct fail-safe: it stops the bleeding and forces human diagnosis.
+        if getattr(self, "_rate_halt_latched", False):
+            return
+        self._rate_halt_latched = True
+        self.logger().critical(
+            "JEP-221 order-rate circuit breaker TRIPPED for %s: %s maker placements within "
+            "%.0fs exceeded max_placements_per_window — latching per-boot HALT (cancelling all "
+            "resting makers, suppressing all further maker/hedge placement until restart).",
+            getattr(self, "maker_trading_pair", "?"), count, window,
+        )
+        try:
+            self._cancel_all_maker()
+        except Exception:
+            self.logger().exception("JEP-221 breaker: _cancel_all_maker raised during halt.")
 
     # ============================================================ hedge queue
 
@@ -1040,6 +1114,10 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         self._ensure_direction_accounting()
         self._reconcile_stuck_hedges()
         self._reconcile_open_hedges()
+        if self._rate_halted:
+            # JEP-221 breaker latched: existing-hedge reconcile/cancel above is fine, but never
+            # PLACE a new hedge (placement is the runaway surface). Freeze until restart.
+            return
         if self.status == RunnableStatus.TERMINATED:
             # _reconcile_stuck_hedges may trip evaluate_max_retries() -> stop() (e.g. a
             # terminal stuck hedge exceeding max_retries). Never place a hedge after the

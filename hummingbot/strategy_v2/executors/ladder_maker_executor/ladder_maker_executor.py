@@ -435,6 +435,9 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         # matching close order resting instead of the wind_down cancel-then-replace, stranding
         # open-side makers). Single-sided wind_down was never special-cased (it fell through to the
         # base generic) and still isn't.
+        if self._rate_halted:
+            # JEP-221 breaker latched: makers already cancelled on trip; place nothing.
+            return
         if self._is_two_sided() and getattr(self.config, "wind_down", False):
             targets = self._compute_targets()
             if not self._should_reprice(targets):

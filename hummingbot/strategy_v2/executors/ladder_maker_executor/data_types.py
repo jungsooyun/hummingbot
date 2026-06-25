@@ -88,6 +88,16 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
 
     # Safety
     kill_switch: bool = False
+    # JEP-221 #2: HARD per-boot order-rate circuit breaker (backstop for the close-fill churn
+    # that produced the 2026-06-25 NXT runaway). More than max_placements_per_window REAL maker
+    # placements within placement_rate_window_s latches a per-boot HALT — cancel all resting
+    # makers + suppress all further maker/hedge placement until restart. Default-on with generous
+    # bounds: normal reprice is rate-limited by min_reprice_interval_s while orders rest, so it
+    # stays far below the cap; the runaway sustained ~6 placements/s (435 in 72s), which the
+    # JEP-218 clock watchdog cannot catch (the clock keeps advancing). Tune from live baseline.
+    placement_rate_breaker_enabled: bool = True
+    placement_rate_window_s: float = 30.0
+    max_placements_per_window: int = 80
     # JEP-133 approval-envelope per-order cap (port of stratops max_qty_per_order). When set,
     # a maker order whose quantized size exceeds this many base units is REFUSED at the
     # placement boundary (logged + skipped), never clamped down and never submitted oversized.
