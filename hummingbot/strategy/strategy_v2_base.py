@@ -19,6 +19,7 @@ from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.clock import Clock
 from hummingbot.core.data_type.common import MarketDict, PositionMode
+from hummingbot.core.utils.clock_watchdog import ClockWatchdog
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.event.events import OrderType, PositionAction
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -290,6 +291,11 @@ class StrategyV2Base(StrategyPyBase):
             initial_positions_by_controller=self._collect_initial_positions()
         )
 
+        # JEP-218: off-by-default clock-stall watchdog. When enabled via env, an OS
+        # thread dumps all-thread tracebacks + asyncio task stacks if the clock tick
+        # stops advancing (a frozen event loop). None when disabled -> zero overhead.
+        self._clock_watchdog = ClockWatchdog.from_env()
+
     # -------------------------------------------------------------------------
     # Shared methods (simple + V2 modes)
     # -------------------------------------------------------------------------
@@ -301,6 +307,8 @@ class StrategyV2Base(StrategyPyBase):
 
         :param timestamp: current tick timestamp
         """
+        if self._clock_watchdog is not None:
+            self._clock_watchdog.beat(timestamp)
         if not self.ready_to_trade:
             self.ready_to_trade = all(ex.ready for ex in self.connectors.values())
             if not self.ready_to_trade:
@@ -329,6 +337,9 @@ class StrategyV2Base(StrategyPyBase):
         Called when the strategy is stopped. Shuts down controllers, executors, and market data provider.
         """
         self._is_stop_triggered = True
+
+        if self._clock_watchdog is not None:
+            self._clock_watchdog.stop()
 
         # Stop controllers FIRST to prevent new executor actions
         for controller in self.controllers.values():
@@ -625,6 +636,11 @@ class StrategyV2Base(StrategyPyBase):
         if HummingbotApplication.main_application()._mqtt is not None:
             self.mqtt_enabled = True
             self._pub = ETopicPublisher("performance", use_bot_prefix=True)
+
+        # JEP-218: start the clock-stall watchdog (no-op when disabled). Started here
+        # (inside the running loop, after a real tick beats) so it captures the loop.
+        if self._clock_watchdog is not None:
+            self._clock_watchdog.start()
 
         # Start controllers
         for controller in self.controllers.values():
