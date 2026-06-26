@@ -111,6 +111,10 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
     session_halt_max_ws_age_s: float = 3.0
     session_halt_max_book_static_s: float = 15.0
     session_halt_cooldown_s: float = 1800.0
+    # JEP-226: cap (s) of continuous same-side naked age the hedge is deferred during a
+    # clock-scheduled single-price auction before force-hedging. <=0 disables the whole
+    # session-aware hedge gate (behavior-neutral). Read by CrossVenueHedgedExecutorBase.
+    hedge_session_defer_cap_s: float = 30.0
     # Observe / no-submit: compute fair + targets and LOG the intended maker quotes
     # but never call place_order (no real orders, so no fills and no hedges). For
     # safe live verification of the full decision path before enabling submission.

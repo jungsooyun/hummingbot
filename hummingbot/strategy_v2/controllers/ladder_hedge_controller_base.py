@@ -42,6 +42,10 @@ class LadderHedgeControllerConfigBase(ControllerConfigBase):
     # halt this many seconds past the freeze END (covers the ~10min CB single-price auction the
     # clock can't see). Default 1800s = full CB (20min freeze + 10min auction). 0 disables.
     session_halt_cooldown_s: float = Field(default=1800.0, json_schema_extra={"is_updatable": True})
+    # JEP-226: see LadderMakerExecutorConfig.hedge_session_defer_cap_s. Cap (s) the hedge taker
+    # defers during a clock-scheduled single-price auction before force-hedging; <=0 disables the
+    # session-aware hedge gate (behavior-neutral). Hot-tunable; the gate behavior itself needs a cold-boot.
+    hedge_session_defer_cap_s: float = Field(default=30.0, json_schema_extra={"is_updatable": True})
     adopt_existing_inventory: bool = Field(default=False, json_schema_extra={"is_updatable": True})
     latency_profiling: bool = Field(default=False, json_schema_extra={"is_updatable": True})
     max_executors: int = Field(default=1, json_schema_extra={"is_updatable": True})

@@ -191,6 +191,8 @@ class Hip3KisLadderController(LadderHedgeControllerBase):
             session_halt_gate_enabled=self.config.session_halt_gate_enabled,
             session_halt_max_ws_age_s=self.config.session_halt_max_ws_age_s,
             session_halt_max_book_static_s=self.config.session_halt_max_book_static_s,
+            session_halt_cooldown_s=self.config.session_halt_cooldown_s,   # JEP-226 F6: was missing -> cooldown knob was dead (pinned to executor default 1800.0)
+            hedge_session_defer_cap_s=self.config.hedge_session_defer_cap_s,
             observe=self.config.observe,
             adopt_existing_inventory=self.config.adopt_existing_inventory,
             latency_profiling=self.config.latency_profiling,

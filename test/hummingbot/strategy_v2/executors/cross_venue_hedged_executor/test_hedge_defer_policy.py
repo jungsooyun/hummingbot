@@ -67,3 +67,14 @@ def test_side_flip_restarts_timer_no_premature_force():
 def test_same_side_keeps_timer():
     d = _d(defer_side="SELL", needed_side="SELL", defer_since=995.0, now=1000.0)
     assert d.since == 995.0 and d.side == "SELL"
+
+
+def test_executor_config_exposes_defer_cap_default_30():
+    # JEP-226 F4: ExecutorConfigBase is pydantic v2 extra=ignore — a pass-through kwarg the
+    # config class does not declare is SILENTLY DROPPED. The field must exist on the executor
+    # config so getattr(config, "hedge_session_defer_cap_s") is real, not the 30.0 fallback.
+    # (The controller-config is_updatable + construction pass-through are Docker-verified in Task 7.)
+    from hummingbot.strategy_v2.executors.ladder_maker_executor.data_types import LadderMakerExecutorConfig
+    fields = LadderMakerExecutorConfig.model_fields
+    assert "hedge_session_defer_cap_s" in fields
+    assert fields["hedge_session_defer_cap_s"].default == 30.0
