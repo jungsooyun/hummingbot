@@ -1183,33 +1183,38 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             return
         # JEP-226: session/auction-aware gate. needed_side is non-None here (pending != ZERO).
         # Defer a hedge that cannot fill at a continuous price; force only on a clock-scheduled
-        # auction past the cap; hold (never force) on a genuine halt. cap<=0 disables the gate.
-        dec = decide_hedge_defer(
-            cap=self._hedge_session_defer_cap_s,
-            halted=(self._session_halt_state is not None and self._session_halt_state.halted),
-            reason=(self._session_halt_state.reason if self._session_halt_state is not None else ""),
-            defer_since=self._hedge_defer_since_ts,
-            defer_side=self._hedge_defer_side,
-            needed_side=needed_side,
-            now=self._strategy.current_timestamp,
-            force_eligible_reasons=FORCE_ELIGIBLE_HALT_REASONS,
-        )
-        self._hedge_defer_since_ts = dec.since
-        self._hedge_defer_side = dec.side
-        if dec.since is None:
-            self._hedge_defer_logged_kind = None
-        elif dec.kind != self._hedge_defer_logged_kind:
-            self.logger().warning(
-                "JEP-226 hedge %s: reason=%s pending=%s cap=%.0fs (place=%s).",
-                dec.kind,
-                self._session_halt_state.reason if self._session_halt_state is not None else "",
-                self._pending_hedge_base,
-                self._hedge_session_defer_cap_s,
-                dec.place,
+        # auction past the cap; hold (never force) on a genuine halt. cap<=0 OR not-halted is
+        # behavior-neutral and MUST NOT read the clock (mirrors the JEP-219 disable-check
+        # discipline: a harness / non-session venue never sets _strategy.current_timestamp).
+        # getattr-defensive so an executor built bypassing __init__ skips the gate entirely.
+        cap = getattr(self, "_hedge_session_defer_cap_s", 0.0)
+        st = getattr(self, "_session_halt_state", None)
+        if cap > 0 and st is not None and st.halted:
+            dec = decide_hedge_defer(
+                cap=cap,
+                halted=True,
+                reason=st.reason,
+                defer_since=getattr(self, "_hedge_defer_since_ts", None),
+                defer_side=getattr(self, "_hedge_defer_side", None),
+                needed_side=needed_side,
+                now=self._strategy.current_timestamp,
+                force_eligible_reasons=FORCE_ELIGIBLE_HALT_REASONS,
             )
-            self._hedge_defer_logged_kind = dec.kind
-        if not dec.place:
-            return
+            self._hedge_defer_since_ts = dec.since
+            self._hedge_defer_side = dec.side
+            if dec.kind != getattr(self, "_hedge_defer_logged_kind", None):
+                self.logger().warning(
+                    "JEP-226 hedge %s: reason=%s pending=%s cap=%.0fs (place=%s).",
+                    dec.kind, st.reason, self._pending_hedge_base, cap, dec.place,
+                )
+                self._hedge_defer_logged_kind = dec.kind
+            if not dec.place:  # "defer" or "hold" -> hold pending, suppress placement
+                return
+        else:
+            # gate disabled (cap<=0) or not halted -> clear the timer; proceed to place.
+            self._hedge_defer_since_ts = None
+            self._hedge_defer_side = None
+            self._hedge_defer_logged_kind = None
         pending_base = self._pending_hedge_base
         spec = self._size_hedge(pending_base)
         if spec is None:
