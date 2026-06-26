@@ -51,6 +51,12 @@ class KrxSessionCalendar:
     _KRX_CLOSE_MIN = 15 * 60 + 30  # 15:30 KST
     _KRX_OPEN_AUCTION = (8 * 60 + 30, 9 * 60)          # [08:30, 09:00) KST opening call auction
     _KRX_CLOSE_AUCTION = (15 * 60 + 20, 15 * 60 + 30)  # [15:20, 15:30) KST closing call auction
+    # JEP-226: 시간외단일가 [16:00, 18:00) KST — 10-min single-price batch auctions (no continuous
+    # matching). A marketable hedge here rests/fills at the batch match, not at a continuous quote;
+    # surfaced as in_auction_window -> the hedge taker defers-then-forces (force-eligible). 시간외종가
+    # [15:40,16:00) is continuous-at-close-price (fillable) and NXT (15:30-20:00) is continuous, so
+    # neither is a defer window.
+    _KRX_AFTERHOURS_SINGLE = (16 * 60, 18 * 60)        # [16:00, 18:00) KST 시간외단일가
 
     def now(self, current_timestamp: float) -> datetime:
         return datetime.fromtimestamp(current_timestamp, tz=self._KST)
@@ -66,4 +72,5 @@ class KrxSessionCalendar:
         now = self.now(current_timestamp)
         m = now.hour * 60 + now.minute
         return (self._KRX_OPEN_AUCTION[0] <= m < self._KRX_OPEN_AUCTION[1]
-                or self._KRX_CLOSE_AUCTION[0] <= m < self._KRX_CLOSE_AUCTION[1])
+                or self._KRX_CLOSE_AUCTION[0] <= m < self._KRX_CLOSE_AUCTION[1]
+                or self._KRX_AFTERHOURS_SINGLE[0] <= m < self._KRX_AFTERHOURS_SINGLE[1])

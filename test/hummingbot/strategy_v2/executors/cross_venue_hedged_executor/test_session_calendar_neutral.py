@@ -42,8 +42,10 @@ def test_krx_eod_pressure_wind_nonpositive_is_zero():
 
 
 @pytest.mark.parametrize("hour,minute,expected", [
-    (8, 29, False), (8, 30, True), (8, 59, True), (9, 0, False),   # opening call auction [08:30,09:00)
+    (8, 29, False), (8, 30, True), (8, 59, True), (9, 0, False),      # opening call auction [08:30,09:00)
     (15, 19, False), (15, 20, True), (15, 29, True), (15, 30, False),  # closing call auction [15:20,15:30)
+    (15, 50, False),                                                 # 시간외종가 -> fillable, NOT a defer window
+    (15, 59, False), (16, 0, True), (17, 59, True), (18, 0, False),  # 시간외단일가 [16:00,18:00)
     (12, 0, False),  # mid-session continuous
 ])
 def test_krx_in_auction_window(hour, minute, expected):
