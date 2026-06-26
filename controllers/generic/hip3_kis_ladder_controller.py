@@ -84,8 +84,12 @@ class Hip3KisLadderControllerConfig(LadderHedgeControllerConfigBase):
     # Per-config so only NXT-exposed controllers switch; default LIMIT preserves existing behavior.
     hedge_order_type: OrderType = OrderType.LIMIT
     # JEP-219: cancel + re-price a hedge that rests OPEN (unfilled) past this many seconds. Bounds
-    # naked exposure when a marketable hedge parks on a thin/empty book. 0 disables (behavior-neutral).
-    hedge_fill_timeout_s: float = 0.0
+    # naked exposure when a marketable hedge parks on a thin/empty book. 0 disables.
+    # JEP-226: default 6.0 (was 0.0). A hedged MM must never leave a hedge resting untended: SKHX
+    # inherited 0.0 and a marketable LIMIT that failed to cross a single-price/thin book (auction,
+    # NXT after-market) could sit unfilled -> perp leg naked with no re-price. 6s matches SMSN's
+    # proven value. Set 0 explicitly only for a controller that wants the (unsafe) no-timeout behavior.
+    hedge_fill_timeout_s: float = 6.0
 
     # Two-sided MM
     two_sided: bool = False

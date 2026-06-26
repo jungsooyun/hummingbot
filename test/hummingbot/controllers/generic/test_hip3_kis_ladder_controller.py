@@ -241,6 +241,15 @@ def test_config_default_round_trip_cost_is_positive():
     assert cfg.round_trip_cost_bps > Decimal("0")
 
 
+def test_config_default_hedge_fill_timeout_bounds_naked_exposure():
+    # JEP-226: a hedged MM must never leave a hedge resting untended. The default must be a
+    # positive timeout so an inheriting controller (e.g. SKHX, which sets no override) cannot
+    # sit naked when a marketable hedge fails to cross a thin / single-price book (auction, NXT).
+    cfg = Hip3KisLadderControllerConfig(id="t")
+    assert cfg.hedge_fill_timeout_s == 6.0
+    assert cfg.hedge_fill_timeout_s > 0
+
+
 def test_config_rejects_non_unit_share_per_unit():
     # cross-venue hedge accounting assumes 1 maker unit == 1 hedge share
     with pytest.raises(ValueError, match="share_per_unit"):
