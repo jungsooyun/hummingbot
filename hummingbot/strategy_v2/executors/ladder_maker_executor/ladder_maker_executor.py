@@ -216,14 +216,10 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
                 total += Decimal(order.price) * Decimal(order.amount)
         return total
 
-    def _gates_open(self) -> bool:
-        if getattr(self, "_seed_fail_closed", False):
-            return False
-
-        def _age_for_ctx(age):
-            return age if age is not None else float("inf")
-
-        ws_on = getattr(self.config, "ws_staleness_kill_switch_enabled", False)
+    def _evaluate_session_state(self) -> None:
+        # JEP-226: compute the folded halt decision ONCE per tick (relocated out of _gates_open)
+        # and cache it so BOTH the maker gate AND the base hedge path read one decision. Behavior-
+        # neutral when disabled (NoHaltSource never halts; session_halt_cooldown_s==0 no-ops the latch).
         _halt_st = self._halt_source.evaluate(
             self.hedge_trading_pair,
             in_auction=self._calendar.in_auction_window(self._strategy.current_timestamp),
@@ -232,8 +228,7 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         )
         # JEP-198 interim auction-gap guard (D): hold the halt past the freeze END so the CB
         # single-price-auction phase (updating 예상체결 book) cannot re-open the gate while the
-        # KIS taker hedge is unavailable. Behavior-neutral when the gate is disabled (NoHaltSource
-        # never halts) or session_halt_cooldown_s == 0.
+        # KIS taker hedge is unavailable.
         _halt_st, self._halt_cooldown_until, _cd_armed = apply_post_halt_cooldown(
             _halt_st,
             now=self._strategy.current_timestamp,
@@ -246,6 +241,20 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
                 f"({getattr(self.config, 'session_halt_cooldown_s', 1800.0)}s): holding the maker-quote "
                 f"halt past the freeze to cover the unscheduled single-price auction "
                 f"(KIS taker unavailable). arming_reason={_halt_st.reason!r}")
+        self._session_halt_state = _halt_st
+
+    def _gates_open(self) -> bool:
+        if getattr(self, "_seed_fail_closed", False):
+            return False
+
+        def _age_for_ctx(age):
+            return age if age is not None else float("inf")
+
+        ws_on = getattr(self.config, "ws_staleness_kill_switch_enabled", False)
+        # JEP-226: session halt state is computed once per tick in _evaluate_session_state()
+        # (called before _gates_open in control_task) and cached on self._session_halt_state.
+        # getattr-defensive: test helpers build the executor bypassing __init__.
+        _sh = getattr(self, "_session_halt_state", None)
         ctx = GateContext(
             now_kst=self._calendar.now(self._strategy.current_timestamp),
             kis_age_s=0.0,  # REST book-age gate -> JEP-133
@@ -259,7 +268,7 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             kill_switch=bool(self.config.kill_switch) or self._hedge_kill_switch or self._staleness_kill_switch,
             kis_ws_age_s=_age_for_ctx(self._hedge_ws_age_s) if ws_on else 0.0,  # KIS = hedge leg
             hl_ws_age_s=_age_for_ctx(self._maker_ws_age_s) if ws_on else 0.0,  # HL = maker leg
-            kis_session_halted=_halt_st.halted,
+            kis_session_halted=(_sh.halted if _sh is not None else False),
         )
         if not self._gate_chain.evaluate(ctx).open:
             return False

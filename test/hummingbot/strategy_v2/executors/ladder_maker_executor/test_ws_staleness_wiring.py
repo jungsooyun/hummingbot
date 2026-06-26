@@ -84,6 +84,7 @@ class LadderMakerWsStalenessWiringTest(unittest.TestCase):
         ex._halt_source = SimpleNamespace(
             evaluate=lambda p, **kw: SessionHaltState(halted=True, ready=True, reason="book_frozen"))
         ex._calendar = SimpleNamespace(now=lambda ts: _kst(10), in_auction_window=lambda ts: False)
+        ex._evaluate_session_state()  # JEP-226: production calls this before _gates_open each tick
         self.assertFalse(ex._gates_open())
 
     def test_gates_open_when_not_halted(self):
@@ -93,6 +94,7 @@ class LadderMakerWsStalenessWiringTest(unittest.TestCase):
         ex._halt_source = SimpleNamespace(
             evaluate=lambda p, **kw: SessionHaltState(halted=False, ready=True, reason=""))
         ex._calendar = SimpleNamespace(now=lambda ts: _kst(10), in_auction_window=lambda ts: False)
+        ex._evaluate_session_state()  # JEP-226: production calls this before _gates_open each tick
         # other gates open + fair computable -> open
         self.assertTrue(ex._gates_open())
 
@@ -111,21 +113,27 @@ class LadderMakerWsStalenessWiringTest(unittest.TestCase):
 
     def test_cooldown_holds_halt_after_freeze_clears(self):
         ex, state = self._make_halt_seq(1800.0)
+        # JEP-226: _evaluate_session_state() runs the cooldown latch each tick (was inline in _gates_open).
         # tick 1: real freeze -> gates closed + cooldown armed (until 1000+1800=2800)
         ex._strategy.current_timestamp = 1000.0
+        ex._evaluate_session_state()
         self.assertFalse(ex._gates_open())
         # tick 2: book un-froze (CB single-price auction) but within cooldown -> STILL closed
         state["halted"], state["reason"] = False, ""
         ex._strategy.current_timestamp = 1500.0
+        ex._evaluate_session_state()
         self.assertFalse(ex._gates_open())
         # tick 3: cooldown expired -> gates open again
         ex._strategy.current_timestamp = 2801.0
+        ex._evaluate_session_state()
         self.assertTrue(ex._gates_open())
 
     def test_cooldown_zero_does_not_hold(self):
         ex, state = self._make_halt_seq(0.0)   # cooldown disabled
         ex._strategy.current_timestamp = 1000.0
+        ex._evaluate_session_state()
         self.assertFalse(ex._gates_open())      # frozen -> closed by the freeze itself
         state["halted"], state["reason"] = False, ""
         ex._strategy.current_timestamp = 1001.0
+        ex._evaluate_session_state()
         self.assertTrue(ex._gates_open())       # no cooldown -> reopens immediately

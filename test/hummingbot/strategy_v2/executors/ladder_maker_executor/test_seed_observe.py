@@ -105,8 +105,14 @@ def _make_observe_executor(*, adopt: bool) -> LadderMakerExecutor:
     ex._should_reprice = MagicMock(return_value=True)
     ex.logger = MagicMock(return_value=MagicMock())
     from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_calendar import KrxSessionCalendar
+    from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_halt_source import NoHaltSource
 
     ex._calendar = KrxSessionCalendar()
+    # JEP-226: control_task now calls _evaluate_session_state() (ladder override) at the top of the
+    # RUNNING branch, which reads _halt_source/_halt_cooldown_until. Production sets these in __init__;
+    # this fixture bypasses __init__, so wire the behavior-neutral defaults here.
+    ex._halt_source = NoHaltSource()
+    ex._halt_cooldown_until = 0.0
     return ex
 
 
