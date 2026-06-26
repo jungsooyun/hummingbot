@@ -83,12 +83,17 @@ from hummingbot.core.event.events import (
 )
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
+from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.hedge_defer_policy import decide_hedge_defer
 from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.maker_reconcile import (
     RestingOrder,
     RungTarget,
     Side,
     blocked_targets,
     diff_ladder_targets,
+)
+from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_halt_source import (
+    FORCE_ELIGIBLE_HALT_REASONS,
+    SessionHaltState,
 )
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair, ExecutorConfigBase
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
@@ -182,6 +187,15 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         # while the order stays open (else one dropped cancel re-opens the naked window forever).
         self._hedge_cancel_requested: Dict[str, float] = {}
 
+        # JEP-226: session/auction-aware hedge gate. Cached per-tick folded halt state (set by
+        # _evaluate_session_state; None on non-session venues -> never blocks). The defer timer
+        # measures CONTINUOUS same-side naked age; cap from config (<=0 disables the gate).
+        self._session_halt_state: Optional[SessionHaltState] = None
+        self._hedge_defer_since_ts: Optional[float] = None
+        self._hedge_defer_side: Optional[TradeType] = None
+        self._hedge_defer_logged_kind: Optional[str] = None
+        self._hedge_session_defer_cap_s = float(getattr(config, "hedge_session_defer_cap_s", 30.0) or 0.0)
+
         # Direction-aware inventory ledgers. Legacy executed-base/quote totals above
         # stay as magnitudes because get_net_pnl_quote intentionally remains unchanged.
         self._maker_buy_base = ZERO
@@ -267,6 +281,12 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             rec.close()
 
     # ============================================================ abstract hooks
+
+    def _evaluate_session_state(self) -> None:
+        """JEP-226: compute + cache ``self._session_halt_state`` for this tick. Base = no-op
+        (no session venue); subclasses with a SessionCalendar/HaltSource override. Called from
+        ``control_task`` before every ``_process_hedges`` so the hedge gate sees fresh state."""
+        return
 
     @abstractmethod
     def _gates_open(self) -> bool:
@@ -402,6 +422,10 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
     async def control_task(self):
         if self.status == RunnableStatus.RUNNING:
             await self._seed_inventory_from_connector()
+            # JEP-226: refresh the cached session-halt state BEFORE any _process_hedges call.
+            # The seed-pending branch below calls _process_hedges before _evaluate_ws_staleness,
+            # so this must run at the very top to keep the hedge gate fresh on every path.
+            self._evaluate_session_state()
             if self._seed_pending():
                 # JEP-210: an adopt:true seed is still in progress (not yet adopted, not yet
                 # fail-closed). Do not quote -- otherwise the executor would place opens before
@@ -419,6 +443,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self._process_hedges()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
             self._evaluate_ws_staleness()
+            self._evaluate_session_state()  # JEP-226: _control_shutdown -> _process_hedges needs fresh state
             await self._control_shutdown()
 
     def early_stop(self, keep_position: bool = False, flatten: bool = False):
@@ -1138,6 +1163,11 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             ):
                 self._strategy.cancel(self.hedge_connector, self.hedge_trading_pair, oid)
         if self._pending_hedge_signed == ZERO:
+            # JEP-226: naked exposure cleared -> reset the defer timer so a fresh pending
+            # never inherits a stale elapsed naked age.
+            self._hedge_defer_since_ts = None
+            self._hedge_defer_side = None
+            self._hedge_defer_logged_kind = None
             return
         if self._hedge_in_flight():
             return
@@ -1150,6 +1180,35 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                     self._pending_hedge_base,
                 )
                 self._hedge_suppress_logged = True
+            return
+        # JEP-226: session/auction-aware gate. needed_side is non-None here (pending != ZERO).
+        # Defer a hedge that cannot fill at a continuous price; force only on a clock-scheduled
+        # auction past the cap; hold (never force) on a genuine halt. cap<=0 disables the gate.
+        dec = decide_hedge_defer(
+            cap=self._hedge_session_defer_cap_s,
+            halted=(self._session_halt_state is not None and self._session_halt_state.halted),
+            reason=(self._session_halt_state.reason if self._session_halt_state is not None else ""),
+            defer_since=self._hedge_defer_since_ts,
+            defer_side=self._hedge_defer_side,
+            needed_side=needed_side,
+            now=self._strategy.current_timestamp,
+            force_eligible_reasons=FORCE_ELIGIBLE_HALT_REASONS,
+        )
+        self._hedge_defer_since_ts = dec.since
+        self._hedge_defer_side = dec.side
+        if dec.since is None:
+            self._hedge_defer_logged_kind = None
+        elif dec.kind != self._hedge_defer_logged_kind:
+            self.logger().warning(
+                "JEP-226 hedge %s: reason=%s pending=%s cap=%.0fs (place=%s).",
+                dec.kind,
+                self._session_halt_state.reason if self._session_halt_state is not None else "",
+                self._pending_hedge_base,
+                self._hedge_session_defer_cap_s,
+                dec.place,
+            )
+            self._hedge_defer_logged_kind = dec.kind
+        if not dec.place:
             return
         pending_base = self._pending_hedge_base
         spec = self._size_hedge(pending_base)
