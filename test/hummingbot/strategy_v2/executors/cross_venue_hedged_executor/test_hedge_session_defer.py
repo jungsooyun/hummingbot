@@ -18,9 +18,9 @@ from test.hummingbot.strategy_v2.executors.cross_venue_hedged_executor.test_hedg
 )
 
 
-def _arm(h, *, halted, reason, cap=30.0, since=None, side=None, now=1000.0):
+def _arm(h, *, halted, reason, cap=30.0, since=None, side=None, now=1000.0, hard_halt=False):
     """Configure the JEP-226 gate state on a harness needing a BUY hedge (pending=-1)."""
-    h._session_halt_state = SessionHaltState(halted=halted, ready=True, reason=reason)
+    h._session_halt_state = SessionHaltState(halted=halted, ready=True, reason=reason, hard_halt=hard_halt)
     h._hedge_session_defer_cap_s = cap
     h._hedge_defer_since_ts = since
     h._hedge_defer_side = side
@@ -60,6 +60,27 @@ def test_hold_on_hour_cls_auction():
     _arm(h, halted=True, reason="hour_cls_auction", since=0.0, side=TradeType.BUY, now=10_000.0)
     h._process_hedges()
     assert h.placed == [] and h._hedge_defer_logged_kind == "hold"
+
+
+def test_auction_with_hard_halt_overlap_holds():
+    # challenge F1: CB/거래정지/VI/stale overlapping a scheduled auction -> reason stays
+    # "in_auction_window" but hard_halt=True -> HOLD, never force.
+    h = _Harness()
+    _arm(h, halted=True, reason="in_auction_window", hard_halt=True, since=0.0, side=TradeType.BUY, now=10_000.0)
+    h._process_hedges()
+    assert h.placed == [] and h._hedge_defer_logged_kind == "hold"
+
+
+def test_fail_closed_when_cap_set_but_state_missing():
+    # challenge F5: gate configured (cap>0) but no cached session state -> hold (fail-closed), not place.
+    h = _Harness()
+    h._hedge_session_defer_cap_s = 30.0
+    h._session_halt_state = None
+    h._pending_hedge_signed = Decimal("-1")
+    h._hedge_order_side = {}
+    h._strategy.current_timestamp = 1000.0
+    h._process_hedges()
+    assert h.placed == [] and h._hedge_defer_logged_kind == "fail_closed"
 
 
 def test_cap_zero_killswitch_places_despite_halt():

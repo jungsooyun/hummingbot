@@ -1187,13 +1187,26 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         # behavior-neutral and MUST NOT read the clock (mirrors the JEP-219 disable-check
         # discipline: a harness / non-session venue never sets _strategy.current_timestamp).
         # getattr-defensive so an executor built bypassing __init__ skips the gate entirely.
+        # The cap bounds the DEFER phase (waiting to place); once forced, JEP-219
+        # _reconcile_open_hedges bounds each in-flight resting phase. The timer is NOT touched on
+        # the _hedge_in_flight / WS-stale early-returns above, so naked age is PRESERVED across an
+        # in-flight period (it does not restart a fresh cap after a JEP-219 cancel).
         cap = getattr(self, "_hedge_session_defer_cap_s", 0.0)
         st = getattr(self, "_session_halt_state", None)
+        if cap > 0 and st is None:
+            # Fail-closed: the gate is configured (cap>0) but the per-tick session state was not
+            # computed (mis-sequencing). A safety gate MUST NOT fail open -> hold the hedge.
+            if getattr(self, "_hedge_defer_logged_kind", None) != "fail_closed":
+                self.logger().error(
+                    "JEP-226: session state missing with cap=%.0fs — holding hedge (fail-closed).", cap)
+                self._hedge_defer_logged_kind = "fail_closed"
+            return
         if cap > 0 and st is not None and st.halted:
             dec = decide_hedge_defer(
                 cap=cap,
                 halted=True,
                 reason=st.reason,
+                hard_halt=st.hard_halt,
                 defer_since=getattr(self, "_hedge_defer_since_ts", None),
                 defer_side=getattr(self, "_hedge_defer_side", None),
                 needed_side=needed_side,
@@ -1204,8 +1217,8 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self._hedge_defer_side = dec.side
             if dec.kind != getattr(self, "_hedge_defer_logged_kind", None):
                 self.logger().warning(
-                    "JEP-226 hedge %s: reason=%s pending=%s cap=%.0fs (place=%s).",
-                    dec.kind, st.reason, self._pending_hedge_base, cap, dec.place,
+                    "JEP-226 hedge %s: reason=%s hard_halt=%s pending=%s cap=%.0fs (place=%s).",
+                    dec.kind, st.reason, st.hard_halt, self._pending_hedge_base, cap, dec.place,
                 )
                 self._hedge_defer_logged_kind = dec.kind
             if not dec.place:  # "defer" or "hold" -> hold pending, suppress placement

@@ -8,7 +8,7 @@ FE = frozenset({"in_auction_window"})
 
 
 def _d(**kw):
-    base = dict(cap=30.0, halted=True, reason="in_auction_window",
+    base = dict(cap=30.0, halted=True, reason="in_auction_window", hard_halt=False,
                 defer_since=None, defer_side="SELL", needed_side="SELL",
                 now=1000.0, force_eligible_reasons=FE)
     base.update(kw)
@@ -48,6 +48,18 @@ def test_auction_at_cap_forces():
 def test_auction_past_cap_forces():
     d = _d(defer_since=900.0, now=1000.0)        # naked_age=100 >= 30
     assert d.place is True and d.kind == "force" and d.since == 900.0
+
+
+def test_auction_with_hard_halt_overlap_holds_never_forces():
+    # JEP-226 (challenge F1): a real halt (CB/거래정지/VI/stale) overlapping a scheduled auction
+    # arrives as reason="in_auction_window" + hard_halt=True -> HOLD, never force into a non-fillable book.
+    d = _d(reason="in_auction_window", hard_halt=True, defer_since=0.0, now=10_000.0)  # naked huge
+    assert d.place is False and d.kind == "hold"
+
+
+def test_auction_no_hard_halt_still_forces():
+    d = _d(reason="in_auction_window", hard_halt=False, defer_since=900.0, now=1000.0)
+    assert d.place is True and d.kind == "force"
 
 
 def test_halt_reason_never_forces_even_past_cap():

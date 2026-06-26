@@ -24,6 +24,12 @@ class SessionHaltState:
     halted: bool
     ready: bool
     reason: str
+    # JEP-226: True when a genuine non-fillable halt (CB / 거래정지 / VI / stale-or-unconfirmed
+    # book) is present. ``in_auction`` is checked FIRST in compute_session_halt (so a scheduled
+    # auction overlapping a real halt is still reasoned as "in_auction_window" for the maker
+    # book_frozen suppression), but the hedge force-eligibility must NOT force into such an
+    # overlap -> it reads this flag. Defaults False; only the in_auction return needs it accurate.
+    hard_halt: bool = False
 
 
 def compute_session_halt(
@@ -53,9 +59,13 @@ def compute_session_halt(
         and sig.book_static_sec > max_book_static_s
     )
     ready = book_fresh and sig.market_status_ready
+    # JEP-226: a genuine non-fillable halt present regardless of the scheduled-auction clock.
+    # book_frozen is excluded here: it is (not in_auction)-gated and a static book DURING a
+    # scheduled auction is normal, not a freeze (see test_book_frozen_suppressed_during_auction).
+    hard_halt = bool(sig.cb_latched or sig.trht_halted or sig.vi_latched or not ready)
 
     if in_auction:
-        return SessionHaltState(True, ready, "in_auction_window")
+        return SessionHaltState(True, ready, "in_auction_window", hard_halt=hard_halt)
     if not ready:
         reason = "not_ready_book_stale" if not book_fresh else "not_ready_status_unconfirmed"
         return SessionHaltState(True, ready, reason)

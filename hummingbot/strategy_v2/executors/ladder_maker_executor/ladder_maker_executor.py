@@ -268,7 +268,11 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             kill_switch=bool(self.config.kill_switch) or self._hedge_kill_switch or self._staleness_kill_switch,
             kis_ws_age_s=_age_for_ctx(self._hedge_ws_age_s) if ws_on else 0.0,  # KIS = hedge leg
             hl_ws_age_s=_age_for_ctx(self._maker_ws_age_s) if ws_on else 0.0,  # HL = maker leg
-            kis_session_halted=(_sh.halted if _sh is not None else False),
+            # JEP-226 fail-closed: if the gate is ENABLED but the per-tick session state was not
+            # computed (mis-sequencing), close the maker gate rather than fail open. Disabled gate
+            # (or non-session venue) -> False (behavior-neutral).
+            kis_session_halted=(_sh.halted if _sh is not None
+                                else bool(getattr(self.config, "session_halt_gate_enabled", False))),
         )
         if not self._gate_chain.evaluate(ctx).open:
             return False

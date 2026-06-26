@@ -33,6 +33,7 @@ def decide_hedge_defer(
     cap: float,
     halted: bool,
     reason: str,
+    hard_halt: bool,
     defer_since: Optional[float],
     defer_side: Any,
     needed_side: Any,
@@ -46,9 +47,13 @@ def decide_hedge_defer(
     if since is None or side != needed_side:
         since, side = now, needed_side
     naked_age = now - since
-    if reason in force_eligible_reasons:
+    # Force ONLY into a clock-scheduled auction with NO overlapping hard halt: in_auction is
+    # checked before cb/trht/vi/not-ready in compute_session_halt, so a real halt overlapping a
+    # scheduled window arrives as reason="in_auction_window" with hard_halt=True -> hold, never
+    # force into a non-fillable book.
+    if reason in force_eligible_reasons and not hard_halt:
         if naked_age >= cap:
             return HedgeDeferDecision(place=True, since=since, side=side, kind="force")
         return HedgeDeferDecision(place=False, since=since, side=side, kind="defer")
-    # non-auction halt: hold, never force
+    # non-auction halt, OR a scheduled auction overlapping a hard halt: hold, never force
     return HedgeDeferDecision(place=False, since=since, side=side, kind="hold")

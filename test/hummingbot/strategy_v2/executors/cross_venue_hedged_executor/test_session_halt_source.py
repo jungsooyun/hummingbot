@@ -156,4 +156,15 @@ def test_apply_post_halt_cooldown_type_hints_resolve():
     import typing
     from hummingbot.strategy_v2.executors.cross_venue_hedged_executor import session_halt_source as m
     typing.get_type_hints(m.apply_post_halt_cooldown)  # NameError if Tuple unimported
+
+
+def test_in_auction_hard_halt_flag_reflects_overlapping_halt():
+    # JEP-226 (challenge F1): in_auction is reasoned first, but hard_halt must still flag a real
+    # overlapping halt so the hedge force-eligibility can refuse to force.
+    assert _eval(_sig(book_age_sec=0.1, book_static_sec=0.1), in_auction=True).hard_halt is False
+    assert _eval(_sig(cb_latched=True), in_auction=True).reason == "in_auction_window"
+    assert _eval(_sig(cb_latched=True), in_auction=True).hard_halt is True
+    assert _eval(_sig(vi_latched=True, book_static_sec=0.1), in_auction=True).hard_halt is True
+    assert _eval(_sig(trht_halted=True, book_static_sec=0.1), in_auction=True).hard_halt is True
+    assert _eval(_sig(book_age_sec=99.0), in_auction=True).hard_halt is True  # stale book = not ready
     assert "in_auction_window" not in COOLDOWN_ARM_REASONS
