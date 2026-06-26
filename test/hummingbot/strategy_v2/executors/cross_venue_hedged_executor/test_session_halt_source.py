@@ -127,4 +127,33 @@ def test_arm_reasons_membership():
     assert "book_frozen" in COOLDOWN_ARM_REASONS
     assert "market_wide_cb" in COOLDOWN_ARM_REASONS
     assert "not_ready_book_stale" not in COOLDOWN_ARM_REASONS
+
+
+# ----------------------------------------------------------- JEP-226 force-eligibility + Tuple import
+
+def test_force_eligible_reasons_is_in_auction_only():
+    from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_halt_source import (
+        FORCE_ELIGIBLE_HALT_REASONS,
+    )
+    assert FORCE_ELIGIBLE_HALT_REASONS == frozenset({"in_auction_window"})
+    # hour_cls_auction / vi must NOT be force-eligible (R2-F1): they only surface OUTSIDE a clock window
+    assert "hour_cls_auction" not in FORCE_ELIGIBLE_HALT_REASONS
+    assert "vi" not in FORCE_ELIGIBLE_HALT_REASONS
+    assert FORCE_ELIGIBLE_HALT_REASONS.isdisjoint(COOLDOWN_ARM_REASONS)
+
+
+def test_vi_and_hourcls_cooccur_folds_to_hourcls_not_force():
+    # vi co-occurring with hour_cls_auction folds to "hour_cls_auction" (priority), NOT force-eligible
+    from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_halt_source import (
+        FORCE_ELIGIBLE_HALT_REASONS,
+    )
+    st = _eval(_sig(hour_cls_auction=True, vi_latched=True, book_static_sec=0.1))
+    assert st.reason == "hour_cls_auction"
+    assert st.reason not in FORCE_ELIGIBLE_HALT_REASONS
+
+
+def test_apply_post_halt_cooldown_type_hints_resolve():
+    import typing
+    from hummingbot.strategy_v2.executors.cross_venue_hedged_executor import session_halt_source as m
+    typing.get_type_hints(m.apply_post_halt_cooldown)  # NameError if Tuple unimported
     assert "in_auction_window" not in COOLDOWN_ARM_REASONS

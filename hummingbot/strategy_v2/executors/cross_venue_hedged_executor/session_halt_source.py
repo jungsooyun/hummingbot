@@ -15,7 +15,7 @@ py312 without the Cython / V2 stack, and introduces no connector -> strategy imp
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Protocol, runtime_checkable
+from typing import Optional, Protocol, Tuple, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -82,6 +82,16 @@ def compute_session_halt(
 # In Phase 1 (H0STMKO0 off) only ``book_frozen`` actually fires; cb/trht/vi arm too once Phase 2
 # is enabled (belt-and-suspenders alongside the explicit latch).
 COOLDOWN_ARM_REASONS = frozenset({"book_frozen", "market_wide_cb", "trht_halt", "vi"})
+
+# JEP-226: the ONLY reason a forced taker may be placed into — the deterministic
+# clock-scheduled single-price auction, where the match price is well-defined and
+# time-invariant within the window. compute_session_halt checks `in_auction` FIRST,
+# so every clock window (open/close/시간외단일가) surfaces as exactly this reason.
+# Every OTHER halted reason is a connector-flagged signal that only appears OUTSIDE a
+# clock window (hour_cls_auction=='C' 예상가·VI단일가, checked before vi_latched; vi;
+# market_wide_cb; trht_halt; book_frozen; not_ready_*; post_halt_cooldown) -> hold,
+# never force (cannot fill into a real halt, or risks a VI/예상가 single-price match).
+FORCE_ELIGIBLE_HALT_REASONS = frozenset({"in_auction_window"})
 
 
 def apply_post_halt_cooldown(
