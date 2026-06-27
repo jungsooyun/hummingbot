@@ -2008,3 +2008,41 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
         queue = self.data_source._message_queue[self.data_source._trade_messages_queue_key]
         self.assertTrue(queue.empty())
+
+    # ------------------------------------------------------------------
+    # Test: JEP-217 out-of-session snapshot gate
+    # ------------------------------------------------------------------
+
+    async def test_request_snapshots_skipped_out_of_session(self):
+        """Out-of-session: _request_order_book_snapshots must NOT call super()
+        (no REST fetch, so the empty-book IOError path is never entered)."""
+        self.data_source._session_open_fn = lambda: False
+        with patch(
+            "hummingbot.core.data_type.order_book_tracker_data_source."
+            "OrderBookTrackerDataSource._request_order_book_snapshots",
+            new_callable=AsyncMock,
+        ) as mock_super:
+            await self.data_source._request_order_book_snapshots(asyncio.Queue())
+        mock_super.assert_not_called()
+
+    async def test_request_snapshots_runs_in_session(self):
+        """In-session: _request_order_book_snapshots delegates to super()."""
+        self.data_source._session_open_fn = lambda: True
+        with patch(
+            "hummingbot.core.data_type.order_book_tracker_data_source."
+            "OrderBookTrackerDataSource._request_order_book_snapshots",
+            new_callable=AsyncMock,
+        ) as mock_super:
+            q = asyncio.Queue()
+            await self.data_source._request_order_book_snapshots(q)
+        mock_super.assert_awaited_once()
+
+    def test_session_open_fn_defaults_to_real_window(self):
+        """With no injection, _is_session_open delegates to in_session_window."""
+        with patch(
+            "hummingbot.connector.exchange.kis.kis_api_order_book_data_source."
+            "in_session_window",
+            return_value=True,
+        ) as mock_win:
+            self.assertTrue(self.data_source._is_session_open())
+        mock_win.assert_called_once()

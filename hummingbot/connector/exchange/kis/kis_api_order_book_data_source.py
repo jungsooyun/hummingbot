@@ -1,13 +1,14 @@
 import asyncio
 import json
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from hummingbot.connector.exchange.kis import (
     kis_constants as CONSTANTS,
     kis_utils,
     kis_web_utils as web_utils,
 )
+from hummingbot.connector.exchange.kis.krx_session import in_session_window
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
@@ -59,6 +60,7 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         ws_enabled: bool = True,
         market_status_enabled: bool = False,
         market_status_capture_only: bool = False,
+        session_open_fn: Optional[Callable[[], bool]] = None,
     ):
         super().__init__(trading_pairs)
         self._connector = connector
@@ -77,6 +79,12 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # over-pause from the empty KNOWN_NORMAL_MKOP). Full ``market_status_enabled`` takes
         # precedence (subscribe + latch); capture-only is the subscribe + log middle mode.
         self._market_status_capture_only = market_status_capture_only
+        # JEP-217: out-of-session REST snapshot gate. Default = real KRX time
+        # window (fail-open, no holiday check). Injectable for deterministic tests.
+        self._session_open_fn = session_open_fn
+        # JEP-217: shutdown discriminator for the supervised snapshot loop — set by
+        # teardown so an intentional cancel propagates instead of being restarted.
+        self._ob_shutting_down = False
         self._market_status_subscribed = market_status_enabled or market_status_capture_only
         self._market_status_tr_id = CONSTANTS.WS_MARKET_STATUS_TR_ID_BY_ROUTING[market_routing]
         # REST snapshot market-division code, routing-aware like the WS TR_IDs above.
@@ -348,6 +356,32 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
     # ------------------------------------------------------------------
     # REST snapshot fallback (for initial load and recovery)
     # ------------------------------------------------------------------
+
+    def _is_session_open(self) -> bool:
+        """JEP-217: True when the KRX session is open (time window only, fail-open).
+
+        Uses the injected ``session_open_fn`` when present (tests), else the real
+        ``in_session_window``. Deliberately ignores holidays so the bot still
+        bootstraps on real trading days when the holiday cache is unknown; the
+        empty-book guard in ``_order_book_snapshot`` remains the safety net.
+        """
+        if self._session_open_fn is not None:
+            return self._session_open_fn()
+        return in_session_window(time.time())
+
+    async def _request_order_book_snapshots(self, output: asyncio.Queue):
+        """JEP-217: skip the REST snapshot poll entirely when out-of-session.
+
+        The base ``listen_for_order_book_snapshots`` while-loop stays alive and
+        re-checks the session every ``FULL_ORDER_BOOK_RESET_DELTA_SECONDS``
+        (~5s), so polling auto-resumes at the open boundary WITHOUT a task
+        stop/start (which would re-introduce the lifecycle churn at the exact
+        boundary where the cancel-death was observed). Out-of-session we never
+        enter the empty-book ``IOError`` path that preceded the death.
+        """
+        if not self._is_session_open():
+            return
+        return await super()._request_order_book_snapshots(output=output)
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
         """Build an OrderBookMessage from a KIS REST orderbook response."""
