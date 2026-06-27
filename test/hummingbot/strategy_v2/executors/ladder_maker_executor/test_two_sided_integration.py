@@ -33,6 +33,19 @@ class _Tracked:
         return Decimal("0")
 
 
+class _FeeTracked:
+    """Tracked hedge order carrying a native-quote (KRW) fee, for the completion path."""
+
+    def __init__(self, order_id, fee_quote):
+        self.order_id = order_id
+        self.order = None
+        self._fee_quote = Decimal(str(fee_quote))
+
+    @property
+    def cum_fees_quote(self):
+        return self._fee_quote
+
+
 class _Ev:
     def __init__(self, order_id, amount, price, trade_type):
         self.order_id = order_id
@@ -343,6 +356,32 @@ class LadderMakerTwoSidedIntegrationTest(unittest.TestCase):
 
         # maker_avg = 60 (USD); hedge_avg must be 82800/1380 = 60 (USD), not 82800 (KRW).
         self.assertEqual(Decimal("0"), ex.get_net_pnl_quote())
+
+    def test_hedge_fee_fx_converts_krw_before_pnl_subtraction(self):
+        # JEP-254: the KIS hedge leg pays fees in KRW; get_cum_fees_quote() subtracts
+        # _hedge_fees_quote from a USD net PnL. Crediting the RAW KRW fee is the JEP-185
+        # currency bug on the fee term (~1380x), mis-calibrating the drawdown breaker /
+        # risk lease that read this number. The fee must convert KRW->USD.
+        #
+        # Setup mirrors test_hedge_fill_fx_converts_krw_to_usd_in_spot_cash (notional nets
+        # to 0); a 1380 KRW hedge fee booked at completion must reduce net PnL by exactly
+        # 1.0 USD (= 1380 / 1380), not by 1380.
+        ex = self._make_executor(fx=(Decimal("1380"), Decimal("1380")))
+        size = Decimal("1")
+
+        ex.maker_orders["open-1"] = _Tracked("open-1")
+        ex._maker_placed_edge_bps["open-1"] = Decimal("10")
+        ex.process_order_filled_event(None, None, _Ev("open-1", size, "60", TradeType.SELL))
+
+        ex._hedge_order_side["hedge-open-1"] = (TradeType.BUY, size)
+        ex._credit_hedge_fill("hedge-open-1", size, Decimal("82800"))
+        self.assertEqual(Decimal("0"), ex.get_net_pnl_quote())  # notional nets to 0
+
+        ex.hedge_orders["hedge-open-1"] = _FeeTracked("hedge-open-1", Decimal("1380"))
+        ex.process_order_completed_event(None, None, SimpleNamespace(order_id="hedge-open-1"))
+
+        self.assertEqual(Decimal("1"), ex.get_cum_fees_quote())   # 1380 KRW -> 1 USD
+        self.assertEqual(Decimal("-1"), ex.get_net_pnl_quote())   # 0 notional - 1 USD fee
 
 
 if __name__ == "__main__":

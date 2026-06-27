@@ -773,6 +773,10 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         """JEP-185 backward bridge -> FxBridgedFairSource (forward/backward pairing kept in one file)."""
         return self._fair.hedge_price_to_maker_quote(price, side)
 
+    def _hedge_fee_to_maker_quote(self, fee: Decimal) -> Decimal:
+        """JEP-254: KRW hedge fee -> maker quote (USD) via the same FX source as the notional (mid rate)."""
+        return self._fair.hedge_fee_to_maker_quote(fee)
+
     # ------------------------------------------------------------------ balance hook
 
     def _maker_balance_candidate(self) -> Optional[OrderCandidate]:

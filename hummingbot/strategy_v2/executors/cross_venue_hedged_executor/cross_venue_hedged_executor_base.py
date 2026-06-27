@@ -851,6 +851,22 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         """
         return price
 
+    def _hedge_fee_to_maker_quote(self, fee: Decimal) -> Decimal:
+        """Convert a hedge-leg fee into the maker-leg quote unit (JEP-254).
+
+        Default identity (generic two-venue / fx=1; tests inject pre-converted fees).
+        ``LadderMakerExecutor`` overrides this to divide a KRW fee by the mid FX so
+        ``_hedge_fees_quote`` accrues in USD (the maker leg's quote) -- keeping
+        ``get_cum_fees_quote()`` single-currency before it is subtracted from the USD net
+        PnL. Without this the KIS hedge fee (native KRW) is the JEP-185 currency bug on the
+        fee term (~1380x), which would mis-calibrate every loss-based safety mechanism
+        (drawdown breaker / risk lease) that reads the net PnL. Mirrors
+        ``_hedge_price_to_maker_quote`` (notional); fees use the MID rate (no ``side`` arg)
+        because a fee is a non-directional cost with no round-trip netting partner -- the
+        fill side is also not cleanly available at the completion/reconcile credit points.
+        """
+        return fee
+
     def _residual_mark_price(self) -> Decimal:
         """Mark price for the naked (unhedged) residual in two-sided cash-flow PnL.
 
@@ -1056,7 +1072,11 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             if in_flight.is_done:
                 # No completion event will arrive (its events were lost): credit fees here
                 # (for a still-open order the normal completion event credits them instead).
-                self._hedge_fees_quote += in_flight.cumulative_fee_paid(in_flight.quote_asset)
+                # JEP-254: FX-convert the native (KRW) hedge fee to the maker quote (USD)
+                # before accruing, so get_cum_fees_quote() stays single-currency.
+                self._hedge_fees_quote += self._hedge_fee_to_maker_quote(
+                    in_flight.cumulative_fee_paid(in_flight.quote_asset)
+                )
                 self.hedge_orders.pop(order_id, None)
                 self._remember_terminal_hedge_order(order_id)
                 if not in_flight.is_filled:
@@ -1445,7 +1465,11 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self._maker_fees_quote += self.maker_orders[event.order_id].cum_fees_quote
         elif event.order_id in self.hedge_orders:
             self._update_tracked(self.hedge_connector, event.order_id)
-            self._hedge_fees_quote += self.hedge_orders[event.order_id].cum_fees_quote
+            # JEP-254: FX-convert the native (KRW) hedge fee to the maker quote (USD) so the
+            # cumulative fee subtracted from the USD net PnL is single-currency.
+            self._hedge_fees_quote += self._hedge_fee_to_maker_quote(
+                self.hedge_orders[event.order_id].cum_fees_quote
+            )
             # Drop the completed hedge from BOTH books together. Leaving it in hedge_orders
             # while popping its recorded side let a stray post-completion fill credit at the
             # default self.hedge_side (wrong after a two-sided sign flip) and leaked the dict.

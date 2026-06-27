@@ -62,5 +62,25 @@ class FxBridgedFairSource:
             fx = (fx_bid + fx_ask) / Decimal("2")
         return price / fx
 
+    def hedge_fee_to_maker_quote(self, fee: Decimal) -> Decimal:
+        """JEP-254: convert a hedge-leg fee from its native quote (KRW) to the maker quote
+        (USD) so it can be subtracted from a USD net PnL. A fee is a NON-directional cost
+        (no round-trip netting partner), so it converts at the MID rate -- unlike
+        ``hedge_price_to_maker_quote``, whose side-aware bid/ask pairing keeps a round trip
+        netting at fair. FX unavailable -> 0 + ERROR (never book raw KRW as USD): a transient
+        under-count of one fill's cost is the fail-safe direction, never a ~1380x phantom loss
+        that would false-trip a loss-based breaker. ``static_fx_rate`` still flows via
+        ``_get_fx``."""
+        fx_bid, fx_ask = self._get_fx()
+        if fx_bid is None or fx_ask is None or fx_bid <= ZERO or fx_ask <= ZERO:
+            self._logger.error(
+                "JEP-254: FX unavailable at hedge-fee credit; booking 0 for this fee "
+                "(never raw KRW as USD). Net PnL under-reports this fee until FX returns. "
+                "Check FairFxSource/static_fx_rate."
+            )
+            return ZERO
+        mid = (fx_bid + fx_ask) / Decimal("2")
+        return fee / mid
+
     def observe_fx_legs(self) -> Tuple[Optional[Decimal], Optional[Decimal]]:
         return self._get_fx()
