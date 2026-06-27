@@ -98,6 +98,18 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
     placement_rate_breaker_enabled: bool = True
     placement_rate_window_s: float = 30.0
     max_placements_per_window: int = 80
+    # JEP-238: latching P&L drawdown circuit breaker (per-executor; account-aggregate cap is
+    # JEP-255, Decision Plane). No loss-based kill existed before this: share-count / order-rate
+    # / staleness breakers can all be green while money bleeds (bad fair / FX divergence / hedge
+    # slippage). Trips when the FX-correct net PnL (JEP-254, incl. fees) falls strictly below
+    # -pnl_loss_limit_quote (in the maker quote, USD). Default action "hold": cancel/suppress
+    # makers (stop NEW exposure) but stay RUNNING and KEEP hedging the residual (never a bare
+    # stop that abandons the naked leg); "flatten" routes to early_stop(flatten=True) for an
+    # active reduce-only unwind. Latched until restart. Default-OFF: arm + tune the limit from a
+    # live PnL baseline (a loss kill must never trip by surprise).
+    pnl_breaker_enabled: bool = False
+    pnl_loss_limit_quote: Decimal = Decimal("0")
+    pnl_breach_action: Literal["hold", "flatten"] = "hold"
     # JEP-133 approval-envelope per-order cap (port of stratops max_qty_per_order). When set,
     # a maker order whose quantized size exceeds this many base units is REFUSED at the
     # placement boundary (logged + skipped), never clamped down and never submitted oversized.

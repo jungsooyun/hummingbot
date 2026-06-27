@@ -230,6 +230,9 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         # JEP-218 clock watchdog cannot catch this (the clock keeps advancing).
         self._maker_placement_ts: list = []
         self._rate_halt_latched = False
+        # JEP-238: latching P&L drawdown breaker (separate latch from the rate breaker so the
+        # two compose independently). Trips when the FX-correct net PnL falls below a loss limit.
+        self._pnl_breaker_latched = False
         self._open_edge_base = ZERO
         self._open_edge_notional_bps = ZERO
         self._open_edge_vwap = ZERO
@@ -451,6 +454,17 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                     return
                 self._evaluate_ws_staleness()
                 if not self._gates_open():
+                    self._cancel_all_maker()
+                    return
+                # JEP-238: latching P&L drawdown breaker (per-executor; account-aggregate cap is
+                # JEP-255). On the first breach of the FX-correct net PnL (JEP-254), trip + apply
+                # the action; while latched, cancel/suppress makers and skip reconcile, but
+                # _process_hedges still runs in `finally` so the residual is flattened (never a
+                # bare stop that leaves a naked leg). "flatten" additionally routes the trip to
+                # early_stop(flatten=True) -> active unwind via the SHUTTING_DOWN branch.
+                if self._pnl_breaker_tripped or self._check_pnl_breaker():
+                    if not self._pnl_breaker_tripped:
+                        self._trip_pnl_breaker()
                     self._cancel_all_maker()
                     return
                 self._reconcile_maker()
@@ -762,6 +776,73 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self._cancel_all_maker()
         except Exception:
             self.logger().exception("JEP-221 breaker: _cancel_all_maker raised during halt.")
+
+    # ===================================== JEP-238 P&L drawdown circuit breaker (per-executor)
+
+    def _pnl_breaker_config(self) -> tuple:
+        """(enabled, loss_limit_quote, action). Read lazily via getattr so configs/harnesses
+        missing the keys default to OFF (a loss-based kill must be armed + tuned from a live
+        baseline, never on by surprise). ``action`` in {"hold", "flatten"}."""
+        cfg = getattr(self, "config", None)
+        enabled = bool(getattr(cfg, "pnl_breaker_enabled", False))
+        limit = Decimal(str(getattr(cfg, "pnl_loss_limit_quote", "0") or "0"))
+        action = getattr(cfg, "pnl_breach_action", "hold")
+        return enabled, limit, action
+
+    @property
+    def _pnl_breaker_tripped(self) -> bool:
+        return getattr(self, "_pnl_breaker_latched", False)
+
+    def _check_pnl_breaker(self) -> bool:
+        """True iff the breaker is armed and the FX-correct realized net PnL (JEP-254, incl.
+        fees) has fallen strictly below ``-loss_limit_quote``. A non-positive limit is treated
+        as unarmed so a zero/blank config never means "trip on any loss". A NaN PnL means the
+        accounting is already corrupt -- ``NaN < -limit`` is False, which would silently DISARM
+        the breaker exactly when something is wrong -- so trip conservatively instead."""
+        enabled, limit, _ = self._pnl_breaker_config()
+        if not enabled or limit <= ZERO:
+            return False
+        pnl = self.get_net_pnl_quote()
+        if pnl.is_nan():
+            return True
+        return pnl < -limit
+
+    def _trip_pnl_breaker(self) -> None:
+        """Latch the P&L breaker (idempotent) and apply the configured trip action.
+
+        The default ``hold`` is deliberately NOT a bare stop: ``early_stop(keep_position=True)``
+        would call ``stop()`` immediately and abandon any still-pending hedge (the naked leg the
+        breaker exists to protect). Instead ``hold`` only latches -- ``control_task`` then
+        cancels/suppresses makers (stops NEW exposure) while ``_process_hedges`` keeps running in
+        its ``finally`` so the residual is hedged out, and the executor stays RUNNING (held until
+        an operator restart). ``flatten`` routes to ``early_stop(flatten=True)`` for an active
+        reduce-only unwind via the SHUTTING_DOWN path.
+
+        Caveats (logged, not silently assumed): (1) if the JEP-221 rate-halt is ALSO latched it
+        suppresses hedge placement (``_rate_halted`` gate) by design, so the hold residual is NOT
+        re-hedged and a leg may be left naked -- a both-latched state is logged CRITICAL below.
+        (2) The trigger is REALIZED cash-flow PnL (residual marked at entry VWAP), not unrealized
+        mark-to-market; for a delta-neutral hedged book the two coincide. (3) Restarting to clear
+        the latch also resets the PnL baseline to zero, so a structurally-losing position should
+        be flattened, not resumed, on restart."""
+        if getattr(self, "_pnl_breaker_latched", False):
+            return
+        self._pnl_breaker_latched = True
+        _, limit, action = self._pnl_breaker_config()
+        self.logger().critical(
+            "JEP-238 P&L loss circuit breaker TRIPPED for %s: net_pnl_quote=%s < -%s "
+            "(action=%s) — latching until restart. Makers cancelled/suppressed; in hold the "
+            "residual keeps hedging (never a bare stop that abandons the naked leg).",
+            getattr(self, "maker_trading_pair", "?"), self.get_net_pnl_quote(), limit, action,
+        )
+        if getattr(self, "_rate_halted", False):
+            self.logger().critical(
+                "JEP-238 + JEP-221 BOTH latched for %s: the rate-halt suppresses hedge "
+                "placement, so the P&L-hold residual may be left NAKED — operator must flatten "
+                "manually.", getattr(self, "maker_trading_pair", "?"),
+            )
+        if action == "flatten":
+            self.early_stop(flatten=True)
 
     # ============================================================ hedge queue
 

@@ -123,6 +123,26 @@ class TestHip3KisLadderController(IsolatedAsyncioWrapperTestCase):
         self.assertIs(executor_config.wind_down, True)
         self.assertEqual(45.5, executor_config.flatten_timeout_s)
 
+    def test_pnl_breaker_fields_default_off(self):
+        # JEP-238: the per-executor P&L breaker must REACH the executor config (default OFF).
+        self.controller.executors_info = []
+        executor_config = self.controller.determine_executor_actions()[0].executor_config
+        self.assertIs(executor_config.pnl_breaker_enabled, False)
+        self.assertEqual(Decimal("0"), executor_config.pnl_loss_limit_quote)
+        self.assertEqual("hold", executor_config.pnl_breach_action)
+
+    def test_pnl_breaker_fields_passthrough(self):
+        # JEP-238 H1 regression: without forwarding these the breaker is permanently OFF in the
+        # only live path (executor default enabled=False) -> illusory protection.
+        self.config.pnl_breaker_enabled = True
+        self.config.pnl_loss_limit_quote = Decimal("50")
+        self.config.pnl_breach_action = "flatten"
+        self.controller.executors_info = []
+        executor_config = self.controller.determine_executor_actions()[0].executor_config
+        self.assertIs(executor_config.pnl_breaker_enabled, True)
+        self.assertEqual(Decimal("50"), executor_config.pnl_loss_limit_quote)
+        self.assertEqual("flatten", executor_config.pnl_breach_action)
+
     def test_adopt_existing_inventory_defaults_false(self):
         self.controller.executors_info = []
 

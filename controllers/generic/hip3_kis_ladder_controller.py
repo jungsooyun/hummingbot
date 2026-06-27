@@ -11,7 +11,7 @@ Ported from stratops korea_hip3. Pure pricing math lives in
 One controller instance per symbol; the V2 framework runs them concurrently.
 """
 from decimal import Decimal
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import Field, field_validator, model_validator
 
@@ -100,6 +100,15 @@ class Hip3KisLadderControllerConfig(LadderHedgeControllerConfigBase):
     max_close_cost_bps: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
     wind_down: bool = Field(default=False, json_schema_extra={"is_updatable": True})
     flatten_timeout_s: float = Field(default=30.0, json_schema_extra={"is_updatable": True})
+
+    # JEP-238: per-executor P&L loss circuit breaker (forwarded to LadderMakerExecutorConfig).
+    # Trips when realized net PnL (FX-correct incl. fees, JEP-254) falls below -pnl_loss_limit_quote
+    # (USD). Default action "hold" cancels/suppresses makers but keeps hedging the residual;
+    # "flatten" actively unwinds. Default-OFF; arm + tune the limit from a live PnL baseline.
+    # Restart-only (not is_updatable) so arming a loss kill is deliberate, mirroring JEP-221.
+    pnl_breaker_enabled: bool = False
+    pnl_loss_limit_quote: Decimal = Decimal("0")
+    pnl_breach_action: Literal["hold", "flatten"] = "hold"
 
     @field_validator("hedge_order_type", mode="before")
     @classmethod
@@ -205,6 +214,9 @@ class Hip3KisLadderController(LadderHedgeControllerBase):
             max_close_cost_bps=self.config.max_close_cost_bps,
             wind_down=self.config.wind_down,
             flatten_timeout_s=self.config.flatten_timeout_s,
+            pnl_breaker_enabled=self.config.pnl_breaker_enabled,
+            pnl_loss_limit_quote=self.config.pnl_loss_limit_quote,
+            pnl_breach_action=self.config.pnl_breach_action,
             controller_id=self.config.id,
         )
 
