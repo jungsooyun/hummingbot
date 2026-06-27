@@ -384,6 +384,13 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         if not getattr(self.config, "ws_staleness_kill_switch_enabled", False):
             return
 
+        # JEP-231: out-of-session(장 마감/휴장) WS 침묵은 정상 → grace 미적립·latch 금지.
+        # Default True so cold-boot / SHUTTING_DOWN paths (base default) remain in-session.
+        if not getattr(self, "_session_in_session", True):
+            self._staleness_since_ts = None
+            self._hedge_suppress_logged = False
+            return
+
         maker_age = self._ws_freshness_sec(self.maker_connector, self.maker_trading_pair)
         hedge_age = self._ws_freshness_sec(self.hedge_connector, self.hedge_trading_pair)
         self._maker_ws_age_s = maker_age
