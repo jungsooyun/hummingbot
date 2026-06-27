@@ -452,8 +452,12 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self._reconcile_maker()
             self._process_hedges()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
+            # JEP-231 fix (MED): refresh session state BEFORE staleness so a graceful stop landing
+            # just after the 20:00 KST close (with an accumulated stale timer) does NOT latch the
+            # JEP-134 kill-switch — that would defeat next-session auto-resume. Still before
+            # _control_shutdown -> _process_hedges (JEP-226 needs fresh session state).
+            self._evaluate_session_state()
             self._evaluate_ws_staleness()
-            self._evaluate_session_state()  # JEP-226: _control_shutdown -> _process_hedges needs fresh state
             await self._control_shutdown()
 
     def early_stop(self, keep_position: bool = False, flatten: bool = False):
