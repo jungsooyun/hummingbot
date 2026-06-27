@@ -16,6 +16,7 @@ from hummingbot.connector.exchange.kis import (
 from hummingbot.connector.exchange.kis.kis_api_order_book_data_source import KisAPIOrderBookDataSource
 from hummingbot.connector.exchange.kis.kis_api_user_stream_data_source import KisAPIUserStreamDataSource
 from hummingbot.connector.exchange.kis.kis_auth import KisAuth
+from hummingbot.connector.exchange.kis.kis_holiday_cache import KisHolidayCache
 from hummingbot.connector.exchange.kis.kis_ws_hub import KisWsHub
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
@@ -172,6 +173,51 @@ class KisExchange(ExchangePyBase):
             self.logger().warning(_warning)
         # Balance updates are still REST-polled; order/fill events come via WS
         self.real_time_balance_update = False
+        # JEP-231 holiday cache — disk-persisted, stdlib only (sync read by SessionCalendar)
+        self._holiday_cache = KisHolidayCache(cache_path=self._holiday_cache_path())
+        self._holiday_refreshed_day: Optional[str] = None
+
+    def _holiday_cache_path(self) -> str:
+        """JEP-231: 토큰 캐시와 같은 디렉토리에 휴장일 캐시를 배치.
+        KisAuth는 매번 새 인스턴스를 만들지만 _token_cache_path는 파라미터로 결정적(deterministic).
+        """
+        import os
+        token_path = KisAuth(
+            app_key=self._app_key,
+            app_secret=self._app_secret,
+            sandbox=self._sandbox,
+        )._token_cache_path
+        return os.path.join(os.path.dirname(token_path), "kis_holiday_cache.json")
+
+    def is_trading_day(self, d) -> Optional[bool]:
+        """date -> True(거래일)/False(휴장)/None(미상). 캐시(디스크 hydrate)에서 sync 읽기.
+        SessionCalendar.trading_day_fn 주입 용도.
+        """
+        return self._holiday_cache.is_trading_day(d)
+
+    async def refresh_holiday_cache(self, base_yyyymmdd: str) -> bool:
+        """JEP-231: 오늘~연말 범위 휴장일을 1회 조회해 캐시 갱신.
+        실패 시 기존 캐시 보존(상위 fail-closed). 성공=True 반환.
+        """
+        try:
+            result = await self._api_get(
+                path_url=CONSTANTS.DOMESTIC_STOCK_HOLIDAY_PATH,
+                params={"BASS_DT": base_yyyymmdd, "CTX_AREA_NK": "", "CTX_AREA_FK": ""},
+                is_auth_required=True,
+                headers={"tr_id": CONSTANTS.DOMESTIC_STOCK_HOLIDAY_TR_ID},
+            )
+            if result.get("rt_cd") != "0":
+                self.logger().warning(
+                    "JEP-231 holiday fetch rt_cd=%s msg=%s — keeping cache",
+                    result.get("rt_cd"), result.get("msg1"),
+                )
+                return False
+            rows = result.get("output") or []
+            self._holiday_cache.update(rows)
+            return True
+        except Exception as e:
+            self.logger().warning("JEP-231 holiday fetch failed (%s) — keeping cache", e)
+            return False
 
     def _excg_for_routing(self) -> str:
         """Map the active routing mode to its EXCG_ID_DVSN_CD value."""
@@ -333,6 +379,11 @@ class KisExchange(ExchangePyBase):
                 f"msg_cd={result.get('msg_cd')} msg={result.get('msg1')}",
                 msg_cd=str(result.get("msg_cd") or ""),
             )
+        # JEP-231: 일1회 휴장일 캐시 갱신 (성공 경로에서만 — 실패 시 다음 tick 재시도)
+        today = self._kst_today()
+        if self._holiday_refreshed_day != today:
+            if await self.refresh_holiday_cache(today):
+                self._holiday_refreshed_day = today   # 성공 후에만 guard set
 
     @property
     def trading_pairs(self):

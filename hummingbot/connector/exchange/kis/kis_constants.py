@@ -102,6 +102,9 @@ DOMESTIC_STOCK_BALANCE_PATH = "uapi/domestic-stock/v1/trading/inquire-balance"
 DOMESTIC_STOCK_BALANCE_TR_ID = "TTTC8434R"
 DOMESTIC_STOCK_ORDER_DETAIL_PATH = "uapi/domestic-stock/v1/trading/inquire-daily-ccld"
 DOMESTIC_STOCK_ORDER_DETAIL_TR_ID = "TTTC8001R"
+# JEP-231 holiday calendar (CTCA0903R chk-holiday — 실전/모의 동일, 쿼리TR은 V-prefix 없음)
+DOMESTIC_STOCK_HOLIDAY_PATH = "uapi/domestic-stock/v1/quotations/chk-holiday"
+DOMESTIC_STOCK_HOLIDAY_TR_ID = "CTCA0903R"
 
 # --------------------------------------------------------------------------- #
 # KIS gateway error codes (msg_cd) — auth-relevant subset
@@ -316,6 +319,9 @@ RATE_LIMITS = [
     # balance RateLimit above is dead config — calls never pass limit_id=TR_ID.)
     RateLimit(limit_id=DOMESTIC_STOCK_BALANCE_PATH, limit=1, time_interval=1),
     RateLimit(limit_id=DOMESTIC_STOCK_ORDER_DETAIL_PATH, limit=10, time_interval=1),
+    # JEP-231 holiday calendar — 일1회 조회이므로 20/s는 충분한 여유
+    RateLimit(limit_id=DOMESTIC_STOCK_HOLIDAY_TR_ID, limit=20, time_interval=1),
+    RateLimit(limit_id=DOMESTIC_STOCK_HOLIDAY_PATH, limit=20, time_interval=1),
     # WebSocket
     RateLimit(limit_id=WS_APPROVAL_PATH_URL, limit=1, time_interval=60),
 ]
