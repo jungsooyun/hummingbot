@@ -1,6 +1,6 @@
 # A single source of truth for constant variables related to the KIS exchange
 
-from hummingbot.core.api_throttler.data_types import RateLimit
+from hummingbot.core.api_throttler.data_types import LinkedLimitWeightPair, RateLimit
 from hummingbot.core.data_type.in_flight_order import OrderState
 
 EXCHANGE_NAME = "kis"
@@ -105,6 +105,12 @@ DOMESTIC_STOCK_ORDER_DETAIL_TR_ID = "TTTC8001R"
 # JEP-231 holiday calendar (CTCA0903R chk-holiday — 실전/모의 동일, 쿼리TR은 V-prefix 없음)
 DOMESTIC_STOCK_HOLIDAY_PATH = "uapi/domestic-stock/v1/quotations/chk-holiday"
 DOMESTIC_STOCK_HOLIDAY_TR_ID = "CTCA0903R"
+
+# Account-wide REST budget: KIS caps ALL REST calls at 18/s per appkey (real; 모의 1/s),
+# summed across order/cancel/balance/order-detail/ticker/orderbook/holiday. 15/s = ~17% safety
+# margin under 18 to absorb sliding-window distribution rejections. This is a per-CONNECTOR bucket,
+# so a future 2nd appkey (or spot+futures split) gets its own independent account ceiling for free.
+KIS_ACCOUNT_REST_LIMIT_ID = "kis_account_rest"
 
 # --------------------------------------------------------------------------- #
 # KIS gateway error codes (msg_cd) — auth-relevant subset
@@ -273,11 +279,14 @@ class KisMarketType:
 # Rate Limits — KIS allows ~20 requests/sec per TR_ID
 # --------------------------------------------------------------------------- #
 RATE_LIMITS = [
+    # Account-wide REST ceiling — ALL acquired REST calls link here (see KIS_ACCOUNT_REST_LIMIT_ID).
+    RateLimit(limit_id=KIS_ACCOUNT_REST_LIMIT_ID, limit=15, time_interval=1),
     # Token refresh (conservative)
     RateLimit(limit_id=TOKEN_PATH_URL, limit=1, time_interval=60),
     # Domestic Stock — by TR_ID
     RateLimit(limit_id=DOMESTIC_STOCK_TICKER_TR_ID, limit=20, time_interval=1),
-    RateLimit(limit_id=DOMESTIC_STOCK_ORDERBOOK_TR_ID, limit=20, time_interval=1),
+    RateLimit(limit_id=DOMESTIC_STOCK_ORDERBOOK_TR_ID, limit=20, time_interval=1,
+              linked_limits=[LinkedLimitWeightPair(KIS_ACCOUNT_REST_LIMIT_ID, 1)]),
     # Domestic Futures/Options — by TR_ID
     RateLimit(limit_id=DOMESTIC_FUTURES_TICKER_TR_ID, limit=20, time_interval=1),
     RateLimit(limit_id=DOMESTIC_FUTURES_ORDERBOOK_TR_ID, limit=20, time_interval=1),
@@ -297,7 +306,8 @@ RATE_LIMITS = [
     RateLimit(limit_id=DOMESTIC_STOCK_BALANCE_TR_ID, limit=10, time_interval=1),
     RateLimit(limit_id=DOMESTIC_STOCK_ORDER_DETAIL_TR_ID, limit=10, time_interval=1),
     # Path-based rate limits (used by ExchangePyBase._api_request as default limit_id)
-    RateLimit(limit_id=DOMESTIC_STOCK_TICKER_PATH, limit=20, time_interval=1),
+    RateLimit(limit_id=DOMESTIC_STOCK_TICKER_PATH, limit=20, time_interval=1,
+              linked_limits=[LinkedLimitWeightPair(KIS_ACCOUNT_REST_LIMIT_ID, 1)]),
     RateLimit(limit_id=DOMESTIC_STOCK_ORDERBOOK_PATH, limit=20, time_interval=1),
     RateLimit(limit_id=DOMESTIC_FUTURES_TICKER_PATH, limit=20, time_interval=1),
     RateLimit(limit_id=DOMESTIC_FUTURES_ORDERBOOK_PATH, limit=20, time_interval=1),
@@ -307,8 +317,10 @@ RATE_LIMITS = [
     RateLimit(limit_id=OVERSEAS_FUTURES_ORDERBOOK_PATH, limit=20, time_interval=1),
     RateLimit(limit_id=OVERSEAS_OPTIONS_TICKER_PATH, limit=20, time_interval=1),
     RateLimit(limit_id=OVERSEAS_OPTIONS_ORDERBOOK_PATH, limit=20, time_interval=1),
-    RateLimit(limit_id=DOMESTIC_STOCK_ORDER_PATH, limit=5, time_interval=1),
-    RateLimit(limit_id=DOMESTIC_STOCK_CANCEL_PATH, limit=5, time_interval=1),
+    RateLimit(limit_id=DOMESTIC_STOCK_ORDER_PATH, limit=5, time_interval=1,
+              linked_limits=[LinkedLimitWeightPair(KIS_ACCOUNT_REST_LIMIT_ID, 1)]),
+    RateLimit(limit_id=DOMESTIC_STOCK_CANCEL_PATH, limit=5, time_interval=1,
+              linked_limits=[LinkedLimitWeightPair(KIS_ACCOUNT_REST_LIMIT_ID, 1)]),
     # EGW00215 fix: inquire-balance hits a per-second account-LEDGER limit far below 10/s.
     # Both _update_balances (poll) and the check_network probe call _api_get on this PATH with
     # no explicit limit_id, so the throttler keys them here (limit_id = limit_id or path_url).
@@ -317,11 +329,14 @@ RATE_LIMITS = [
     # more HTTP 500 "초당 거래건수 초과". Avg balance demand is ~0.3/s so 1/s never bottlenecks.
     # Also the leading trigger for the JEP-218 cold-boot throttle-storm freeze. (The TR_ID
     # balance RateLimit above is dead config — calls never pass limit_id=TR_ID.)
-    RateLimit(limit_id=DOMESTIC_STOCK_BALANCE_PATH, limit=1, time_interval=1),
-    RateLimit(limit_id=DOMESTIC_STOCK_ORDER_DETAIL_PATH, limit=10, time_interval=1),
+    RateLimit(limit_id=DOMESTIC_STOCK_BALANCE_PATH, limit=1, time_interval=1,
+              linked_limits=[LinkedLimitWeightPair(KIS_ACCOUNT_REST_LIMIT_ID, 1)]),
+    RateLimit(limit_id=DOMESTIC_STOCK_ORDER_DETAIL_PATH, limit=10, time_interval=1,
+              linked_limits=[LinkedLimitWeightPair(KIS_ACCOUNT_REST_LIMIT_ID, 1)]),
     # JEP-231 holiday calendar — 일1회 조회이므로 20/s는 충분한 여유
     RateLimit(limit_id=DOMESTIC_STOCK_HOLIDAY_TR_ID, limit=20, time_interval=1),
-    RateLimit(limit_id=DOMESTIC_STOCK_HOLIDAY_PATH, limit=20, time_interval=1),
+    RateLimit(limit_id=DOMESTIC_STOCK_HOLIDAY_PATH, limit=20, time_interval=1,
+              linked_limits=[LinkedLimitWeightPair(KIS_ACCOUNT_REST_LIMIT_ID, 1)]),
     # WebSocket
     RateLimit(limit_id=WS_APPROVAL_PATH_URL, limit=1, time_interval=60),
 ]
