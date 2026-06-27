@@ -1018,8 +1018,16 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         )
         await exchange._update_balances()
         # 4. order_books_initialized — authenticated REST snapshot bootstraps the tracker.
+        # JEP-217: the cold-start path now gates on the KRX session window; force it
+        # open so this readiness integration test is wall-clock-independent (it still
+        # exercises the real REST snapshot bootstrap).
+        from unittest.mock import patch
         self._configure_orderbook_snapshot_response(mock_api)
-        await exchange.order_book_tracker._init_order_books()
+        with patch(
+            "hummingbot.connector.exchange.kis.kis_api_order_book_data_source.in_session_window",
+            return_value=True,
+        ):
+            await exchange.order_book_tracker._init_order_books()
         # 5. user_stream_initialized — decoupled from the WS (always True).
 
         status = exchange.status_dict

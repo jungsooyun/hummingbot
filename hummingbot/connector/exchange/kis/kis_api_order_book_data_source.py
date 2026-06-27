@@ -354,6 +354,39 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
     # REST snapshot fallback (for initial load and recovery)
     # ------------------------------------------------------------------
 
+    async def get_new_order_book(self, trading_pair: str) -> "OrderBook":
+        """JEP-217: make the cold-start readiness path session-aware.
+
+        ``OrderBookTracker._init_order_books`` calls this once per pair with NO
+        try/except and gates connector readiness on its completion
+        (``_order_books_initialized``). The base implementation calls
+        ``_order_book_snapshot`` directly, which raises on an out-of-session
+        empty/one-sided book (JEP-161) — so a cold boot before the open would kill
+        the init task and wedge the connector permanently not-ready (the core
+        JEP-217 failure mode on the readiness path, distinct from the periodic
+        listener loop).
+
+        Block here until the session is open AND a valid two-sided book is
+        fetched, so init completes and the connector becomes ready at the open
+        boundary WITHOUT a manual restart. Only ``IOError``/``OSError`` (empty /
+        one-sided / logical REST errors) are retried; ``CancelledError`` propagates
+        so ``OrderBookTracker.stop()`` can still cancel the init task during
+        teardown.
+        """
+        while True:
+            if not self._is_session_open():
+                await self._sleep(self.FULL_ORDER_BOOK_RESET_DELTA_SECONDS)
+                continue
+            try:
+                return await super().get_new_order_book(trading_pair)
+            except (IOError, OSError):
+                self.logger().warning(
+                    f"KIS initial order book for {trading_pair} unavailable "
+                    f"(out-of-session/empty/one-sided); retrying until a valid "
+                    f"two-sided book is published."
+                )
+                await self._sleep(self.FULL_ORDER_BOOK_RESET_DELTA_SECONDS)
+
     def _is_session_open(self) -> bool:
         """JEP-217: True when the KRX session is open (time window only, fail-open).
 

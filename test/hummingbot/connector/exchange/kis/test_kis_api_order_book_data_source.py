@@ -2096,3 +2096,60 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
                     await task
                 except asyncio.CancelledError:
                     pass
+
+    # ------------------------------------------------------------------
+    # Test: JEP-217 cold-start readiness path (get_new_order_book gate)
+    # ------------------------------------------------------------------
+
+    async def test_get_new_order_book_waits_for_session_open(self):
+        """The cold-start readiness path (_init_order_books -> get_new_order_book)
+        must NOT raise out-of-session (which would kill the init task and wedge the
+        connector not-ready). It blocks until the session opens, then returns a
+        book so init completes and the connector becomes ready at open."""
+        self.data_source.FULL_ORDER_BOOK_RESET_DELTA_SECONDS = 0.05
+        state = {"open": False}
+        self.data_source._session_open_fn = lambda: state["open"]
+
+        mock_response = self._order_book_snapshot_response()
+        regex_url = re.compile(
+            f"{CONSTANTS.REST_URL}/{CONSTANTS.DOMESTIC_STOCK_ORDERBOOK_PATH}"
+        )
+        with aioresponses() as mock_api:
+            mock_api.get(regex_url, body=json.dumps(mock_response), repeat=True)
+            task = asyncio.create_task(
+                self.data_source.get_new_order_book(self.trading_pair)
+            )
+            try:
+                await asyncio.sleep(0.2)  # ~4 poll cycles while closed
+                self.assertFalse(
+                    task.done(), "get_new_order_book returned/raised while out-of-session"
+                )
+                state["open"] = True
+                ob = await asyncio.wait_for(task, timeout=5.0)
+                self.assertIsInstance(ob, OrderBook)
+            finally:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+    async def test_get_new_order_book_retries_on_transient_empty_in_session(self):
+        """In-session, a transient empty/one-sided book is retried (not fatal to
+        the init task) until a valid two-sided book is fetched."""
+        self.data_source.FULL_ORDER_BOOK_RESET_DELTA_SECONDS = 0.05
+        self.data_source._session_open_fn = lambda: True
+
+        empty = {"rt_cd": "0", "output1": {}}  # parses to no levels -> IOError
+        good = self._order_book_snapshot_response()
+        regex_url = re.compile(
+            f"{CONSTANTS.REST_URL}/{CONSTANTS.DOMESTIC_STOCK_ORDERBOOK_PATH}"
+        )
+        with aioresponses() as mock_api:
+            mock_api.get(regex_url, body=json.dumps(empty))
+            mock_api.get(regex_url, body=json.dumps(good))
+            ob = await asyncio.wait_for(
+                self.data_source.get_new_order_book(self.trading_pair), timeout=5.0
+            )
+        self.assertIsInstance(ob, OrderBook)
