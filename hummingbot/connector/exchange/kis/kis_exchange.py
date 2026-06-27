@@ -214,6 +214,19 @@ class KisExchange(ExchangePyBase):
                 return False
             rows = result.get("output") or []
             self._holiday_cache.update(rows)
+            # JEP-231 fix (MED): only report success if TODAY (base_yyyymmdd) is actually covered.
+            # An rt_cd=0 with empty/partial output would otherwise let the daily guard mark the day
+            # refreshed, leaving today unknown (fail-closed) until the next KST date — i.e. a cold
+            # boot at open could stop quoting all day. Returning False keeps the retry open.
+            try:
+                base_date = datetime.strptime(base_yyyymmdd, "%Y%m%d").date()
+            except ValueError:
+                return False
+            if self._holiday_cache.is_trading_day(base_date) is None:
+                self.logger().warning(
+                    "JEP-231 holiday fetch covered no row for %s — keeping retry open", base_yyyymmdd
+                )
+                return False
             return True
         except Exception as e:
             self.logger().warning("JEP-231 holiday fetch failed (%s) — keeping cache", e)
