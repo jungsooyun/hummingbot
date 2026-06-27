@@ -243,6 +243,15 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             SafetyNotifier.get_instance()
         except Exception:
             pass
+        # JEP-259: pre-warm the off-loop dead-man pinger here too (starts its daemon thread once,
+        # off the control thread) so per-tick _record_heartbeat is a cheap lock-free timestamp stamp.
+        try:
+            from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.heartbeat_pinger import (
+                HeartbeatPinger,
+            )
+            HeartbeatPinger.get_instance()
+        except Exception:
+            pass
         self._open_edge_base = ZERO
         self._open_edge_notional_bps = ZERO
         self._open_edge_vwap = ZERO
@@ -447,6 +456,13 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
 
     async def control_task(self):
         if self.status == RunnableStatus.RUNNING:
+            # JEP-259: stamp the dead-man heartbeat at the TOP of every RUNNING tick -- before the
+            # gates / breaker early-returns -- so the stamp proves the control loop is CYCLING, not
+            # that it is actively quoting (a closed-market tick is still a healthy, beating bot). A
+            # wedged/dead loop stops stamping -> the off-loop pinger flips to <url>/fail (or simply
+            # stops on process/box death) -> the external watcher alerts. Self-swallowing; never
+            # blocks or raises into the loop.
+            self._record_heartbeat()
             # JEP-233: the maker-side path (seed / session+staleness evaluation /
             # _reconcile_maker) must never skip hedging. A persistent exception here would
             # otherwise leave maker fills unhedged -> a naked perp leg, with no kill-switch
@@ -871,6 +887,17 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             )
             pair = getattr(self, "maker_trading_pair", "?")
             SafetyNotifier.get_instance().notify(f"{pair}:{event}", f"[{pair}] {event}: {detail}")
+        except Exception:
+            pass
+
+    def _record_heartbeat(self) -> None:
+        """JEP-259: stamp the process-wide dead-man heartbeat (the off-loop pinger reads it).
+        Cheap + self-swallowing; the liveness signal must never slow or break the control loop."""
+        try:
+            from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.heartbeat_pinger import (
+                HeartbeatPinger,
+            )
+            HeartbeatPinger.get_instance().record_beat()
         except Exception:
             pass
 
