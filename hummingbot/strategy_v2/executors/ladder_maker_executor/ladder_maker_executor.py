@@ -41,7 +41,10 @@ from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import
     build_two_sided_targets,
     compute_hedge_order,
 )
-from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_calendar import KrxSessionCalendar
+from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_calendar import (
+    KrxSessionCalendar,
+    TwentyFourSevenCalendar,
+)
 from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.session_halt_source import (
     KisSessionHaltSource,
     NoHaltSource,
@@ -193,15 +196,13 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         # so the executor config is created once and never mutated. If either field is
         # ever made updatable, rebuild self._fair on update (else the cached FX behavior
         # would diverge from config — a JEP-185-class money risk).
-        # JEP-231: inject KIS connector's is_trading_day as trading_day_fn so KrxSessionCalendar
-        # can gate in_session on actual trading days (휴장일 fail-closed).
-        # getattr-defensive: test helpers that patch super().__init__ may not set connectors /
-        # hedge_connector → fall back to no trading_day_fn (KrxSessionCalendar stays fail-closed).
+        # JEP-231: pick the session calendar by hedge-connector capability (see
+        # _select_session_calendar). getattr-defensive: test helpers that patch
+        # super().__init__ may not set connectors / hedge_connector.
         _hedge_name = getattr(self, "hedge_connector", None)
         _connectors = getattr(self, "connectors", {})
         _conn = _connectors.get(_hedge_name) if (_hedge_name and isinstance(_connectors, dict)) else None
-        _tdf = getattr(_conn, "is_trading_day", None) if _conn is not None else None
-        self._calendar = KrxSessionCalendar(trading_day_fn=_tdf)
+        self._calendar = self._select_session_calendar(_conn)
         self._halt_source = (
             KisSessionHaltSource(self.connectors[self.hedge_connector])
             if getattr(self.config, "session_halt_gate_enabled", False) else NoHaltSource()
@@ -227,6 +228,18 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             if order is not None and order.price is not None and order.amount is not None:
                 total += Decimal(order.price) * Decimal(order.amount)
         return total
+
+    @staticmethod
+    def _select_session_calendar(hedge_connector):
+        """JEP-231 (BLOCKER fix): use KrxSessionCalendar only when the hedge connector exposes
+        is_trading_day (KIS / session-aware). Sessionless or non-KIS connectors (no is_trading_day)
+        get TwentyFourSevenCalendar — behavior-neutral. Without this, KrxSessionCalendar fail-closes
+        EVERY timestamp when there is no trading-day source, silently stopping 24/7 pairs because
+        trading_hours_gate_enabled defaults True."""
+        tdf = getattr(hedge_connector, "is_trading_day", None) if hedge_connector is not None else None
+        if tdf is not None:
+            return KrxSessionCalendar(trading_day_fn=tdf)
+        return TwentyFourSevenCalendar()
 
     def _evaluate_session_state(self) -> None:
         # JEP-226: compute the folded halt decision ONCE per tick (relocated out of _gates_open)
