@@ -431,26 +431,35 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
 
     async def control_task(self):
         if self.status == RunnableStatus.RUNNING:
-            await self._seed_inventory_from_connector()
-            # JEP-226: refresh the cached session-halt state BEFORE any _process_hedges call.
-            # The seed-pending branch below calls _process_hedges before _evaluate_ws_staleness,
-            # so this must run at the very top to keep the hedge gate fresh on every path.
-            self._evaluate_session_state()
-            if self._seed_pending():
-                # JEP-210: an adopt:true seed is still in progress (not yet adopted, not yet
-                # fail-closed). Do not quote -- otherwise the executor would place opens before
-                # recognizing the held inventory, over-exposing during the cold-boot retry grace.
-                # Lives here (base) so every subclass -- ladder AND A&S -- is covered.
-                self._cancel_all_maker()
+            # JEP-233: the maker-side path (seed / session+staleness evaluation /
+            # _reconcile_maker) must never skip hedging. A persistent exception here would
+            # otherwise leave maker fills unhedged -> a naked perp leg, with no kill-switch
+            # covering an exception-driven stall (the control loop only logs and respins).
+            # _process_hedges() runs once in `finally` so it fires on every RUNNING path:
+            # happy, early-return (seed-pending / gates-closed), AND exception.
+            try:
+                await self._seed_inventory_from_connector()
+                # JEP-226: refresh the cached session-halt state BEFORE _process_hedges so the
+                # hedge gate is fresh on every path (incl. the seed-pending early return below).
+                self._evaluate_session_state()
+                if self._seed_pending():
+                    # JEP-210: an adopt:true seed is still in progress (not yet adopted, not yet
+                    # fail-closed). Do not quote -- otherwise the executor would place opens before
+                    # recognizing the held inventory, over-exposing during the cold-boot retry grace.
+                    # Lives here (base) so every subclass -- ladder AND A&S -- is covered.
+                    self._cancel_all_maker()
+                    return
+                self._evaluate_ws_staleness()
+                if not self._gates_open():
+                    self._cancel_all_maker()
+                    return
+                self._reconcile_maker()
+            except Exception:
+                self.logger().exception(
+                    "JEP-233: maker-side control path raised; hedging anyway to avoid a naked leg."
+                )
+            finally:
                 self._process_hedges()
-                return
-            self._evaluate_ws_staleness()
-            if not self._gates_open():
-                self._cancel_all_maker()
-                self._process_hedges()
-                return
-            self._reconcile_maker()
-            self._process_hedges()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
             # JEP-231 fix (MED): refresh session state BEFORE staleness so a graceful stop landing
             # just after the 20:00 KST close (with an accumulated stale timer) does NOT latch the
