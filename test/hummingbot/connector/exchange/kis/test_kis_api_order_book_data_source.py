@@ -129,6 +129,11 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
             hub=MagicMock(),
             domain=CONSTANTS.DEFAULT_DOMAIN,
             market_routing=CONSTANTS.MARKET_ROUTING_SOR,
+            # JEP-217: keep the out-of-session snapshot gate OPEN by default so the
+            # pre-existing REST-fallback tests stay wall-clock-independent (they
+            # predate the gate and assume the loop always fetches). Gate-specific
+            # tests override ``_session_open_fn`` explicitly.
+            session_open_fn=lambda: True,
         )
         self.data_source.logger().setLevel(1)
         self.data_source.logger().addHandler(self)
@@ -2039,6 +2044,7 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
     def test_session_open_fn_defaults_to_real_window(self):
         """With no injection, _is_session_open delegates to in_session_window."""
+        self.data_source._session_open_fn = None  # undo the setUp default
         with patch(
             "hummingbot.connector.exchange.kis.kis_api_order_book_data_source."
             "in_session_window",
@@ -2046,3 +2052,47 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         ) as mock_win:
             self.assertTrue(self.data_source._is_session_open())
         mock_win.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # Test: JEP-217 boundary-survival repro (internal skip->resume path)
+    # ------------------------------------------------------------------
+
+    async def test_loop_survives_open_boundary_and_resumes(self):
+        """JEP-217 repro: out-of-session the loop publishes nothing (no empty-book
+        churn); when the session flips open the SAME listen loop resumes fetching
+        and publishes — i.e. it survived the boundary without re-supervision."""
+        self.data_source.FULL_ORDER_BOOK_RESET_DELTA_SECONDS = 0.05
+
+        # Session starts CLOSED, flips OPEN after a few poll cycles.
+        state = {"open": False}
+        self.data_source._session_open_fn = lambda: state["open"]
+
+        mock_response = self._order_book_snapshot_response()
+        regex_url = re.compile(
+            f"{CONSTANTS.REST_URL}/{CONSTANTS.DOMESTIC_STOCK_ORDERBOOK_PATH}"
+        )
+
+        msg_queue: asyncio.Queue = asyncio.Queue()
+        with aioresponses() as mock_api:
+            mock_api.get(regex_url, body=json.dumps(mock_response), repeat=True)
+            task = asyncio.create_task(
+                self.data_source.listen_for_order_book_snapshots(
+                    self.local_event_loop, msg_queue
+                )
+            )
+            try:
+                # While closed: nothing should be published.
+                await asyncio.sleep(0.2)  # ~4 poll cycles, all skipped
+                self.assertTrue(msg_queue.empty(), "published a snapshot while out-of-session")
+
+                # Flip to open; the SAME loop must resume and publish.
+                state["open"] = True
+                msg = await asyncio.wait_for(msg_queue.get(), timeout=5.0)
+                self.assertEqual(OrderBookMessageType.SNAPSHOT, msg.type)
+                self.assertEqual(self.trading_pair, msg.trading_pair)
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass

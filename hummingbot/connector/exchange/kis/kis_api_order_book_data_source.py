@@ -82,9 +82,6 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # JEP-217: out-of-session REST snapshot gate. Default = real KRX time
         # window (fail-open, no holiday check). Injectable for deterministic tests.
         self._session_open_fn = session_open_fn
-        # JEP-217: shutdown discriminator for the supervised snapshot loop — set by
-        # teardown so an intentional cancel propagates instead of being restarted.
-        self._ob_shutting_down = False
         self._market_status_subscribed = market_status_enabled or market_status_capture_only
         self._market_status_tr_id = CONSTANTS.WS_MARKET_STATUS_TR_ID_BY_ROUTING[market_routing]
         # REST snapshot market-division code, routing-aware like the WS TR_IDs above.
