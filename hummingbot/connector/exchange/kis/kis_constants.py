@@ -108,8 +108,13 @@ DOMESTIC_STOCK_HOLIDAY_TR_ID = "CTCA0903R"
 
 # Account-wide REST budget: KIS caps ALL REST calls at 18/s per appkey (real; 모의 1/s),
 # summed across order/cancel/balance/order-detail/ticker/orderbook/holiday. 15/s = ~17% safety
-# margin under 18 to absorb sliding-window distribution rejections. This is a per-CONNECTOR bucket,
-# so a future 2nd appkey (or spot+futures split) gets its own independent account ceiling for free.
+# margin under 18. The 3/s margin absorbs (a) sliding-window distribution rejections AND (b) auth
+# REST that bypasses this throttler — oauth2/tokenP and oauth2/Approval are issued via raw aiohttp
+# in kis_auth.py (throttler-blind by design), so a reconnect/reauth burst can add a few uncounted
+# calls; 15 + a couple auth calls still stays < 18. This is a per-CONNECTOR bucket, so a future 2nd
+# appkey (or spot+futures split) gets its own independent account ceiling for free.
+# NOTE: AsyncThrottler has no priority lane, so this models a window-level aggregate delay + headroom,
+# NOT a hard instantaneous ceiling, and does not reserve capacity for cancels (see JEP-232 spec §4/§6).
 KIS_ACCOUNT_REST_LIMIT_ID = "kis_account_rest"
 
 # --------------------------------------------------------------------------- #
