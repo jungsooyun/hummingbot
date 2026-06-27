@@ -2153,3 +2153,22 @@ class KisAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
                 self.data_source.get_new_order_book(self.trading_pair), timeout=5.0
             )
         self.assertIsInstance(ob, OrderBook)
+
+    async def test_get_new_order_book_propagates_hard_rest_error_in_session(self):
+        """In-session, a genuine REST/logical failure (rt_cd != 0, e.g. auth
+        EGW00304) must PROPAGATE from the cold-start path — NOT be masked by the
+        empty-book retry — so a hard failure kills init visibly. (Message-matched
+        because asyncio.TimeoutError is an OSError subclass on py3.11+.)"""
+        self.data_source.FULL_ORDER_BOOK_RESET_DELTA_SECONDS = 0.05
+        self.data_source._session_open_fn = lambda: True
+
+        err = {"rt_cd": "1", "msg1": "EGW00304 not authenticated", "output1": {}}
+        regex_url = re.compile(
+            f"{CONSTANTS.REST_URL}/{CONSTANTS.DOMESTIC_STOCK_ORDERBOOK_PATH}"
+        )
+        with aioresponses() as mock_api:
+            mock_api.get(regex_url, body=json.dumps(err), repeat=True)
+            with self.assertRaisesRegex(IOError, "rt_cd"):
+                await asyncio.wait_for(
+                    self.data_source.get_new_order_book(self.trading_pair), timeout=2.0
+                )

@@ -23,6 +23,18 @@ if TYPE_CHECKING:
     from hummingbot.connector.exchange.kis.kis_ws_hub import KisWsHub
 
 
+class EmptyOrderBookError(IOError):
+    """Raised when a KIS REST snapshot is empty/one-sided (no usable two-sided book).
+
+    JEP-217: a dedicated subclass so the cold-start readiness path
+    (``get_new_order_book``) can retry ONLY this expected transient (out-of-session
+    / open-auction empty book) while letting genuine REST/logical failures
+    (``rt_cd != "0"``, HTTP >= 400) propagate as before — preserving observability
+    of hard failures (e.g. EGW00304 auth). Still an ``IOError`` so the JEP-161
+    fail-closed publish guard in the listener path is unchanged.
+    """
+
+
 class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
     """
     KIS WebSocket-based order book data source.
@@ -379,11 +391,14 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 continue
             try:
                 return await super().get_new_order_book(trading_pair)
-            except (IOError, OSError):
+            except EmptyOrderBookError:
+                # Expected transient (in-session empty/one-sided book, e.g. the open
+                # auction): retry. Genuine REST/logical failures (rt_cd != "0", HTTP
+                # >= 400) are NOT caught here — they propagate so a hard failure
+                # (e.g. EGW00304 auth) kills init visibly instead of being masked.
                 self.logger().warning(
-                    f"KIS initial order book for {trading_pair} unavailable "
-                    f"(out-of-session/empty/one-sided); retrying until a valid "
-                    f"two-sided book is published."
+                    f"KIS initial order book for {trading_pair} is empty/one-sided "
+                    f"(likely open-auction transient); retrying for a valid two-sided book."
                 )
                 await self._sleep(self.FULL_ORDER_BOOK_RESET_DELTA_SECONDS)
 
@@ -445,7 +460,7 @@ class KisAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # InvalidOperation) and either fakes readiness with a NaN fair or crashes the
         # control loop. Refuse to publish and let the tracker retry (JEP-161; codex 2026-06-19).
         if not asks or not bids:
-            raise IOError(
+            raise EmptyOrderBookError(
                 f"KIS orderbook snapshot for {trading_pair} is one-sided/empty "
                 f"(asks={len(asks)} bids={len(bids)}) — refusing to publish an unusable book"
             )
