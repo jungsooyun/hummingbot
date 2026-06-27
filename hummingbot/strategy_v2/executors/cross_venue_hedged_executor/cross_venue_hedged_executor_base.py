@@ -233,6 +233,16 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         # JEP-238: latching P&L drawdown breaker (separate latch from the rate breaker so the
         # two compose independently). Trips when the FX-correct net PnL falls below a loss limit.
         self._pnl_breaker_latched = False
+        # JEP-258: pre-warm the off-loop safety-push singleton here (off the trip path) so a
+        # trip-time _emit_safety_alert is a pure non-blocking enqueue -- never a thread.start()
+        # on the control thread during the degraded condition that fired the alert.
+        try:
+            from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.safety_notifier import (
+                SafetyNotifier,
+            )
+            SafetyNotifier.get_instance()
+        except Exception:
+            pass
         self._open_edge_base = ZERO
         self._open_edge_notional_bps = ZERO
         self._open_edge_vwap = ZERO
@@ -423,6 +433,9 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                     "(HOLD: stop quoting, cancel makers, hold position, suppress stale hedges). "
                     "Manual restart required once WS recovers.",
                     grace,
+                )
+                self._emit_safety_alert(
+                    "staleness_kill", f"WS stale >= {grace:.0f}s; quoting halted, manual restart"
                 )
         else:
             if self._staleness_since_ts is not None:
@@ -776,6 +789,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             self._cancel_all_maker()
         except Exception:
             self.logger().exception("JEP-221 breaker: _cancel_all_maker raised during halt.")
+        self._emit_safety_alert("rate_halt", f"{count} maker placements within {window:.0f}s")
 
     # ===================================== JEP-238 P&L drawdown circuit breaker (per-executor)
 
@@ -829,11 +843,12 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             return
         self._pnl_breaker_latched = True
         _, limit, action = self._pnl_breaker_config()
+        pnl = self.get_net_pnl_quote()  # compute once; reused by the log + the alert
         self.logger().critical(
             "JEP-238 P&L loss circuit breaker TRIPPED for %s: net_pnl_quote=%s < -%s "
             "(action=%s) — latching until restart. Makers cancelled/suppressed; in hold the "
             "residual keeps hedging (never a bare stop that abandons the naked leg).",
-            getattr(self, "maker_trading_pair", "?"), self.get_net_pnl_quote(), limit, action,
+            getattr(self, "maker_trading_pair", "?"), pnl, limit, action,
         )
         if getattr(self, "_rate_halted", False):
             self.logger().critical(
@@ -841,8 +856,23 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                 "placement, so the P&L-hold residual may be left NAKED — operator must flatten "
                 "manually.", getattr(self, "maker_trading_pair", "?"),
             )
+        self._emit_safety_alert("pnl_breaker", f"net_pnl_quote={pnl} < -{limit} (action={action})")
         if action == "flatten":
             self.early_stop(flatten=True)
+
+    def _emit_safety_alert(self, event: str, detail: str) -> None:
+        """JEP-258: fire-and-forget no-dependency safety push (Telegram). Per ``(symbol,
+        event)`` latch-once (the ``SafetyNotifier`` dedups) so a latch that re-asserts every
+        tick pushes once. Runs OFF the control loop and swallows every error -- the alerter
+        must NEVER be able to stop or slow trading."""
+        try:
+            from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.safety_notifier import (
+                SafetyNotifier,
+            )
+            pair = getattr(self, "maker_trading_pair", "?")
+            SafetyNotifier.get_instance().notify(f"{pair}:{event}", f"[{pair}] {event}: {detail}")
+        except Exception:
+            pass
 
     # ============================================================ hedge queue
 
@@ -1608,6 +1638,11 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                 "Clear _hedge_kill_switch once the hedge venue recovers.",
                 self._current_retries, self._max_retries, self._pending_hedge_base,
             )
+            self._emit_safety_alert(
+                "hedge_kill",
+                f"hedge failed {self._current_retries} > max_retries={self._max_retries}; "
+                f"quoting halted, pending={self._pending_hedge_base}",
+            )
         # Hard backstop: if the venue stays dead well past the trip, stop hammering it.
         # The kill-switch keeps re-submitting a hedge every tick to recover in place; that
         # is right for a TRANSIENT outage (a fill resets _current_retries long before this),
@@ -1672,6 +1707,9 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                     getattr(self, "_seed_last_balance_error", None),
                 )
             self._seed_fail_closed = True
+            self._emit_safety_alert(
+                "seed_fail_closed", "adopt seed gave up after grace; executor will not quote"
+            )
 
     async def _seed_inventory_from_connector(self) -> None:
         if not getattr(self.config, "adopt_existing_inventory", False):
@@ -1693,6 +1731,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             # JEP-210: HEDGE position mode is an unrecoverable config error -> fail-close
             # immediately, before the retry grace and regardless of snapshot freshness.
             self._seed_fail_closed = True
+            self._emit_safety_alert("seed_fail_closed", "HEDGE position mode (unrecoverable config)")
             return
         self._seed_adopting = True
         try:
@@ -1752,6 +1791,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         connector = self.connectors[self.maker_connector]
         if getattr(connector, "position_mode", PositionMode.ONEWAY) == PositionMode.HEDGE:
             self._seed_fail_closed = True
+            self._emit_safety_alert("seed_fail_closed", "HEDGE position mode at perp-position read")
             return ZERO, ZERO
 
         positions = getattr(connector, "account_positions", {}) or {}
