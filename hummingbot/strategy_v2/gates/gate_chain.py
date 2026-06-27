@@ -100,6 +100,9 @@ class GateContext:
     kis_ws_age_s: float = 0.0
     hl_ws_age_s: float = 0.0
     kis_session_halted: bool = False
+    # JEP-231: True when the venue is in its continuous-trading session (WS frames expected).
+    # Default True → 24/7 venues and any context not yet aware of session state behave as before.
+    in_trading_session: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -170,35 +173,21 @@ class KillSwitchGate:
 
 
 class TradingHoursGate:
-    """Opens only when ``ctx.now_kst`` falls inside at least one SessionWindow.
+    """JEP-231: closes when out of trading session (pure predicate — reads ctx.in_trading_session).
 
-    An empty sessions list means never-open (always closed).
+    The in_session decision is owned by the SessionCalendar seam and cached on the executor as
+    ``_session_in_session`` each tick (computed in ``_evaluate_session_state`` before this gate
+    runs). This gate has no time-window logic of its own — it only relays the pre-computed flag so
+    downstream code (gate-chain, staleness guard, hedge-submit guard) shares one source of truth.
 
-    Parameters
-    ----------
-    sessions:
-        Ordered list of ``SessionWindow`` objects.  The gate is open when
-        ``ctx.now_kst`` falls inside ANY window (OR across windows).
+    Default ``ctx.in_trading_session=True`` means 24/7 venues (TwentyFourSevenCalendar) and any
+    contexts that are not session-aware are always open — behavior-neutral for non-KIS paths.
     """
 
-    def __init__(self, sessions: List[SessionWindow]) -> None:
-        self._sessions: List[SessionWindow] = list(sessions)
-
     def evaluate(self, ctx: GateContext) -> GateResult:
-        dt = ctx.now_kst
-        h, m, s = dt.hour, dt.minute, dt.second
-        for window in self._sessions:
-            if window.contains(h, m, s):
-                return _OPEN
-        if self._sessions:
-            windows_str = ", ".join(
-                f"{w.start[0]:02d}:{w.start[1]:02d}-{w.end[0]:02d}:{w.end[1]:02d}"
-                for w in self._sessions
-            )
-            reason = f"outside_trading_hours: {h:02d}:{m:02d}:{s:02d} KST not in [{windows_str}]"
-        else:
-            reason = "outside_trading_hours: no sessions configured"
-        return GateResult(open=False, reason=reason)
+        if not ctx.in_trading_session:
+            return GateResult(open=False, reason="out_of_session")
+        return _OPEN
 
 
 class StalenessGate:

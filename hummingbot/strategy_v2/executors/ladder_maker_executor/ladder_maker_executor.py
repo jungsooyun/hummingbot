@@ -53,6 +53,7 @@ from hummingbot.strategy_v2.gates.gate_chain import (
     InventoryGate,
     KillSwitchGate,
     SessionHaltGate,
+    TradingHoursGate,
     WsStalenessGate,
 )
 from hummingbot.strategy_v2.models.executors import TrackedOrder
@@ -172,6 +173,9 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
                     "session_halt_cooldown_s must be a finite non-negative number when "
                     f"session_halt_gate_enabled is True (0 disables; got {_cooldown!r}).")
             _gates.append(SessionHaltGate())
+        # JEP-231: session-aware gate (flag-gated; pure predicate reads ctx.in_trading_session)
+        if getattr(config, "trading_hours_gate_enabled", False):
+            _gates.append(TradingHoursGate())
         self._gate_chain = GateChain(_gates)
         super().__init__(
             strategy=strategy,
@@ -283,6 +287,8 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             # (or non-session venue) -> False (behavior-neutral).
             kis_session_halted=(_sh.halted if _sh is not None
                                 else bool(getattr(self.config, "session_halt_gate_enabled", False))),
+            # JEP-231: pre-computed per-tick session predicate (True = in-session, safe default).
+            in_trading_session=getattr(self, "_session_in_session", True),
         )
         if not self._gate_chain.evaluate(ctx).open:
             return False

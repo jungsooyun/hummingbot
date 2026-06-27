@@ -49,6 +49,7 @@ def _ctx(
     open_order_count: int = 0,
     pending_notional: Decimal = Decimal("0"),
     kill_switch: bool = False,
+    in_trading_session: bool = True,
 ) -> GateContext:
     if now_kst is None:
         now_kst = _kst(10, 0, 0)
@@ -64,6 +65,7 @@ def _ctx(
         open_order_count=open_order_count,
         pending_notional=pending_notional,
         kill_switch=kill_switch,
+        in_trading_session=in_trading_session,
     )
 
 
@@ -162,79 +164,33 @@ class TestSessionHaltGate:
 
 
 class TestTradingHoursGate:
-    """KRX session: 09:00–15:30 KST (inclusive start, exclusive end)."""
+    """JEP-231: TradingHoursGate is a pure predicate reading ctx.in_trading_session.
 
-    krx_gate = TradingHoursGate(
-        sessions=[SessionWindow(start=(9, 0), end=(15, 30))]
-    )
+    Time-window logic was moved to SessionCalendar.in_session (session_calendar.py).
+    This gate receives the pre-computed flag and relays it to the gate chain — it has
+    no time arithmetic of its own.
+    """
 
-    def test_open_during_session(self):
-        r = self.krx_gate.evaluate(_ctx(now_kst=_kst(10, 0, 0)))
+    gate = TradingHoursGate()
+
+    def test_open_in_session(self):
+        r = self.gate.evaluate(_ctx(in_trading_session=True))
         assert r.open is True
 
-    def test_open_at_session_start(self):
-        r = self.krx_gate.evaluate(_ctx(now_kst=_kst(9, 0, 0)))
-        assert r.open is True
-
-    def test_closed_one_second_before_session(self):
-        r = self.krx_gate.evaluate(_ctx(now_kst=_kst(8, 59, 59)))
-        assert r.open is False
-
-    def test_open_at_last_second_of_session(self):
-        # 15:29:59 is still inside [09:00, 15:30)
-        r = self.krx_gate.evaluate(_ctx(now_kst=_kst(15, 29, 59)))
-        assert r.open is True
-
-    def test_closed_at_session_end_minute(self):
-        # 15:30:00 is at/after the end — closed
-        r = self.krx_gate.evaluate(_ctx(now_kst=_kst(15, 30, 0)))
-        assert r.open is False
-
-    def test_closed_after_session(self):
-        r = self.krx_gate.evaluate(_ctx(now_kst=_kst(16, 0, 0)))
+    def test_closed_out_of_session(self):
+        r = self.gate.evaluate(_ctx(in_trading_session=False))
         assert r.open is False
 
     def test_closed_reason_non_empty(self):
-        r = self.krx_gate.evaluate(_ctx(now_kst=_kst(20, 0, 0)))
+        r = self.gate.evaluate(_ctx(in_trading_session=False))
         assert r.open is False
         assert r.reason != ""
 
-    def test_multiple_sessions_open_in_second(self):
-        """NXT adds a second session 15:30–20:00."""
-        dual_gate = TradingHoursGate(
-            sessions=[
-                SessionWindow(start=(9, 0), end=(15, 30)),
-                SessionWindow(start=(15, 30), end=(20, 0)),
-            ]
-        )
-        r = dual_gate.evaluate(_ctx(now_kst=_kst(17, 0, 0)))
+    def test_default_in_trading_session_true_always_open(self):
+        """GateContext default in_trading_session=True → 24-7 venues + old contexts always open."""
+        ctx = _ctx()  # in_trading_session defaults to True
+        r = self.gate.evaluate(ctx)
         assert r.open is True
-
-    def test_multiple_sessions_open_at_boundary(self):
-        """15:30:00 is closed for KRX but open for NXT — gate should be open."""
-        dual_gate = TradingHoursGate(
-            sessions=[
-                SessionWindow(start=(9, 0), end=(15, 30)),
-                SessionWindow(start=(15, 30), end=(20, 0)),
-            ]
-        )
-        r = dual_gate.evaluate(_ctx(now_kst=_kst(15, 30, 0)))
-        assert r.open is True
-
-    def test_multiple_sessions_closed_outside_all(self):
-        dual_gate = TradingHoursGate(
-            sessions=[
-                SessionWindow(start=(9, 0), end=(15, 30)),
-                SessionWindow(start=(15, 30), end=(20, 0)),
-            ]
-        )
-        r = dual_gate.evaluate(_ctx(now_kst=_kst(20, 0, 0)))
-        assert r.open is False
-
-    def test_no_sessions_always_closed(self):
-        gate = TradingHoursGate(sessions=[])
-        r = gate.evaluate(_ctx(now_kst=_kst(12, 0, 0)))
-        assert r.open is False
 
 
 # ---------------------------------------------------------------------------
@@ -412,43 +368,45 @@ class TestGateChain:
         assert r.open is False
 
     def test_all_open_gates(self):
-        krx = TradingHoursGate(sessions=[SessionWindow(start=(9, 0), end=(15, 30))])
+        # JEP-231: TradingHoursGate is now a pure predicate; in_trading_session=True → open
+        krx = TradingHoursGate()
         chain = GateChain(gates=[KillSwitchGate(), krx])
-        r = chain.evaluate(_ctx(now_kst=_kst(10, 0), kill_switch=False))
+        r = chain.evaluate(_ctx(in_trading_session=True, kill_switch=False))
         assert r.open is True
 
     def test_first_gate_closed_returns_its_reason(self):
-        krx = TradingHoursGate(sessions=[SessionWindow(start=(9, 0), end=(15, 30))])
+        krx = TradingHoursGate()
         chain = GateChain(gates=[KillSwitchGate(), krx])
-        r = chain.evaluate(_ctx(now_kst=_kst(10, 0), kill_switch=True))
+        r = chain.evaluate(_ctx(in_trading_session=True, kill_switch=True))
         assert r.open is False
         assert "kill_switch" in r.reason.lower()
 
     def test_second_gate_closed_returns_its_reason(self):
-        krx = TradingHoursGate(sessions=[SessionWindow(start=(9, 0), end=(15, 30))])
+        # in_trading_session=False → TradingHoursGate closed; kill_switch=False → first gate open
+        krx = TradingHoursGate()
         chain = GateChain(gates=[KillSwitchGate(), krx])
-        r = chain.evaluate(_ctx(now_kst=_kst(20, 0), kill_switch=False))
+        r = chain.evaluate(_ctx(in_trading_session=False, kill_switch=False))
         assert r.open is False
         # Reason should NOT mention kill_switch (that gate passed)
         assert "kill_switch" not in r.reason.lower()
 
     def test_first_closed_wins_over_later_closed(self):
         """Chain stops at first closed gate — first-closed-reason ordering."""
-        krx = TradingHoursGate(sessions=[SessionWindow(start=(9, 0), end=(15, 30))])
+        krx = TradingHoursGate()
         chain = GateChain(gates=[KillSwitchGate(), krx])
         # Both gates closed: kill_switch is first — its reason must be reported
-        r = chain.evaluate(_ctx(now_kst=_kst(20, 0), kill_switch=True))
+        r = chain.evaluate(_ctx(in_trading_session=False, kill_switch=True))
         assert r.open is False
         assert "kill_switch" in r.reason.lower()
 
     def test_full_chain_open(self):
-        krx = TradingHoursGate(sessions=[SessionWindow(start=(9, 0), end=(15, 30))])
+        krx = TradingHoursGate()
         staleness = StalenessGate(max_kis_age_s=5.0, max_hl_age_s=5.0, max_fx_age_s=10.0)
         cap = OrderCapGate(max_open_orders=4, max_pending_notional=Decimal("1000"))
         chain = GateChain(gates=[KillSwitchGate(), krx, staleness, cap])
         r = chain.evaluate(
             _ctx(
-                now_kst=_kst(10, 0),
+                in_trading_session=True,
                 kill_switch=False,
                 kis_age_s=1.0,
                 hl_age_s=1.0,
@@ -477,18 +435,19 @@ class TestGateChainDiagnose:
         assert all(r.open for r in results)
 
     def test_diagnose_mixed(self):
-        krx = TradingHoursGate(sessions=[SessionWindow(start=(9, 0), end=(15, 30))])
+        # JEP-231: TradingHoursGate is pure predicate; use in_trading_session=False to close it
+        krx = TradingHoursGate()
         chain = GateChain(gates=[KillSwitchGate(), krx])
-        results = chain.diagnose(_ctx(now_kst=_kst(20, 0), kill_switch=True))
+        results = chain.diagnose(_ctx(in_trading_session=False, kill_switch=True))
         # KillSwitchGate → closed, TradingHoursGate → closed
         assert results[0].open is False
         assert results[1].open is False
 
     def test_diagnose_does_not_short_circuit(self):
         """diagnose() evaluates ALL gates even when an early one is closed."""
-        krx = TradingHoursGate(sessions=[SessionWindow(start=(9, 0), end=(15, 30))])
+        krx = TradingHoursGate()
         chain = GateChain(gates=[KillSwitchGate(), krx])
-        results = chain.diagnose(_ctx(now_kst=_kst(20, 0), kill_switch=True))
+        results = chain.diagnose(_ctx(in_trading_session=False, kill_switch=True))
         assert len(results) == 2  # both gates evaluated
 
     def test_diagnose_independent_of_evaluate(self):
