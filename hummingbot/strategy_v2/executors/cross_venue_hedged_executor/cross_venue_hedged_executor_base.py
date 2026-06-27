@@ -1191,6 +1191,18 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                 )
                 self._hedge_suppress_logged = True
             return
+        # JEP-231: out-of-session(장 마감/휴장)엔 새 헤지 제출 억제 — 닫힌 KIS에 force-submit 금지.
+        # 잔차 pending은 보존(decrement는 실제 fill에서만) → 익일 in-session에 헤지 재개.
+        # session_halt_gate_enabled 와 무관하게 동작.
+        if not getattr(self, "_session_in_session", True):
+            if getattr(self, "_hedge_defer_logged_kind", None) != "out_of_session":
+                self.logger().info(
+                    "JEP-231: out-of-session — holding hedge (pending=%s), resume next session.",
+                    self._pending_hedge_base,
+                )
+                self._hedge_defer_logged_kind = "out_of_session"
+            return
+
         # JEP-226: session/auction-aware gate. needed_side is non-None here (pending != ZERO).
         # Defer a hedge that cannot fill at a continuous price; force only on a clock-scheduled
         # auction past the cap; hold (never force) on a genuine halt. cap<=0 OR not-halted is
