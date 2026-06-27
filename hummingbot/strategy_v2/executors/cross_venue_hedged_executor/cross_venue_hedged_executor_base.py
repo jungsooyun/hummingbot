@@ -355,6 +355,9 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         self._maker_ws_age_s: Optional[float] = None
         self._hedge_ws_age_s: Optional[float] = None
         self._hedge_suppress_logged = False
+        # JEP-231: session-aware staleness + gate. Default True = in-session (safe for cold-boot /
+        # SHUTTING_DOWN; non-KIS venues that use TwentyFourSevenCalendar are always in-session).
+        self._session_in_session: bool = True
 
     def _ws_freshness_sec(self, connector: str, pair: str) -> Optional[float]:
         try:

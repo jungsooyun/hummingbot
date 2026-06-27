@@ -189,7 +189,11 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         # so the executor config is created once and never mutated. If either field is
         # ever made updatable, rebuild self._fair on update (else the cached FX behavior
         # would diverge from config — a JEP-185-class money risk).
-        self._calendar = KrxSessionCalendar()
+        # JEP-231: inject KIS connector's is_trading_day as trading_day_fn so KrxSessionCalendar
+        # can gate in_session on actual trading days (휴장일 fail-closed).
+        _conn = self.connectors[self.hedge_connector]
+        _tdf = getattr(_conn, "is_trading_day", None)
+        self._calendar = KrxSessionCalendar(trading_day_fn=_tdf)
         self._halt_source = (
             KisSessionHaltSource(self.connectors[self.hedge_connector])
             if getattr(self.config, "session_halt_gate_enabled", False) else NoHaltSource()
@@ -242,6 +246,12 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
                 f"halt past the freeze to cover the unscheduled single-price auction "
                 f"(KIS taker unavailable). arming_reason={_halt_st.reason!r}")
         self._session_halt_state = _halt_st
+        # JEP-231: cache session predicate once per tick (runs before staleness/gate each tick).
+        # Default True when disabled → 현행 동작 보존(항상 in-session). Base initialises True (safe).
+        if getattr(self.config, "trading_hours_gate_enabled", False):
+            self._session_in_session = self._calendar.in_session(self._strategy.current_timestamp)
+        else:
+            self._session_in_session = True   # 비활성 → 현행 동작(항상 in-session)
 
     def _gates_open(self) -> bool:
         if getattr(self, "_seed_fail_closed", False):

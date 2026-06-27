@@ -108,6 +108,7 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
     max_hl_ws_age_s: Optional[float] = 12.0
     ws_staleness_grace_s: float = 90.0
     session_halt_gate_enabled: bool = True
+    trading_hours_gate_enabled: bool = True
     session_halt_max_ws_age_s: float = 3.0
     session_halt_max_book_static_s: float = 15.0
     session_halt_cooldown_s: float = 1800.0

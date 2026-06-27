@@ -36,6 +36,7 @@ class LadderHedgeControllerConfigBase(ControllerConfigBase):
     max_hl_ws_age_s: Optional[float] = Field(default=12.0, json_schema_extra={"is_updatable": True})
     ws_staleness_grace_s: float = Field(default=90.0, json_schema_extra={"is_updatable": True})
     session_halt_gate_enabled: bool = Field(default=True, json_schema_extra={"is_updatable": False})
+    trading_hours_gate_enabled: bool = Field(default=True, json_schema_extra={"is_updatable": False})
     session_halt_max_ws_age_s: float = Field(default=3.0, json_schema_extra={"is_updatable": True})
     session_halt_max_book_static_s: float = Field(default=15.0, json_schema_extra={"is_updatable": True})
     # JEP-198 interim auction-gap guard: once a freeze/CB is detected, hold the maker-quote

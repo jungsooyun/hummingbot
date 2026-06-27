@@ -189,6 +189,7 @@ class Hip3KisLadderController(LadderHedgeControllerBase):
             max_hl_ws_age_s=self.config.max_hl_ws_age_s,
             ws_staleness_grace_s=self.config.ws_staleness_grace_s,
             session_halt_gate_enabled=self.config.session_halt_gate_enabled,
+            trading_hours_gate_enabled=self.config.trading_hours_gate_enabled,
             session_halt_max_ws_age_s=self.config.session_halt_max_ws_age_s,
             session_halt_max_book_static_s=self.config.session_halt_max_book_static_s,
             session_halt_cooldown_s=self.config.session_halt_cooldown_s,   # JEP-226 F6: was missing -> cooldown knob was dead (pinned to executor default 1800.0)
