@@ -195,8 +195,12 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         # would diverge from config — a JEP-185-class money risk).
         # JEP-231: inject KIS connector's is_trading_day as trading_day_fn so KrxSessionCalendar
         # can gate in_session on actual trading days (휴장일 fail-closed).
-        _conn = self.connectors[self.hedge_connector]
-        _tdf = getattr(_conn, "is_trading_day", None)
+        # getattr-defensive: test helpers that patch super().__init__ may not set connectors /
+        # hedge_connector → fall back to no trading_day_fn (KrxSessionCalendar stays fail-closed).
+        _hedge_name = getattr(self, "hedge_connector", None)
+        _connectors = getattr(self, "connectors", {})
+        _conn = _connectors.get(_hedge_name) if (_hedge_name and isinstance(_connectors, dict)) else None
+        _tdf = getattr(_conn, "is_trading_day", None) if _conn is not None else None
         self._calendar = KrxSessionCalendar(trading_day_fn=_tdf)
         self._halt_source = (
             KisSessionHaltSource(self.connectors[self.hedge_connector])
