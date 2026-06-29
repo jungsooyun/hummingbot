@@ -479,10 +479,14 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                     # fail-closed). Do not quote -- otherwise the executor would place opens before
                     # recognizing the held inventory, over-exposing during the cold-boot retry grace.
                     # Lives here (base) so every subclass -- ladder AND A&S -- is covered.
+                    self._log_quote_block("seed_pending")
                     self._cancel_all_maker()
                     return
                 self._evaluate_ws_staleness()
                 if not self._gates_open():
+                    # 2026-06-29 (Bug C): name WHY quoting is blocked (set on _last_gate_block by
+                    # the subclass _gates_open) so a silent no-quote (SKHX incident) is diagnosable.
+                    self._log_quote_block(getattr(self, "_last_gate_block", None) or "gate_closed")
                     self._cancel_all_maker()
                     return
                 # JEP-238: latching P&L drawdown breaker (per-executor; account-aggregate cap is
@@ -1714,12 +1718,43 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             and not getattr(self, "_seed_fail_closed", False)
         )
 
-    def _note_seed_retry(self) -> None:
+    # 2026-06-29 (Bug C): steady-state throttle for the quote-block diagnostic. A reason CHANGE
+    # logs immediately (captures transitions); the same reason re-logs at most this often (bounds
+    # overnight out-of-session / cold-boot-grace noise).
+    _QUOTE_BLOCK_LOG_INTERVAL_S = 300.0
+
+    def _log_quote_block(self, reason: str) -> None:
+        # The quote-gate early returns were fully silent, so a stuck executor (SKHX seeded-OK-
+        # but-no-quote) emitted zero diagnostics. Emit ONE throttled WARNING naming the blocking
+        # reason. Behavior-neutral: logging only, no gate/control-flow change.
+        now = time.monotonic()
+        last_ts = getattr(self, "_last_quote_block_log_ts", None)
+        last_reason = getattr(self, "_last_quote_block_reason", None)
+        if (
+            last_ts is not None
+            and reason == last_reason
+            and (now - last_ts) < self._QUOTE_BLOCK_LOG_INTERVAL_S
+        ):
+            return
+        self._last_quote_block_log_ts = now
+        self._last_quote_block_reason = reason
+        # out-of-session / cold-boot seed are EXPECTED (overnight market close, cold boot), not
+        # actionable -> DEBUG to avoid operator-alarm noise (Codex finding 5). A real in-session
+        # block (fair=None, kill_switch, staleness, halt) stays WARNING.
+        benign = reason in ("out_of_session", "seed_pending")
+        log = self.logger().debug if benign else self.logger().warning
+        log("%s quoting blocked: %s", getattr(self, "maker_trading_pair", "?"), reason)
+
+    def _note_seed_retry(self, reason: str = "unknown") -> None:
         # JEP-210: a transient seed precondition (connector snapshots not fresh yet, a balance
         # poll not landed, a get_open_orders blip, _update_positions error) must NOT permanently
         # fail-close adoption -- the cold-boot startup race resolves within seconds once the
         # control loop runs, and the seed is re-attempted on the next control tick. Only fail-close
         # after a grace window so a genuinely empty adopt:true position still stops quoting.
+        # 2026-06-29: record the actual blocking reason so the fail-close log is diagnostic instead
+        # of the misleading catch-all "perp/spot snapshot never both landed" (the SMSN incident was
+        # a resting/zombie order, not a snapshot miss).
+        self._seed_last_retry_reason = reason
         now = time.monotonic()
         if getattr(self, "_seed_first_attempt_ts", None) is None:
             self._seed_first_attempt_ts = now
@@ -1728,9 +1763,10 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             if not getattr(self, "_seed_fail_closed", False):
                 self.logger().warning(
                     "JEP-210 adopt seed gave up after %.0fs grace for %s "
-                    "(perp/spot snapshot never both landed); fail-closing -> executor will not quote. "
+                    "(last retry reason: %s); fail-closing -> executor will not quote. "
                     "last hedge-balance refresh error: %s",
                     grace, getattr(self, "maker_trading_pair", "?"),
+                    getattr(self, "_seed_last_retry_reason", "unknown"),
                     getattr(self, "_seed_last_balance_error", None),
                 )
             self._seed_fail_closed = True
@@ -1772,14 +1808,14 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                         # leave _seed_adopting stuck and block control_task forever).
                         await asyncio.wait_for(positions, timeout=op_timeout)
                 except Exception:
-                    self._note_seed_retry()
+                    self._note_seed_retry("perp_position_update_error")
                     return
 
             if not await self._await_connector_readiness():
-                self._note_seed_retry()
+                self._note_seed_retry("connector_not_ready")
                 return
             if await self._has_resting_orders():
-                self._note_seed_retry()
+                self._note_seed_retry("resting_orders")
                 return
 
             perp_signed, perp_entry_price = self._read_perp_position_signed()
@@ -1793,7 +1829,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                 # Review F1: a FAILED/unconfirmed refresh must retry, never fall through to a
                 # possibly-stale positive cache (that would over-adopt a wrong balance).
                 if not await self._refresh_hedge_balance(op_timeout):
-                    self._note_seed_retry()
+                    self._note_seed_retry("hedge_balance_refresh_failed")
                     return
                 # Review F5: re-read the perp leg after the hedge-refresh await so the adopted
                 # pair is a tight snapshot (a position update landing during the await is seen).
@@ -1802,7 +1838,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                     return
             spot_base = self._read_spot_balance_base()
             if perp_signed == ZERO or spot_base == ZERO:
-                self._note_seed_retry()
+                self._note_seed_retry(f"empty_snapshot(perp={perp_signed},spot={spot_base})")
                 return
 
             self._apply_seed(perp_signed, spot_base, perp_entry_price)
@@ -1968,8 +2004,25 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                     )
             except Exception:
                 return True
-            if orders:
-                return True
+            # Only a TRULY working order (remaining_amount > 0) should block adopt-seeding. A
+            # terminal/zombie record (e.g. a KIS order the daily-ccld feed still lists after a
+            # 09:00-auction rejection, remaining_amount == 0) can never fill or shift inventory, so
+            # it must not fail-close the seed (2026-06-29 SMSN incident). Defence in depth: the KIS
+            # connector already drops these in get_open_orders, but never trust a single layer.
+            # Fail safe: a record without a remaining_amount field (unknown) counts as resting.
+            for o in orders or []:
+                remaining = getattr(o, "remaining_amount", None)
+                if remaining is None and isinstance(o, dict):
+                    # Codex finding 3: also handle mapping-shaped records so a dict zombie
+                    # (remaining_amount == 0) is recognised as terminal, not fail-safe-resting.
+                    remaining = o.get("remaining_amount")
+                if remaining is None:
+                    return True
+                try:
+                    if Decimal(str(remaining)) > 0:
+                        return True
+                except Exception:
+                    return True
         return False
 
     def get_net_pnl_quote(self) -> Decimal:

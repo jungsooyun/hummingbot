@@ -562,6 +562,48 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         self.assertEqual({r.exchange_order_id for r in records}, {"resting"})
 
     @aioresponses()
+    async def test_get_open_orders_excludes_rejected_zombie(self, mock_api):
+        """A REJECTED daily-ccld row is TERMINAL but slips past the cncl_yn/ccld>=ord guards:
+        it is not a cancel (cncl_yn != 'Y') and nothing filled (tot_ccld_qty=0 < ord_qty), yet
+        rmn_qty=0 / rjct_qty>0 means it can never fill. Returning it as an open order makes the
+        cross-venue adopt-seed's _has_resting_orders block seeding forever (2026-06-29: the 09:00
+        auction rejected the SMSN 03/최유리 hedge -> zombie -> seed fail-close latch -> no MM)."""
+        symbol = self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)
+        ex = self._make_exchange()
+        ex._auth._access_token = "test_access_token"
+        ex._auth._token_expires_at = time.time() + 86400
+        ex._set_trading_pair_symbol_map(bidict({symbol: self.trading_pair}))
+        rows = [
+            {"odno": "resting", "pdno": symbol, "sll_buy_dvsn_cd": "02",
+             "ord_unpr": "1", "ord_qty": "10", "tot_ccld_qty": "0", "rmn_qty": "10", "cncl_yn": "N"},
+            {"odno": "rejected", "pdno": symbol, "sll_buy_dvsn_cd": "02",
+             "ord_unpr": "1", "ord_qty": "5", "tot_ccld_qty": "0", "rmn_qty": "0", "rjct_qty": "5", "cncl_yn": "N"},
+        ]
+        url = re.compile(f"^{re.escape(web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH))}.*")
+        mock_api.get(url, body=json.dumps(self._open_orders_response(rows)))
+        records = await ex.get_open_orders()
+        self.assertEqual({r.exchange_order_id for r in records}, {"resting"})
+
+    @aioresponses()
+    async def test_get_open_orders_rejected_excluded_via_rjct_qty_when_rmn_absent(self, mock_api):
+        """Defensive: if KIS omits rmn_qty on a rejected row, the ord_qty-ccld_qty fallback would
+        be > 0 and defeat a pure remaining<=0 filter; the rjct_qty terminal guard still drops it
+        (ccld_qty + rjct_qty >= ord_qty)."""
+        symbol = self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)
+        ex = self._make_exchange()
+        ex._auth._access_token = "test_access_token"
+        ex._auth._token_expires_at = time.time() + 86400
+        ex._set_trading_pair_symbol_map(bidict({symbol: self.trading_pair}))
+        rows = [
+            {"odno": "rejected-no-rmn", "pdno": symbol, "sll_buy_dvsn_cd": "02",
+             "ord_unpr": "1", "ord_qty": "5", "tot_ccld_qty": "0", "rjct_qty": "5", "cncl_yn": "N"},
+        ]
+        url = re.compile(f"^{re.escape(web_utils.private_rest_url(CONSTANTS.DOMESTIC_STOCK_ORDER_DETAIL_PATH))}.*")
+        mock_api.get(url, body=json.dumps(self._open_orders_response(rows)))
+        records = await ex.get_open_orders()
+        self.assertEqual(records, [])
+
+    @aioresponses()
     async def test_get_open_orders_empty_returns_empty_list(self, mock_api):
         ex = self._make_exchange()
         ex._auth._access_token = "test_access_token"
@@ -2416,6 +2458,35 @@ class KisExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         self.assertEqual(1, ex._net_check_consec_failures)
         ex._auth.invalidate_token.assert_not_awaited()           # NO refresh on throttle
         self.assertEqual(1, probe.await_count)                   # NO retry on throttle
+
+    async def test_check_network_egw00215_transient_logs_at_debug(self):
+        """jep266: EGW00215 (per-second throttle) is expected under multi-symbol load, is debounced,
+        and keeps the connector CONNECTED -> the per-occurrence transient log must be DEBUG, not the
+        WARNING that spammed the operator alarm."""
+        from unittest.mock import patch, AsyncMock
+        ex = self._authed_exchange()
+        probe = AsyncMock(side_effect=self._egw_ioerror(CONSTANTS.KIS_ERR_THROTTLE))
+        with patch.object(ex, "_make_network_check_request", new=probe):
+            with self.assertLogs(ex.logger(), level="DEBUG") as cm:
+                status = await ex.check_network()
+        self.assertEqual(NetworkStatus.CONNECTED, status)
+        transient = [r for r in cm.records if "transient failure" in r.getMessage()]
+        self.assertEqual(1, len(transient))
+        self.assertEqual("DEBUG", transient[0].levelname)
+
+    async def test_check_network_non_throttle_transient_stays_warning(self):
+        """A genuine (non-throttle) transient probe failure still logs at WARNING — only the
+        cosmetic EGW00215 throttle noise is downgraded."""
+        from unittest.mock import patch, AsyncMock
+        ex = self._authed_exchange()
+        probe = AsyncMock(side_effect=IOError("transient timeout"))
+        with patch.object(ex, "_make_network_check_request", new=probe):
+            with self.assertLogs(ex.logger(), level="DEBUG") as cm:
+                status = await ex.check_network()
+        self.assertEqual(NetworkStatus.CONNECTED, status)
+        transient = [r for r in cm.records if "transient failure" in r.getMessage()]
+        self.assertEqual(1, len(transient))
+        self.assertEqual("WARNING", transient[0].levelname)
 
     # --- REAL-PATH tests (review fix #3): drive the genuine
     #     check_network -> _make_network_check_request -> _api_get chain via aioresponses,

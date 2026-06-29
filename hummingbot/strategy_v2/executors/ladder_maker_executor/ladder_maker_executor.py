@@ -276,6 +276,7 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
 
     def _gates_open(self) -> bool:
         if getattr(self, "_seed_fail_closed", False):
+            self._last_gate_block = "seed_fail_closed"
             return False
 
         def _age_for_ctx(age):
@@ -307,11 +308,38 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             # JEP-231: pre-computed per-tick session predicate (True = in-session, safe default).
             in_trading_session=getattr(self, "_session_in_session", True),
         )
-        if not self._gate_chain.evaluate(ctx).open:
+        result = self._gate_chain.evaluate(ctx)
+        if not result.open:
+            # 2026-06-29 (Bug C): record WHICH gate closed so control_task can surface it. The
+            # reason was previously discarded -> a stuck executor emitted zero diagnostics.
+            self._last_gate_block = result.reason or "gate_closed"
             return False
         # Data-readiness gate: a fair price must be computable. Promoting this to a
         # StalenessGate with real KIS/FX ages is JEP-133.
-        return self._compute_fair(self._policy_side()) is not None
+        if self._compute_fair(self._policy_side()) is None:
+            # 2026-06-29 (Bug C): the fair=None data-readiness block was fully silent (SKHX
+            # seeded-OK-but-no-quote). Record the concrete inputs so the block is diagnosable.
+            self._last_gate_block = self._fair_block_reason()
+            return False
+        self._last_gate_block = None
+        return True
+
+    def _fair_block_reason(self) -> str:
+        """Concrete inputs behind a fair=None data-readiness block (hedge book + FX legs),
+        for the throttled quote-block log. Defensive: never raises into the gate path."""
+        bid = ask = None
+        try:
+            kis = self.connectors[self.hedge_connector]
+            bid = kis.get_price_by_type(self.hedge_trading_pair, PriceType.BestBid)
+            ask = kis.get_price_by_type(self.hedge_trading_pair, PriceType.BestAsk)
+        except Exception:
+            pass
+        fx_legs = None
+        try:
+            fx_legs = self._fair.observe_fx_legs()
+        except Exception:
+            pass
+        return f"fair=None (hedge_bid={bid} hedge_ask={ask} fx_legs={fx_legs})"
 
     # ------------------------------------------------------------------ fair price
 

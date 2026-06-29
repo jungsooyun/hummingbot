@@ -284,6 +284,66 @@ def test_has_resting_orders_fail_closed_when_accessor_errors():
     assert asyncio.run(h._has_resting_orders()) is True
 
 
+def test_has_resting_orders_false_for_zombie_zero_remaining():
+    # Defence in depth (2026-06-29): even if a connector mis-reports a terminal/rejected order
+    # as open (e.g. a KIS 09:00-auction-rejected row the daily-ccld feed still lists), a record
+    # with remaining_amount == 0 can never fill or shift inventory and must NOT block adopt-seed.
+    h = _SeedHarness(adopt=True)
+
+    async def _zombie(pair):
+        return [SimpleNamespace(client_order_id="zombie", remaining_amount=Decimal("0"))]
+
+    h.connectors[h.hedge_connector].get_open_orders = _zombie
+
+    assert asyncio.run(h._has_resting_orders()) is False
+
+
+def test_has_resting_orders_true_for_working_order_with_remaining():
+    h = _SeedHarness(adopt=True)
+
+    async def _working(pair):
+        return [SimpleNamespace(client_order_id="working", remaining_amount=Decimal("3"))]
+
+    h.connectors[h.hedge_connector].get_open_orders = _working
+
+    assert asyncio.run(h._has_resting_orders()) is True
+
+
+def test_has_resting_orders_false_for_dict_zombie_zero_remaining():
+    # Codex finding 3: a connector/adapter returning mapping-shaped records (dicts) with
+    # remaining_amount == 0 must also be treated as terminal, not fail-safe-resting.
+    h = _SeedHarness(adopt=True)
+
+    async def _dict_zombie(pair):
+        return [{"client_order_id": "zombie", "remaining_amount": Decimal("0")}]
+
+    h.connectors[h.hedge_connector].get_open_orders = _dict_zombie
+
+    assert asyncio.run(h._has_resting_orders()) is False
+
+
+def test_has_resting_orders_true_for_dict_working_order():
+    h = _SeedHarness(adopt=True)
+
+    async def _dict_working(pair):
+        return [{"client_order_id": "working", "remaining_amount": Decimal("2")}]
+
+    h.connectors[h.hedge_connector].get_open_orders = _dict_working
+
+    assert asyncio.run(h._has_resting_orders()) is True
+
+
+def test_seed_fail_close_records_retry_reason():
+    # The fail-close log was a misleading catch-all ("perp/spot snapshot never both landed")
+    # even when the real cause was a resting/zombie order. _note_seed_retry now records the
+    # actual blocking reason so operators are not misdirected (2026-06-29 SMSN incident).
+    h = _SeedHarness(adopt=True)
+    h._seed_grace_seconds = 0.0  # expire the grace window immediately
+    h._note_seed_retry("resting_orders")
+    assert h._seed_fail_closed is True
+    assert h._seed_last_retry_reason == "resting_orders"
+
+
 def test_seed_full_flow_applies_snapshot_once_and_is_idempotent():
     h = _SeedHarness(adopt=True)
     maker = h.connectors[h.maker_connector]

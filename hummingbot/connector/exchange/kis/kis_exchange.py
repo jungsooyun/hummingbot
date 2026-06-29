@@ -60,7 +60,10 @@ class KisExchange(ExchangePyBase):
     """
 
     API_CALL_TIMEOUT = 10.0
-    POLL_INTERVAL = 1.0
+    # NOTE: balance/poll cadence is governed by ExchangePyBase SHORT_POLL_INTERVAL(5s) /
+    # LONG_POLL_INTERVAL(120s) via _get_poll_interval; a `POLL_INTERVAL` attr here is dead (the
+    # base never reads it). Removed (2026-06-29) so it cannot mislead readers into thinking
+    # balances poll at 1s. To change cadence, override SHORT_POLL_INTERVAL or _get_poll_interval.
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
     UPDATE_TRADE_STATUS_MIN_INTERVAL = 10.0
     # JEP-203: consecutive check_network probe failures tolerated before reporting
@@ -343,7 +346,13 @@ class KisExchange(ExchangePyBase):
                 )
             self._net_check_consec_failures += 1
             if self._net_check_consec_failures < self._NET_CHECK_FAILURE_THRESHOLD:
-                self.logger().warning(
+                # jep266: EGW00215 (per-second throttle) is expected under multi-symbol load, is
+                # debounced here, and keeps the connector CONNECTED -> a per-occurrence WARNING is
+                # cosmetic noise that spammed the operator alarm. Log throttle transients at DEBUG;
+                # keep genuine (non-throttle) transients at WARNING. Sustained failures (below)
+                # always report NOT_CONNECTED regardless of cause.
+                log_transient = self.logger().debug if is_throttle else self.logger().warning
+                log_transient(
                     f"KIS check_network transient failure "
                     f"{self._net_check_consec_failures}/{self._NET_CHECK_FAILURE_THRESHOLD} "
                     f"— keeping CONNECTED (WS hub not torn down): {e!r}"
@@ -989,6 +998,25 @@ class KisExchange(ExchangePyBase):
                 ccld_qty = Decimal(str(row.get("tot_ccld_qty", "0") or "0"))
                 if ord_qty > 0 and ccld_qty >= ord_qty:
                     continue
+                # rmn_qty (잔여수량) is the inquire-daily-ccld remaining field — verified against the
+                # Intrect-io/kis-agent community client (responses/order.py:113 + test fixture) and KIS
+                # docs (TR TTTC8001R). ord_psbl_qty is NOT a field of this endpoint (it belongs to the
+                # balance/orderable-qty endpoints), so a row lacking rmn_qty falls back to
+                # ord_qty - tot_ccld_qty — never an unrelated orderable-qty field. (JEP-135)
+                remaining = row.get("rmn_qty")
+                remaining_amount = Decimal(str(remaining)) if remaining not in (None, "") else (ord_qty - ccld_qty)
+                # A REJECTED row is terminal yet escapes the guards above: it is not a cancel
+                # (cncl_yn != "Y") and nothing filled (ccld < ord), but rmn_qty == 0 / rjct_qty > 0
+                # means it can never fill. Drop it — reporting a never-fill order as resting makes
+                # the cross-venue adopt-seed (_has_resting_orders) fail-close forever (2026-06-29:
+                # the 09:00 auction rejected the SMSN hedge -> zombie -> no MM). rmn_qty is the
+                # primary signal; rjct_qty is the fallback when rmn_qty is absent (ord_qty - ccld
+                # would otherwise be > 0 for a rejected row with no rmn_qty).
+                rjct_qty = Decimal(str(row.get("rjct_qty", "0") or "0"))
+                if remaining_amount <= 0:
+                    continue
+                if ord_qty > 0 and (ccld_qty + rjct_qty) >= ord_qty:
+                    continue
                 pdno = str(row.get("pdno", ""))
                 try:
                     tp = await self.trading_pair_associated_to_exchange_symbol(pdno)
@@ -999,13 +1027,6 @@ class KisExchange(ExchangePyBase):
                 trade_type = TradeType.SELL if str(row.get("sll_buy_dvsn_cd", "")) == "01" else TradeType.BUY
                 eoid = str(row.get("odno", ""))
                 tracked = by_eoid.get(eoid)
-                # rmn_qty (잔여수량) is the inquire-daily-ccld remaining field — verified against the
-                # Intrect-io/kis-agent community client (responses/order.py:113 + test fixture) and KIS
-                # docs (TR TTTC8001R). ord_psbl_qty is NOT a field of this endpoint (it belongs to the
-                # balance/orderable-qty endpoints), so a row lacking rmn_qty falls back to
-                # ord_qty - tot_ccld_qty — never an unrelated orderable-qty field. (JEP-135)
-                remaining = row.get("rmn_qty")
-                remaining_amount = Decimal(str(remaining)) if remaining is not None else (ord_qty - ccld_qty)
                 records.append(OpenOrderRecord(
                     trading_pair=tp,
                     exchange_order_id=eoid,
