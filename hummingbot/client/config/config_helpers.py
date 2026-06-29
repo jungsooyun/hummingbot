@@ -262,9 +262,23 @@ class ClientConfigAdapter:
         from hummingbot.client.config.security import Security  # avoids circular import
         for attr, value in conf_dict.items():
             if isinstance(value, SecretStr):
-                clear_text_value = value.get_secret_value() if isinstance(value, SecretStr) else value
+                clear_text_value = value.get_secret_value()
                 if not Security.secrets_manager:
-                    logging.getLogger().warning(f"Ignore the following error if your config file {attr} contains secret(s)")
+                    # Not logged in: no key to encrypt with. Preserve the original fail-safe --
+                    # emit the documented warning and let the AttributeError on None propagate
+                    # (save_to_yml swallows it, leaving the file unchanged) rather than writing a
+                    # plaintext secret to disk (Codex challenge finding 1, 2026-06-29).
+                    logging.getLogger().warning(
+                        f"Ignore the following error if your config file {attr} contains secret(s)"
+                    )
+                # Idempotency guard (2026-06-29): the client config map is loaded WITHOUT
+                # decryption, so its secret fields hold the on-disk ciphertext. encrypt_secret_value
+                # is NOT idempotent -- re-encrypting double-wraps it ~4x every save (conf_client.yml
+                # ballooned to 142MB and hung boot). Pass an already-encrypted value through;
+                # only encrypt genuine plaintext.
+                elif Security.secrets_manager.is_encrypted_value(clear_text_value):
+                    conf_dict[attr] = clear_text_value
+                    continue
                 conf_dict[attr] = Security.secrets_manager.encrypt_secret_value(attr, clear_text_value)
 
     def _decrypt_secrets(self, conf_dict: Dict[str, Any]):

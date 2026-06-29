@@ -207,3 +207,78 @@ class ReadOnlyClientAdapterTest(unittest.TestCase):
 
         self.assertEqual("Cannot set an attribute on a read-only client adapter", str(context.exception))
         self.assertEqual(initial_instance_id, read_only_adapter.instance_id)
+
+
+class EncryptSecretsIdempotencyTest(unittest.TestCase):
+    # 2026-06-29: the client config map is loaded WITHOUT decryption (unlike connector configs),
+    # so its secret fields hold the on-disk ciphertext. encrypt_secret_value is NOT idempotent --
+    # re-encrypting a ciphertext double-wraps it and grows it ~4x every save, which ballooned
+    # conf_client.yml (toss_fx fields) to 142MB and hung boot. These tests pin the idempotency
+    # + None-guard fix in _encrypt_secrets / ETHKeyFileSecretManger.is_encrypted_value.
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._orig_mgr = Security.secrets_manager
+
+    def tearDown(self) -> None:
+        Security.secrets_manager = self._orig_mgr
+        super().tearDown()
+
+    def test_is_encrypted_value_true_for_ciphertext_false_for_plaintext(self):
+        mgr = ETHKeyFileSecretManger("pw")
+        enc = mgr.encrypt_secret_value("toss_client_id", "plaintext-secret")
+        self.assertTrue(mgr.is_encrypted_value(enc))
+        self.assertFalse(mgr.is_encrypted_value("plaintext-secret"))
+        self.assertFalse(mgr.is_encrypted_value(""))
+        self.assertFalse(mgr.is_encrypted_value("deadbeef"))  # valid hex but not a v3 keystore
+
+    def test_encrypt_secrets_idempotent_for_already_encrypted_ciphertext(self):
+        Security.secrets_manager = ETHKeyFileSecretManger("pw")
+        enc = Security.secrets_manager.encrypt_secret_value("secret_attr", "real-secret")
+        adapter = ClientConfigAdapter(ClientConfigMap())
+        conf_dict = {"secret_attr": SecretStr(enc)}
+        adapter._encrypt_secrets(conf_dict)
+        # Unchanged -> no double-wrap, no geometric growth.
+        self.assertEqual(enc, conf_dict["secret_attr"])
+
+    def test_encrypt_secrets_encrypts_genuine_plaintext_once(self):
+        Security.secrets_manager = ETHKeyFileSecretManger("pw")
+        adapter = ClientConfigAdapter(ClientConfigMap())
+        conf_dict = {"secret_attr": SecretStr("real-secret")}
+        adapter._encrypt_secrets(conf_dict)
+        out = conf_dict["secret_attr"]
+        self.assertNotEqual("real-secret", out)
+        self.assertTrue(Security.secrets_manager.is_encrypted_value(out))
+        self.assertEqual("real-secret", Security.secrets_manager.decrypt_secret_value("secret_attr", out))
+
+    def test_encrypt_secrets_none_manager_does_not_write_plaintext(self):
+        # Codex challenge finding 1 (HIGH): with no secrets manager (not logged in) we must NOT
+        # silently persist a plaintext secret. Preserve the original fail-safe (raise; save_to_yml
+        # swallows it and leaves the file unchanged) rather than writing cleartext to disk.
+        Security.secrets_manager = None
+        adapter = ClientConfigAdapter(ClientConfigMap())
+        conf_dict = {"secret_attr": SecretStr("super-secret-plaintext")}
+        with self.assertRaises(Exception):
+            adapter._encrypt_secrets(conf_dict)
+        # the plaintext was never written into the output dict
+        self.assertNotEqual("super-secret-plaintext", conf_dict.get("secret_attr"))
+
+    def test_is_encrypted_value_rejects_incomplete_keystore_shape(self):
+        # Codex challenge finding 2 (MEDIUM): tighten the shape check so a keystore-shaped value
+        # missing required crypto fields is treated as plaintext (encrypted), not skipped.
+        import binascii
+        import json
+        mgr = ETHKeyFileSecretManger("pw")
+        partial = binascii.hexlify(json.dumps({"version": 3, "crypto": {"ciphertext": "x"}}).encode()).decode()
+        self.assertFalse(mgr.is_encrypted_value(partial))  # missing mac/cipher/kdf
+        not_v3 = binascii.hexlify(json.dumps(
+            {"version": 1, "crypto": {"cipher": "a", "ciphertext": "x", "kdf": "pbkdf2", "mac": "m"}}).encode()).decode()
+        self.assertFalse(mgr.is_encrypted_value(not_v3))
+        # Codex round-2 F2: keystore-shaped plaintext with EMPTY fields must be plaintext.
+        empty_fields = binascii.hexlify(json.dumps(
+            {"version": 3, "crypto": {"cipher": "", "ciphertext": "", "kdf": "", "mac": ""}}).encode()).decode()
+        self.assertFalse(mgr.is_encrypted_value(empty_fields))
+        # ...and one missing cipherparams/kdfparams (a real keystore always carries both).
+        no_params = binascii.hexlify(json.dumps(
+            {"version": 3, "crypto": {"cipher": "aes-128-ctr", "ciphertext": "ab", "kdf": "pbkdf2", "mac": "cd"}}).encode()).decode()
+        self.assertFalse(mgr.is_encrypted_value(no_params))

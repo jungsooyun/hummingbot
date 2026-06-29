@@ -40,6 +40,33 @@ class BaseSecretsManager(ABC):
     def decrypt_secret_value(self, attr: str, value: str) -> str:
         pass
 
+    @staticmethod
+    def is_encrypted_value(value) -> bool:
+        """True if ``value`` is already a hex-encoded v3 keystore produced by
+        ``encrypt_secret_value`` (so re-encrypting it would double-wrap and grow it ~4x on every
+        save -- the conf_client.yml 142MB corruption, 2026-06-29). Any decode/parse failure means
+        it is plaintext, so return False (and it will be encrypted exactly once)."""
+        if not isinstance(value, str) or not value:
+            return False
+        try:
+            obj = json.loads(binascii.unhexlify(value))
+        except (binascii.Error, ValueError, UnicodeDecodeError, TypeError):
+            return False
+        if not isinstance(obj, dict) or obj.get("version") != 3:
+            return False
+        crypto = obj.get("crypto")
+        if not isinstance(crypto, dict):
+            return False
+        # Require the FULL v3-keystore crypto shape with non-empty string fields AND the
+        # cipherparams/kdfparams sub-dicts that _create_v3_keyfile_json always emits. A genuine
+        # ciphertext from encrypt_secret_value always matches; a keystore-SHAPED plaintext (e.g.
+        # empty-string fields, or missing params) is treated as plaintext and still encrypted
+        # (Codex challenge F2 + round-2, 2026-06-29). No decryptability check -> no coupling to the
+        # password / no breakage on rotation.
+        if not all(isinstance(crypto.get(k), str) and crypto.get(k) for k in ("cipher", "ciphertext", "kdf", "mac")):
+            return False
+        return isinstance(crypto.get("cipherparams"), dict) and isinstance(crypto.get("kdfparams"), dict)
+
 
 class ETHKeyFileSecretManger(BaseSecretsManager):
     def encrypt_secret_value(self, attr: str, value: str):
