@@ -815,14 +815,21 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         # the balance candidate must be a PerpetualOrderCandidate -- the perp budget
         # checker reads .position_close/.leverage, which a plain OrderCandidate lacks
         # (AttributeError in validate_sufficient_balance -> executor never quotes).
-        # JEP-270: gate only needs to fund the NEXT one-ladder maker-open commitment, not the full
-        # total_size_cap (the accumulated-position ceiling). Sizing at full cap with phantom
-        # leverage=1 over-demands ~8x vs HL's real isolated leverage and silently terminates a
-        # funded executor (INSUFFICIENT_BALANCE). Placement clips opens to min(rung.size, remaining),
-        # so rung-sum is a safe upper bound on any single open. Disabled rungs are skipped at
-        # placement, so exclude them here too.
-        ladder_size = sum((r.size for r in self.config.rungs if r.enabled), ZERO)
-        gate_amount = ladder_size if ladder_size > ZERO else self.config.total_size_cap
+        # JEP-270: gate only needs to fund the realizable one-ladder maker-open commitment, not the
+        # full total_size_cap at phantom leverage=1 (which over-demands ~Nx vs HL's real isolated
+        # leverage and silently terminates a funded executor with INSUFFICIENT_BALANCE).
+        # build_ladder_targets (ladder_policy) clips the RUNNING open sum to total_size_cap - |pos|
+        # AND each open to min(rung.size, remaining); disabled and non-positive rungs place nothing.
+        # So the true upper bound on simultaneously-open maker size is
+        #   min(sum of enabled positive rung sizes, total_size_cap)
+        # -- raw rung-sum alone over-demands when rungs sum past the cap (re-triggering the churn).
+        # If no positive enabled rung exists, placement creates no targets, so skip the gate
+        # entirely rather than over-demanding the full cap. (The deploy controller also validates
+        # sum(rungs) <= cap and size > 0, but gate defensively so the executor is self-consistent.)
+        ladder_size = sum((r.size for r in self.config.rungs if r.enabled and r.size > ZERO), ZERO)
+        if ladder_size <= ZERO:
+            return None
+        gate_amount = min(ladder_size, self.config.total_size_cap)
         return PerpetualOrderCandidate(
             trading_pair=self.maker_trading_pair,
             is_maker=True,

@@ -58,11 +58,38 @@ def test_disabled_rungs_excluded_from_gate_size():
 
 
 @pytest.mark.skipif(LadderMakerExecutor is None, reason="stale .so")
-def test_all_disabled_or_empty_falls_back_to_cap():
+def test_all_disabled_or_empty_returns_none():
+    # JEP-270 (challenge HIGH): no positive enabled rung => placement creates no targets
+    # (build_ladder_targets skips disabled rungs), so there is nothing to fund. Return None so
+    # the gate is skipped rather than over-demanding the full cap and terminating a no-op executor.
     rungs = [LadderRungConfig(edge_bps=Decimal("5"), size=Decimal("3"), enabled=False)]
     ex = _exec_with_rungs(rungs, cap=Decimal("5"))
+    assert ex._maker_balance_candidate() is None
+
+
+@pytest.mark.skipif(LadderMakerExecutor is None, reason="stale .so")
+def test_gate_caps_at_total_size_cap_when_rung_sum_exceeds_cap():
+    # JEP-270 (challenge BLOCKER): build_ladder_targets clips the running open sum to
+    # total_size_cap - |position| (ladder_policy.py), so the maximum simultaneously-open maker
+    # size is min(rung-sum, cap), NOT raw rung-sum. Gating at raw rung-sum over-demands when
+    # rungs sum past the cap and re-triggers the very INSUFFICIENT_BALANCE churn this fixes.
+    rungs = [LadderRungConfig(edge_bps=Decimal("5"), size=Decimal("3")),
+             LadderRungConfig(edge_bps=Decimal("10"), size=Decimal("3")),
+             LadderRungConfig(edge_bps=Decimal("15"), size=Decimal("3"))]  # sum 9 > cap 5
+    ex = _exec_with_rungs(rungs, cap=Decimal("5"))
     cand = ex._maker_balance_candidate()
-    assert cand.amount == Decimal("5")
+    assert cand.amount == Decimal("5")  # clamped to cap, not 9
+
+
+@pytest.mark.skipif(LadderMakerExecutor is None, reason="stale .so")
+def test_nonpositive_rung_sizes_excluded_from_gate_size():
+    # JEP-270 (challenge HIGH): sum only positive enabled rung sizes so a stray zero/negative
+    # size cannot deflate the gate below what placement will actually open.
+    rungs = [LadderRungConfig(edge_bps=Decimal("5"), size=Decimal("1")),
+             LadderRungConfig(edge_bps=Decimal("10"), size=Decimal("-0.9"))]
+    ex = _exec_with_rungs(rungs, cap=Decimal("5"))
+    cand = ex._maker_balance_candidate()
+    assert cand.amount == Decimal("1")  # negative size excluded, not summed to 0.1
 
 
 @pytest.mark.skipif(LadderMakerExecutor is None, reason="stale .so")
