@@ -145,4 +145,8 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
     adopt_existing_inventory: bool = False
     # JEP-184: per-tick decision-pipeline latency profiling (read-only, off by default).
     latency_profiling: bool = False
+    # JEP-271: account-truth snapshots are an opt-in daemon sink; default must stay OFF.
+    account_truth_snapshot_enabled: bool = False
+    account_truth_snapshot_interval_s: float = 60.0
+    account_truth_snapshot_path: Optional[str] = None
     execution_purpose: str = Field(default="ladder_market_making")
