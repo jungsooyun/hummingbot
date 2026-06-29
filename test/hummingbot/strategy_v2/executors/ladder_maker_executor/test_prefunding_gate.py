@@ -81,7 +81,7 @@ def test_gate_passes_at_rung_sum_where_full_cap_would_fail():
                           cap=Decimal("5"), fair=Decimal("1705"))
     ex.maker_connector = "hyperliquid_perpetual"; ex.stop = MagicMock(); ex.close_type = None
     ex.adjust_order_candidates = _fake_all_or_none_budget(avail)
-    asyncio.get_event_loop().run_until_complete(ex.validate_sufficient_balance())
+    asyncio.run(ex.validate_sufficient_balance())
     ex.stop.assert_not_called()
 
 
@@ -93,7 +93,7 @@ def test_gate_would_fail_at_full_cap_under_same_collateral():
                           cap=Decimal("5"), fair=Decimal("1705"))
     ex.maker_connector = "hyperliquid_perpetual"; ex.stop = MagicMock(); ex.close_type = None
     ex.adjust_order_candidates = _fake_all_or_none_budget(avail)
-    asyncio.get_event_loop().run_until_complete(ex.validate_sufficient_balance())
+    asyncio.run(ex.validate_sufficient_balance())
     ex.stop.assert_called_once()
 
 
@@ -119,6 +119,6 @@ def test_insufficient_balance_branch_logs_warning():
     ex.maker_connector = "hyperliquid_perpetual"; ex.stop = MagicMock(); ex.close_type = None
     ex.adjust_order_candidates = _fake_all_or_none_budget(Decimal("100"))  # avail too low -> amount 0 -> IB
     with patch.object(LadderMakerExecutor, "logger") as logger_mock:
-        asyncio.get_event_loop().run_until_complete(ex.validate_sufficient_balance())
+        asyncio.run(ex.validate_sufficient_balance())
     logger_mock.return_value.warning.assert_called_once()
     ex.stop.assert_called_once()
