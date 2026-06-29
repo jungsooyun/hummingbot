@@ -815,12 +815,20 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         # the balance candidate must be a PerpetualOrderCandidate -- the perp budget
         # checker reads .position_close/.leverage, which a plain OrderCandidate lacks
         # (AttributeError in validate_sufficient_balance -> executor never quotes).
+        # JEP-270: gate only needs to fund the NEXT one-ladder maker-open commitment, not the full
+        # total_size_cap (the accumulated-position ceiling). Sizing at full cap with phantom
+        # leverage=1 over-demands ~8x vs HL's real isolated leverage and silently terminates a
+        # funded executor (INSUFFICIENT_BALANCE). Placement clips opens to min(rung.size, remaining),
+        # so rung-sum is a safe upper bound on any single open. Disabled rungs are skipped at
+        # placement, so exclude them here too.
+        ladder_size = sum((r.size for r in self.config.rungs if r.enabled), ZERO)
+        gate_amount = ladder_size if ladder_size > ZERO else self.config.total_size_cap
         return PerpetualOrderCandidate(
             trading_pair=self.maker_trading_pair,
             is_maker=True,
             order_type=OrderType.LIMIT_MAKER,
             order_side=self.entry_side,
-            amount=self.config.total_size_cap,
+            amount=gate_amount,
             price=fair,
             leverage=Decimal(str(self.config.leverage)),
         )
