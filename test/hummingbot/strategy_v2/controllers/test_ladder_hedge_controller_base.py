@@ -29,6 +29,7 @@ def _ctl():
     c.executors_info = []
     c._clock = {"t": 1_700_000_000.0}     # epoch-like clock (0.0 would mask the epoch bug)
     c._now = lambda: c._clock["t"]
+    c._IB_BREAKER_ENABLED = True           # ARM for the enforcement tests (ships OFF by default)
     return c
 
 
@@ -97,3 +98,19 @@ def test_seen_ids_pruned_no_recount():
     assert c._consecutive_ib == 1
     c.determine_executor_actions()
     assert c._consecutive_ib == 1
+
+
+def test_breaker_ships_off_by_default_observes_without_pausing():
+    # JEP-270 (adversarial review BLOCKERs): the IB breaker enforcement ships armed-OFF
+    # (matches the JEP-238 OFF-by-default breaker convention). Disabled it must NOT pause
+    # creation (so it cannot false-latch a healthy maker for ~300s on a transient JEP-209
+    # /info starve), but it MUST still COUNT consecutive IB for observability. Operators
+    # arm + tune it in a follow-up once it is hardened (success-reset, backoff, is_updatable,
+    # SafetyNotifier wiring).
+    assert LadderHedgeControllerBase._IB_BREAKER_ENABLED is False  # default OFF
+    c = _ctl()
+    c._IB_BREAKER_ENABLED = False  # restore class default (_ctl() arms it for the enforcement tests)
+    for i in range(c._IB_BREAKER_THRESHOLD + 3):
+        c.executors_info = [_done(f"e{i}", CloseType.INSUFFICIENT_BALANCE, float(i))]
+        assert len(c.determine_executor_actions()) == 1  # never pauses while disabled
+    assert c._consecutive_ib >= c._IB_BREAKER_THRESHOLD  # but still counts (observability preserved)

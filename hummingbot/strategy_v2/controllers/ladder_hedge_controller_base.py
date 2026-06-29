@@ -62,8 +62,21 @@ class LadderHedgeControllerConfigBase(ControllerConfigBase):
 
 
 class LadderHedgeControllerBase(ControllerBase):
-    # JEP-270 circuit breaker: when the gate is healthy IB never happens, but on a genuine
-    # underfunding/bug the memoryless (re)creation would churn ~1/s. Bound it + make it observable.
+    # JEP-270 IB circuit breaker. The real bug fix is the gate sizing (ladder_maker_executor
+    # min(rung_sum, cap)) + the per-IB WARNING (cross_venue base): with a correct gate, healthy
+    # operation produces zero IB, and any residual IB is now LOUD instead of silent.
+    #
+    # This breaker is pure defense-in-depth and ships ARMED-OFF (_IB_BREAKER_ENABLED = False),
+    # matching the JEP-238 OFF-by-default breaker convention. Adversarial review (JEP-270, 2
+    # independent engines) found that ENFORCING it as-is is a net regression on a LIVE MM bot:
+    # a transient JEP-209 /info-429 collateral starve momentarily reads HL collateral as 0 and
+    # trips ~10 consecutive pre-quote IB terminations in ~10s, which would FALSE-LATCH a healthy
+    # maker into a ~300s quoting halt (pre-breaker that glitch self-healed in ~1 tick). It also
+    # lacks success-reset (hair-trigger re-latch), is not is_updatable, isn't wired to
+    # SafetyNotifier, and is memoryless across restart. Until those are fixed (follow-up issue),
+    # we keep the COUNTING (observability) but never act. When disabled the breaker only tracks
+    # _consecutive_ib; it never pauses creation.
+    _IB_BREAKER_ENABLED = False
     _IB_BREAKER_THRESHOLD = 10
     _IB_BREAKER_PROBE_INTERVAL_S = 300.0
     _IB_BREAKER_ALERT_INTERVAL_S = 300.0
@@ -112,7 +125,9 @@ class LadderHedgeControllerBase(ControllerBase):
         if len(active) >= self.config.max_executors:
             return []
         now = self._now()
-        if self._consecutive_ib >= self._IB_BREAKER_THRESHOLD:
+        # ENFORCEMENT is gated OFF by default (see class docstring): _update_ib_breaker above still
+        # COUNTS consecutive IB for observability, but we only pause/probe when explicitly armed.
+        if self._IB_BREAKER_ENABLED and self._consecutive_ib >= self._IB_BREAKER_THRESHOLD:
             if (now - self._ib_last_probe_ts) < self._IB_BREAKER_PROBE_INTERVAL_S:
                 self._maybe_alert_ib_breaker(now)
                 return []
