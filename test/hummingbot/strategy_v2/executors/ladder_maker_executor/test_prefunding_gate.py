@@ -106,3 +106,19 @@ def test_near_cap_placement_clips_to_remaining_le_rung_sum():
     total_open = sum((t.size for t in targets), Decimal("0"))
     assert total_open <= Decimal("1")
     assert total_open <= sum((r.size for r in rungs), Decimal("0"))
+
+
+@pytest.mark.skipif(LadderMakerExecutor is None, reason="stale .so")
+def test_insufficient_balance_branch_logs_warning():
+    # JEP-270 Fix 3a: the base validate_sufficient_balance emits ONE WARNING before stop() when the
+    # adjusted candidate amount is ZERO. Exercised via the concrete subclass (base is abstract).
+    import asyncio
+    from unittest.mock import patch
+    ex = _exec_with_rungs([LadderRungConfig(edge_bps=Decimal("5"), size=Decimal("5"))],
+                          cap=Decimal("5"), fair=Decimal("1705"))
+    ex.maker_connector = "hyperliquid_perpetual"; ex.stop = MagicMock(); ex.close_type = None
+    ex.adjust_order_candidates = _fake_all_or_none_budget(Decimal("100"))  # avail too low -> amount 0 -> IB
+    with patch.object(LadderMakerExecutor, "logger") as logger_mock:
+        asyncio.get_event_loop().run_until_complete(ex.validate_sufficient_balance())
+    logger_mock.return_value.warning.assert_called_once()
+    ex.stop.assert_called_once()

@@ -1697,6 +1697,16 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             return
         adjusted = self.adjust_order_candidates(self.maker_connector, [candidate])[0]
         if adjusted.amount == ZERO:
+            # JEP-270: this branch was fully silent (a stuck executor churned ~1/s with no log,
+            # visible only in the Executors DB). Emit ONE WARNING naming the blocking reason.
+            # Behavior-neutral: logging only, no control-flow change.
+            self.logger().warning(
+                "Maker pre-funding gate FAILED: candidate amount=%s price=%s leverage=%s adjusted "
+                "to ZERO by %s budget checker (available collateral insufficient). Terminating "
+                "executor (INSUFFICIENT_BALANCE). If the account IS funded the gate is over-sizing "
+                "-- see JEP-270.",
+                candidate.amount, candidate.price, candidate.leverage, self.maker_connector,
+            )
             self.close_type = CloseType.INSUFFICIENT_BALANCE
             self.stop()
 
