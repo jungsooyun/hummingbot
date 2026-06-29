@@ -290,20 +290,24 @@ class HyperliquidPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpe
         self.assertEqual(CONSTANTS.USER_STATE_TYPE, request_payloads[0]["type"])
         self.assertEqual(CONSTANTS.USER_ABSTRACTION_TYPE, request_payloads[1]["type"])
 
-    def test_get_user_abstraction_mode_refreshes_without_restart(self):
+    def test_get_user_abstraction_mode_caches_within_ttl_and_refreshes_after(self):
+        clock = {"t": 1000.0}
+        self.exchange._now = lambda: clock["t"]
+        self.exchange._user_abstraction_mode = None
+        self.exchange._user_abstraction_mode_ts = None
         api_post_mock = AsyncMock(side_effect=["default", "unifiedAccount"])
         self.exchange._api_post = api_post_mock
 
-        first_mode = self.async_run_with_timeout(self.exchange._get_user_abstraction_mode())
-        second_mode = self.async_run_with_timeout(self.exchange._get_user_abstraction_mode())
+        first = self.async_run_with_timeout(self.exchange._get_user_abstraction_mode())
+        clock["t"] += 1.0  # within TTL -> cached, no new API call
+        second = self.async_run_with_timeout(self.exchange._get_user_abstraction_mode())
+        clock["t"] += self.exchange._ABSTRACTION_MODE_TTL_S + 1.0  # past TTL -> re-resolve (no restart)
+        third = self.async_run_with_timeout(self.exchange._get_user_abstraction_mode())
 
-        self.assertEqual("default", first_mode)
-        self.assertEqual("unifiedAccount", second_mode)
-        self.assertEqual("unifiedAccount", self.exchange._user_abstraction_mode)
+        self.assertEqual("default", first)
+        self.assertEqual("default", second)
+        self.assertEqual("unifiedAccount", third)
         self.assertEqual(2, api_post_mock.await_count)
-        request_payloads = [call.kwargs["data"] for call in api_post_mock.await_args_list]
-        self.assertEqual(CONSTANTS.USER_ABSTRACTION_TYPE, request_payloads[0]["type"])
-        self.assertEqual(CONSTANTS.USER_ABSTRACTION_TYPE, request_payloads[1]["type"])
 
     @aioresponses()
     def test_update_balances_uses_spot_balances_for_unified_account(self, mock_api):

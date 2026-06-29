@@ -69,6 +69,7 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         self._dex_markets: List[Dict] = []  # Store HIP-3 DEX market info separately
         self._is_hip3_market: Dict[str, bool] = {}  # Track which coins are HIP-3
         self._user_abstraction_mode: Optional[str] = None
+        self._user_abstraction_mode_ts: Optional[float] = None
         # JEP-209: latch so the unified-account-safe balance fallback warns once per degraded
         # episode (abstraction mode unresolved) instead of every balance poll.
         self._abstraction_fallback_warned: bool = False
@@ -1231,14 +1232,26 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
             # later unresolved episode warns once again.
             self._abstraction_fallback_warned = False
 
+    _ABSTRACTION_MODE_TTL_S = 60.0  # JEP-270: re-resolve cadence for the stable wallet abstraction mode
+
+    def _now(self) -> float:
+        return time.time()
+
     async def _get_user_abstraction_mode(self) -> Optional[str]:
+        # JEP-270: the abstraction mode is a stable wallet property -> serve a cached value within a
+        # TTL (re-fetching it on every balance poll wastes /info budget and worsens JEP-209
+        # starvation). Not sticky-forever: after the TTL it re-resolves, so a rare unified<->legacy
+        # transition is still picked up without a restart. No blocking sleep.
+        now = self._now()
+        if (self._user_abstraction_mode is not None
+                and self._user_abstraction_mode_ts is not None
+                and (now - self._user_abstraction_mode_ts) < self._ABSTRACTION_MODE_TTL_S):
+            return self._user_abstraction_mode
         try:
             abstraction_mode = await self._api_post(
                 path_url=CONSTANTS.ACCOUNT_INFO_URL,
-                data={
-                    "type": CONSTANTS.USER_ABSTRACTION_TYPE,
-                    "user": self.hyperliquid_perpetual_address,
-                },
+                data={"type": CONSTANTS.USER_ABSTRACTION_TYPE,
+                      "user": self.hyperliquid_perpetual_address},
             )
         except Exception:
             self.logger().debug("Failed to fetch Hyperliquid user abstraction mode.", exc_info=True)
@@ -1246,6 +1259,7 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
 
         if isinstance(abstraction_mode, str):
             self._user_abstraction_mode = abstraction_mode
+            self._user_abstraction_mode_ts = now
         return self._user_abstraction_mode
 
     async def _update_positions(self):
