@@ -28,3 +28,21 @@ def test_executor_config_has_latency_profiling_default_false():
 
 def test_executor_config_latency_profiling_can_be_enabled():
     assert _cfg(latency_profiling=True).latency_profiling is True
+
+
+def test_account_truth_snapshot_flag_defaults_off():
+    cfg = _cfg()
+    assert cfg.account_truth_snapshot_enabled is False
+    assert cfg.account_truth_snapshot_interval_s == 60.0
+    assert cfg.account_truth_snapshot_path is None
+
+
+def test_account_truth_snapshot_flags_parse_values():
+    cfg = _cfg(
+        account_truth_snapshot_enabled=True,
+        account_truth_snapshot_interval_s=5.0,
+        account_truth_snapshot_path="/tmp/account_truth.sqlite",
+    )
+    assert cfg.account_truth_snapshot_enabled is True
+    assert cfg.account_truth_snapshot_interval_s == 5.0
+    assert cfg.account_truth_snapshot_path == "/tmp/account_truth.sqlite"

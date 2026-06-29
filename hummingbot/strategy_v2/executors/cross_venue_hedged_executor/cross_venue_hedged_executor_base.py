@@ -284,6 +284,19 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             except Exception:
                 self._latency_recorder = None
 
+        self._account_truth_snapshotter = None
+        self._last_truth_snapshot_ts = 0.0
+        if getattr(config, "account_truth_snapshot_enabled", False):
+            try:
+                from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.account_truth_snapshotter import (
+                    AccountTruthSnapshotter,
+                )
+                default_path = "/home/hummingbot/data/_truth/account_truth.sqlite"
+                path = getattr(config, "account_truth_snapshot_path", None) or default_path
+                self._account_truth_snapshotter = AccountTruthSnapshotter(db_path=path)
+            except Exception:
+                self._account_truth_snapshotter = None
+
         subscribed = [self.maker_connector, self.hedge_connector]
         for extra in connectors or []:
             if extra and extra not in subscribed:
@@ -301,6 +314,9 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         rec = getattr(self, "_latency_recorder", None)
         if rec is not None:
             rec.close()
+        snap = getattr(self, "_account_truth_snapshotter", None)
+        if snap is not None:
+            snap.close()
 
     # ============================================================ abstract hooks
 
@@ -463,6 +479,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             # stops on process/box death) -> the external watcher alerts. Self-swallowing; never
             # blocks or raises into the loop.
             self._record_heartbeat()
+            self._maybe_snapshot_account_truth(getattr(getattr(self, "_strategy", None), "current_timestamp", None))
             # JEP-233: the maker-side path (seed / session+staleness evaluation /
             # _reconcile_maker) must never skip hedging. A persistent exception here would
             # otherwise leave maker fills unhedged -> a naked perp leg, with no kill-switch
@@ -902,6 +919,23 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                 HeartbeatPinger,
             )
             HeartbeatPinger.get_instance().record_beat()
+        except Exception:
+            pass
+
+    def _maybe_snapshot_account_truth(self, now: float) -> None:
+        """JEP-271: enqueue exchange account truth on a throttled, behavior-neutral cadence."""
+        snap = getattr(self, "_account_truth_snapshotter", None)
+        if snap is None or now is None:
+            return
+        try:
+            interval = getattr(self.config, "account_truth_snapshot_interval_s", 60.0)
+            if now - self._last_truth_snapshot_ts < interval:
+                return
+            self._last_truth_snapshot_ts = now
+            hedge = self.connectors.get(self.hedge_connector)
+            truth = hedge.get_account_truth() if hedge is not None and hasattr(hedge, "get_account_truth") else None
+            if truth is not None:
+                snap.enqueue(truth)
         except Exception:
             pass
 
