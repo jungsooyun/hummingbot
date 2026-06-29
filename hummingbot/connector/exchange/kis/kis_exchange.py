@@ -1,4 +1,6 @@
 import asyncio
+import copy
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -172,6 +174,8 @@ class KisExchange(ExchangePyBase):
         self._acnt_prdt_cd = parts[1] if len(parts) > 1 else "01"
 
         super().__init__(balance_asset_limit, rate_limits_share_pct)
+        self._account_truth_lock = threading.Lock()
+        self._account_truth: Optional[Dict[str, Any]] = None
         for _warning in self._routing_warnings:
             self.logger().warning(_warning)
         # Balance updates are still REST-polled; order/fill events come via WS
@@ -816,10 +820,42 @@ class KisExchange(ExchangePyBase):
                     self._account_available_balances[quote] = krw_available
                     remote_asset_names.add(quote)
 
+        self._capture_account_truth(result)
+
         asset_names_to_remove = local_asset_names.difference(remote_asset_names)
         for asset_name in asset_names_to_remove:
             del self._account_available_balances[asset_name]
             del self._account_balances[asset_name]
+
+    def _capture_account_truth(self, result: Dict[str, Any]) -> None:
+        positions = {}
+        for holding in result.get("output1", []):
+            qty = Decimal(str(holding.get("hldg_qty", "0")))
+            if qty == 0:
+                continue
+            positions[holding["pdno"]] = {
+                "qty": qty,
+                "avg_entry": Decimal(str(holding.get("pchs_avg_pric", "0"))),
+                "mark": Decimal(str(holding.get("prpr", "0"))),
+                "ccy": "KRW",
+            }
+        cash_by_ccy = {
+            "KRW": Decimal(str((result.get("output2") or [{}])[0].get("dnca_tot_amt", "0")))
+        }
+        truth = {
+            "account_id": self._cano,
+            "venue": "kis",
+            "snapshot_ts": time.time(),
+            "source": "inquire-balance",
+            "positions": positions,
+            "cash_by_ccy": cash_by_ccy,
+        }
+        with self._account_truth_lock:
+            self._account_truth = truth
+
+    def get_account_truth(self) -> Optional[Dict[str, Any]]:
+        with self._account_truth_lock:
+            return copy.deepcopy(self._account_truth) if self._account_truth is not None else None
 
     # ------------------------------------------------------------------
     # Order status
