@@ -29,6 +29,12 @@ class TestKisAccountTruthCapture:
     }
 
     def setup_method(self):
+        # KisExchange.__init__ -> OrderBookTracker.__init__ calls asyncio.get_event_loop(),
+        # which raises under Python 3.12 when a prior test left no current loop on MainThread.
+        # Establish a dedicated loop per test unconditionally so construction is robust in the
+        # full-suite run (not just when this file runs alone).
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
         self.exchange = KisExchange(
             kis_app_key="app-key",
             kis_app_secret="app-secret",
@@ -37,9 +43,12 @@ class TestKisAccountTruthCapture:
             trading_required=False,
         )
 
+    def teardown_method(self):
+        self.loop.close()
+
     def test_capture_keeps_raw_truth_fields(self):
         with patch.object(self.exchange, "_api_get", new=AsyncMock(return_value=self.BALANCE_RESPONSE)):
-            asyncio.get_event_loop().run_until_complete(self.exchange._update_balances())
+            self.loop.run_until_complete(self.exchange._update_balances())
 
         truth = self.exchange.get_account_truth()
 
@@ -58,6 +67,6 @@ class TestKisAccountTruthCapture:
     def test_capture_introduces_no_extra_kis_rest_call(self):
         api_get = AsyncMock(return_value=self.BALANCE_RESPONSE)
         with patch.object(self.exchange, "_api_get", api_get):
-            asyncio.get_event_loop().run_until_complete(self.exchange._update_balances())
+            self.loop.run_until_complete(self.exchange._update_balances())
 
         assert api_get.call_count == 1
