@@ -1,3 +1,4 @@
+import time
 from decimal import Decimal
 from typing import List, Optional
 
@@ -6,6 +7,7 @@ from pydantic import Field
 from hummingbot.core.data_type.common import MarketDict
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction
+from hummingbot.strategy_v2.models.executors import CloseType
 
 
 class LadderHedgeControllerConfigBase(ControllerConfigBase):
@@ -60,13 +62,62 @@ class LadderHedgeControllerConfigBase(ControllerConfigBase):
 
 
 class LadderHedgeControllerBase(ControllerBase):
+    # JEP-270 circuit breaker: when the gate is healthy IB never happens, but on a genuine
+    # underfunding/bug the memoryless (re)creation would churn ~1/s. Bound it + make it observable.
+    _IB_BREAKER_THRESHOLD = 10
+    _IB_BREAKER_PROBE_INTERVAL_S = 300.0
+    _IB_BREAKER_ALERT_INTERVAL_S = 300.0
+
+    def _now(self) -> float:
+        return time.time()
+
     async def update_processed_data(self):
         pass
 
+    def _update_ib_breaker(self) -> None:
+        # lazy-init (avoid touching ControllerBase.__init__ signature; codebase getattr pattern).
+        seen = getattr(self, "_seen_done_ids", None)
+        if seen is None:
+            seen = self._seen_done_ids = set()
+            self._consecutive_ib = 0
+            # _now() is epoch seconds; 0.0 init would make a first latch from preexisting dones see
+            # now-0 >> interval and immediately probe (defeating the latch). Init to _now().
+            self._ib_last_probe_ts = self._now()
+            self._ib_last_alert_ts = 0.0
+        new_done = [e for e in self.executors_info if e.is_done and e.id not in seen]
+        new_done.sort(key=lambda e: (e.close_timestamp if e.close_timestamp is not None else e.timestamp))
+        for e in new_done:
+            if e.close_type == CloseType.INSUFFICIENT_BALANCE:
+                self._consecutive_ib += 1
+            else:
+                self._consecutive_ib = 0
+            seen.add(e.id)
+        # prune ids the orchestrator no longer reports (bound growth; no recount since gone == gone).
+        self._seen_done_ids = seen & {e.id for e in self.executors_info}
+
+    def _maybe_alert_ib_breaker(self, now: float) -> None:
+        if (now - getattr(self, "_ib_last_alert_ts", 0.0)) >= self._IB_BREAKER_ALERT_INTERVAL_S:
+            self._ib_last_alert_ts = now
+            self.logger().warning(
+                "IB circuit breaker LATCHED: %s consecutive INSUFFICIENT_BALANCE executor "
+                "terminations on controller %s -- pausing executor (re)creation (probe every %ss). "
+                "Maker quoting stopped; existing hedge/position unchanged (delta-neutral). "
+                "Check maker-leg collateral / JEP-270 gate sizing.",
+                self._consecutive_ib, getattr(self.config, "id", "?"), self._IB_BREAKER_PROBE_INTERVAL_S,
+            )
+
     def determine_executor_actions(self) -> List[ExecutorAction]:
+        self._update_ib_breaker()
         active = self.filter_executors(self.executors_info, filter_func=lambda e: not e.is_done)
         if len(active) >= self.config.max_executors:
             return []
+        now = self._now()
+        if self._consecutive_ib >= self._IB_BREAKER_THRESHOLD:
+            if (now - self._ib_last_probe_ts) < self._IB_BREAKER_PROBE_INTERVAL_S:
+                self._maybe_alert_ib_breaker(now)
+                return []
+            # else: probe due -> fall through to create exactly one
+        self._ib_last_probe_ts = now
         return [CreateExecutorAction(
             executor_config=self._build_executor_config(),
             controller_id=self.config.id,
