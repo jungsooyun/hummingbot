@@ -8,6 +8,7 @@ default = ``TwentyFourSevenCalendar`` (UTC, no EOD ramp). The pure ramp math sta
 """
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Protocol
@@ -39,6 +40,8 @@ class TwentyFourSevenCalendar:
     """Neutral default: an always-open venue (e.g. a 24/7 CEX). No EOD pressure."""
 
     def now(self, current_timestamp: float) -> datetime:
+        if not math.isfinite(current_timestamp):  # JEP-284: see KrxSessionCalendar.now
+            return datetime.now(tz=timezone.utc)
         return datetime.fromtimestamp(current_timestamp, tz=timezone.utc)
 
     def eod_pressure(self, current_timestamp: float, wind_minutes: int) -> Decimal:
@@ -73,6 +76,14 @@ class KrxSessionCalendar:
         self._trading_day_fn = trading_day_fn if trading_day_fn is not None else (lambda _d: None)
 
     def now(self, current_timestamp: float) -> datetime:
+        # JEP-284: a strategy stop (drawdown guard / manual kill / cash-out) freezes the Hummingbot
+        # clock, so self._strategy.current_timestamp goes NaN. Orphaned executor control_loops keep
+        # reading it, and fromtimestamp(NaN) -> ValueError (inf -> OverflowError) crash-looped the
+        # live bot every tick. Guard non-finite clocks with a real wall-clock fallback: for the live
+        # KIS calendar the framework clock tracks wall time, so this yields the correct session
+        # decision instead of crashing. Finite inputs are byte-for-byte unchanged.
+        if not math.isfinite(current_timestamp):
+            return datetime.now(tz=self._KST)
         return datetime.fromtimestamp(current_timestamp, tz=self._KST)
 
     def eod_pressure(self, current_timestamp: float, wind_minutes: int) -> Decimal:
