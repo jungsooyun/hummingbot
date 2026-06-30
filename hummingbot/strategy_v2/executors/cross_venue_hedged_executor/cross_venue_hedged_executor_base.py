@@ -64,6 +64,7 @@ file is additive scaffolding only.
 import asyncio
 import inspect
 import logging
+import math
 import time
 from abc import abstractmethod
 from collections import OrderedDict
@@ -471,6 +472,38 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
     # ============================================================ lifecycle
 
     async def control_task(self):
+        # JEP-284: a strategy-level stop (drawdown guard / manual kill-switch / cash-out) calls
+        # HummingbotApplication.stop(), which freezes the Hummingbot clock -> self._strategy.
+        # current_timestamp goes non-finite (NaN). This executor's control loop is an INDEPENDENT
+        # asyncio task that keeps cycling AFTER the strategy stops; on a NaN clock it either crashed
+        # (datetime.fromtimestamp(NaN) -> ValueError, the original crash loop) or, worse, would keep
+        # making valid-looking session/trading decisions on a dead lifecycle. Fail-closed: a
+        # non-finite clock means the lifecycle is invalid -> place NO new orders (no quote, no hedge,
+        # no reconcile) for the rest of the tick. Skipping above _record_heartbeat() is deliberate:
+        # the off-loop dead-man stops seeing beats and alerts the operator that the strategy died.
+        # The SessionCalendar.now() crash-guard backstops the mid-tick freeze (a stop landing during
+        # an await, after this check passed finite) on the ladder path -- it covers non-finite floats.
+        # Only a numeric non-finite value trips; a harness with no clock (None) proceeds unchanged.
+        _clock = getattr(getattr(self, "_strategy", None), "current_timestamp", None)
+        try:
+            _clock_dead = _clock is not None and not math.isfinite(_clock)
+        except (TypeError, ValueError, OverflowError):
+            _clock_dead = False
+        if _clock_dead:
+            # NOT inert: this control_loop is an asyncio task decoupled from the strategy clock, so it
+            # keeps cycling with LIVE connectors. A resting post-only maker can still FILL during the
+            # NaN window and credit a pending hedge that _process_hedges (reachable only from here)
+            # will never fire -> an UNBOUNDED naked perp leg (adversarial finding, HIGH). So pull the
+            # resting ladder off the book first (cancel is clock-free) so no further naked fills can
+            # occur, then skip. Best-effort + self-swallowing: the dead-clock path must never raise
+            # (that was the original crash loop). The stop-instant residual (a fill in the gap before
+            # this first cancel, or an in-progress flatten abandoned here) is bounded and covered by
+            # the JEP-259 dead-man + break-glass flatten + adopt:true seed reconciliation on restart.
+            try:
+                self._cancel_all_maker()
+            except Exception:
+                self.logger().exception("JEP-284: dead-clock maker cancel failed; skipping tick.")
+            return
         if self.status == RunnableStatus.RUNNING:
             # JEP-259: stamp the dead-man heartbeat at the TOP of every RUNNING tick -- before the
             # gates / breaker early-returns -- so the stamp proves the control loop is CYCLING, not
