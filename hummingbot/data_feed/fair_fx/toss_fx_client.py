@@ -33,12 +33,18 @@ class TossFxClient:
     # Toss sits behind Cloudflare; the default aiohttp User-Agent gets intermittently
     # WAF-blocked (HTTP 403 "The request could not be satisfied"). Send a browser-like
     # UA + Accept so the requests are not flagged as bot traffic.
+    # JEP-285: pin Accept-Encoding to encodings aiohttp can decode. Cloudflare began
+    # serving Content-Encoding: zstd, which this aiohttp cannot decompress -> the FX poll
+    # failed with "Can not decode content-encoding: zstd" (or a JSON "Unterminated string"
+    # on the raw zstd bytes) -> FX unavailable -> data-readiness gate HOLDs quoting. Stating
+    # gzip/deflate (and omitting zstd) makes Cloudflare negotiate a decodable encoding.
     _DEFAULT_HEADERS = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ),
         "Accept": "application/json",
+        "Accept-Encoding": "gzip, deflate",
     }
 
     def __init__(

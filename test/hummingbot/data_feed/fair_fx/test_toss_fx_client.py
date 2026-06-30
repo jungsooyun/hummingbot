@@ -67,6 +67,22 @@ class TossFxClientTest(unittest.IsolatedAsyncioTestCase):
         # GET still carries the bearer token alongside the default headers.
         self.assertTrue(sess.last_get_headers["Authorization"].startswith("Bearer "))
 
+    async def test_requests_pin_non_zstd_accept_encoding(self):
+        # JEP-285: Toss sits behind Cloudflare, which began serving Content-Encoding: zstd
+        # that the bot's aiohttp cannot decode -> "Can not decode content-encoding: zstd"
+        # (or a JSON "Unterminated string" on the raw zstd bytes) -> FX poll fails ->
+        # data-readiness gate HOLDs quoting. Pin Accept-Encoding to encodings aiohttp can
+        # decode so Cloudflare negotiates gzip/deflate, never zstd. Both the token POST and
+        # the rate GET must carry it.
+        sess = FakeSession()
+        c = TossFxClient("id", "sec", http_factory=lambda: sess)
+        await c.fetch_exchange_rate()
+        for hdrs in (sess.last_post_headers, sess.last_get_headers):
+            self.assertIsNotNone(hdrs)
+            self.assertIn("Accept-Encoding", hdrs)
+            self.assertNotIn("zstd", hdrs["Accept-Encoding"])
+            self.assertIn("gzip", hdrs["Accept-Encoding"])
+
     async def test_token_cached_within_ttl(self):
         sess = FakeSession()
         c = TossFxClient("id", "sec", http_factory=lambda: sess)
