@@ -271,8 +271,14 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         # Default True when disabled → 현행 동작 보존(항상 in-session). Base initialises True (safe).
         if getattr(self.config, "trading_hours_gate_enabled", False):
             self._session_in_session = self._calendar.in_session(self._strategy.current_timestamp)
+            # JEP-231 follow-up: the hedge (KIS/KRX) venue has NO continuous two-sided book during
+            # scheduled single-price call auctions. Reuse the SAME predicate the halt path uses
+            # (line ~250) so the base staleness latch masks ONLY the hedge leg there — one predicate,
+            # both paths, no divergence. False during an auction window → hedge staleness suppressed.
+            self._hedge_expect_continuous = not self._calendar.in_auction_window(self._strategy.current_timestamp)
         else:
             self._session_in_session = True   # 비활성 → 현행 동작(항상 in-session)
+            self._hedge_expect_continuous = True
 
     def _gates_open(self) -> bool:
         if getattr(self, "_seed_fail_closed", False):

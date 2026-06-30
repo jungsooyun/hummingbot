@@ -83,3 +83,66 @@ class WsStalenessSessionAwareTest(unittest.TestCase):
         ex._evaluate_ws_staleness()
         self.assertIsNone(ex._staleness_since_ts)
         self.assertFalse(ex._staleness_kill_switch)
+
+    # ---- per-leg auction-aware staleness (JEP-231 follow-up) ----
+
+    def test_hedge_silent_during_auction_does_not_latch(self):
+        """Hedge WS silence during a KRX single-price call auction must NOT latch: one-sided
+        예상체결 frames legitimately don't refresh the hedge book, so the hedge leg is masked
+        from the latch fold while in-session. This is the 08:50-09:00 false-latch fix."""
+        ex = _make_executor(ws_enabled=True, grace=90.0)
+        ex._session_in_session = True            # auction is inside the [08:00,20:00) envelope
+        ex._hedge_expect_continuous = False      # auction window: hedge venue has no continuous book
+        _stub_ws_age(ex, hedge_age=999, maker_age=0.0)
+        t0 = 1_000_000.0
+        ex._strategy.current_timestamp = t0
+        ex._evaluate_ws_staleness()
+        ex._strategy.current_timestamp = t0 + 95   # grace exceeded
+        ex._evaluate_ws_staleness()
+        self.assertFalse(ex._staleness_kill_switch)   # hedge masked -> no latch
+        self.assertIsNone(ex._staleness_since_ts)
+
+    def test_maker_silent_during_auction_still_latches(self):
+        """The maker (HL, 24/7) leg must NOT be blinded by hedge-auction suppression."""
+        ex = _make_executor(ws_enabled=True, grace=90.0)
+        ex._session_in_session = True
+        ex._hedge_expect_continuous = False      # hedge masked...
+        _stub_ws_age(ex, hedge_age=0.0, maker_age=999)  # ...but MAKER is stale
+        t0 = 1_000_000.0
+        ex._strategy.current_timestamp = t0
+        ex._evaluate_ws_staleness()
+        ex._strategy.current_timestamp = t0 + 95
+        ex._evaluate_ws_staleness()
+        self.assertTrue(ex._staleness_kill_switch)    # maker still arms the latch
+
+    def test_hedge_silent_continuous_session_still_latches(self):
+        """No-regression: hedge silent during CONTINUOUS session (expect_continuous=True) latches."""
+        ex = _make_executor(ws_enabled=True, grace=90.0)
+        ex._session_in_session = True
+        ex._hedge_expect_continuous = True       # continuous session -> hedge armed
+        _stub_ws_age(ex, hedge_age=999, maker_age=0.0)
+        t0 = 1_000_000.0
+        ex._strategy.current_timestamp = t0
+        ex._evaluate_ws_staleness()
+        ex._strategy.current_timestamp = t0 + 95
+        ex._evaluate_ws_staleness()
+        self.assertTrue(ex._staleness_kill_switch)
+
+    def test_continuous_stale_then_auction_clears_timer_without_latch(self):
+        """JEP-287: a hedge that goes stale in continuous session accrues the timer, then ENTERING an
+        auction window (flag flips False) clears the timer and does NOT latch. The maker is held by
+        the per-tick WsAgeGate meanwhile, so this is a safe HOLD, not a missed outage."""
+        ex = _make_executor(ws_enabled=True, grace=90.0)
+        ex._session_in_session = True
+        ex._hedge_expect_continuous = True       # continuous session
+        _stub_ws_age(ex, hedge_age=999, maker_age=0.0)
+        t0 = 1_000_000.0
+        ex._strategy.current_timestamp = t0
+        ex._evaluate_ws_staleness()              # timer starts accruing
+        self.assertIsNotNone(ex._staleness_since_ts)
+        # enter an auction window before grace elapses
+        ex._hedge_expect_continuous = False
+        ex._strategy.current_timestamp = t0 + 30  # < grace
+        ex._evaluate_ws_staleness()
+        self.assertIsNone(ex._staleness_since_ts)     # timer held/cleared, not a recovery
+        self.assertFalse(ex._staleness_kill_switch)   # no latch

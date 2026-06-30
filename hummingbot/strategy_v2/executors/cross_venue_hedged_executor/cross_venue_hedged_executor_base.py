@@ -397,6 +397,12 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         # JEP-231: session-aware staleness + gate. Default True = in-session (safe for cold-boot /
         # SHUTTING_DOWN; non-KIS venues that use TwentyFourSevenCalendar are always in-session).
         self._session_in_session: bool = True
+        # JEP-231 follow-up: per-leg auction-aware staleness. True = the HEDGE venue is expected to
+        # be emitting a continuous two-sided book now (24/7 hedge, or KRX continuous session). A
+        # subclass with a SessionCalendar flips this False during the hedge venue's scheduled
+        # single-price call auctions (KIS one-sided 예상체결 frames never refresh the book). Default
+        # True = hedge leg fully armed (fail-safe; neutral for 24/7 hedges and __init__-bypassing tests).
+        self._hedge_expect_continuous: bool = True
 
     def _ws_freshness_sec(self, connector: str, pair: str) -> Optional[float]:
         try:
@@ -437,7 +443,15 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         self._maker_ws_stale = self._leg_ws_stale(maker_age, getattr(self.config, "max_hl_ws_age_s", None))
         self._hedge_ws_stale = self._leg_ws_stale(hedge_age, getattr(self.config, "max_kis_ws_age_s", None))
 
-        any_stale = self._maker_ws_stale or self._hedge_ws_stale
+        # JEP-231 follow-up: PER-LEG auction suppression. During the hedge venue's scheduled
+        # single-price call auctions (open 08:30-09:00, close 15:20-15:30, 시간외단일가 16:00-18:00)
+        # there is no continuous two-sided book, so one-sided 예상체결 frames never stamp hedge
+        # freshness (kis_api_order_book_data_source.py `if bids and asks:`) and a hedge-leg gap is
+        # EXPECTED. Mask ONLY the hedge leg in the latch fold; the maker leg (24/7) stays armed.
+        # self._hedge_ws_stale itself is left unmasked so the hedge-submission-suppression path is
+        # unaffected. A real outage persisting into continuous session re-arms when the flag flips.
+        hedge_stale_for_latch = self._hedge_ws_stale and getattr(self, "_hedge_expect_continuous", True)
+        any_stale = self._maker_ws_stale or hedge_stale_for_latch
         now = self._strategy.current_timestamp
         grace = float(getattr(self.config, "ws_staleness_grace_s", 90.0))
         if any_stale:
@@ -465,7 +479,17 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                 )
         else:
             if self._staleness_since_ts is not None:
-                self.logger().info("JEP-134 WS feeds recovered; clearing staleness timer.")
+                if self._hedge_ws_stale and not getattr(self, "_hedge_expect_continuous", True):
+                    # JEP-287: hedge WS is one-sided during a scheduled single-price auction window
+                    # (expected — KIS posts 예상체결, not a two-sided book). Clearing the latch timer
+                    # here is the intended HOLD, NOT a recovery; avoid the misleading "recovered" log
+                    # that would otherwise fire every auction window and confuse incident triage.
+                    self.logger().info(
+                        "JEP-287 hedge WS one-sided during a single-price auction window; "
+                        "holding the staleness timer (no kill-switch latch)."
+                    )
+                else:
+                    self.logger().info("JEP-134 WS feeds recovered; clearing staleness timer.")
             self._staleness_since_ts = None
             self._hedge_suppress_logged = False
 
