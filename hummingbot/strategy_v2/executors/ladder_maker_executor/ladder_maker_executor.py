@@ -25,6 +25,12 @@ from typing import Dict, List, Optional
 
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
+from hummingbot.connector.derivative.hyperliquid_perpetual.hyperliquid_perpetual_batch import (
+    HyperliquidBatchCancelRequest,
+    HyperliquidBatchModifyRequest,
+    HyperliquidBatchOrderRequest,
+)
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.cross_venue_hedged_executor_base import (
@@ -33,6 +39,7 @@ from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.cross_venue_he
 from hummingbot.strategy_v2.executors.ladder_maker_executor.data_types import LadderMakerExecutorConfig
 from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.fx_bridged_fair_source import FxBridgedFairSource
 from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import (
+    RungTarget,
     RungSpec,
     Side,
     TwoSidedTargets,
@@ -271,8 +278,14 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         # Default True when disabled → 현행 동작 보존(항상 in-session). Base initialises True (safe).
         if getattr(self.config, "trading_hours_gate_enabled", False):
             self._session_in_session = self._calendar.in_session(self._strategy.current_timestamp)
+            # JEP-231 follow-up: the hedge (KIS/KRX) venue has NO continuous two-sided book during
+            # scheduled single-price call auctions. Reuse the SAME predicate the halt path uses
+            # (line ~250) so the base staleness latch masks ONLY the hedge leg there — one predicate,
+            # both paths, no divergence. False during an auction window → hedge staleness suppressed.
+            self._hedge_expect_continuous = not self._calendar.in_auction_window(self._strategy.current_timestamp)
         else:
             self._session_in_session = True   # 비활성 → 현행 동작(항상 in-session)
+            self._hedge_expect_continuous = True
 
     def _gates_open(self) -> bool:
         if getattr(self, "_seed_fail_closed", False):
@@ -519,6 +532,9 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             self._cancel_all_maker()
             self._place_targets(targets)
             return
+        targets = self._compute_targets()
+        if self._try_hyperliquid_batch_modify(targets):
+            return
         return super()._reconcile_maker()
 
     def _place_targets(self, targets: List) -> None:
@@ -533,9 +549,235 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             if now - self._last_observe_log_ts >= self._OBSERVE_LOG_INTERVAL_S:
                 self._last_observe_log_ts = now
                 self.logger().info(self._format_observe_line(self._last_observe))
-        for target in targets:
-            self._place_target_one(target)
+        self._place_targets_subset(targets)
         self._last_reprice_ts = self._strategy.current_timestamp
+
+    def _hyperliquid_batch_orders_enabled(self) -> bool:
+        if not getattr(self.config, "enable_hyperliquid_batch_orders", False):
+            return False
+        if not getattr(self.config, "maker_post_only", True):
+            return False
+        connector = self.connectors.get(self.maker_connector)
+        return (
+            self.maker_connector == "hyperliquid_perpetual"
+            and connector is not None
+            and hasattr(connector, "batch_place_orders")
+            and hasattr(connector, "batch_cancel_by_cloid")
+        )
+
+    def _hyperliquid_batch_modify_enabled(self) -> bool:
+        if not self._hyperliquid_batch_orders_enabled():
+            return False
+        connector = self.connectors.get(self.maker_connector)
+        return connector is not None and hasattr(connector, "batch_modify_orders")
+
+    def _target_side_and_position_action(self, target) -> tuple:
+        if self._is_two_sided():
+            side = TradeType.SELL if target.side == Side.SELL else TradeType.BUY
+            position_action = PositionAction.OPEN if side == self.entry_side else PositionAction.CLOSE
+            return side, position_action
+        return self.entry_side, PositionAction.OPEN
+
+    def _try_hyperliquid_batch_modify(self, targets: List[RungTarget]) -> bool:
+        if getattr(self.config, "observe", False):
+            return False
+        if not targets or not self._hyperliquid_batch_modify_enabled():
+            return False
+
+        connector = self.connectors[self.maker_connector]
+        open_makers = self._open_maker_orders()
+        if len(open_makers) != len(targets):
+            return False
+
+        pending_ids = getattr(self, "_hyperliquid_batch_modify_pending_order_ids", set())
+        current_order_ids = [order.order_id for order in open_makers]
+        if any(order_id in pending_ids for order_id in current_order_ids):
+            return True
+
+        marked_for_repair = set()
+        for order_id in current_order_ids:
+            if (
+                hasattr(connector, "is_hyperliquid_batch_modify_rejected")
+                and connector.is_hyperliquid_batch_modify_rejected(order_id)
+            ) or (
+                hasattr(connector, "is_hyperliquid_batch_modify_ambiguous")
+                and connector.is_hyperliquid_batch_modify_ambiguous(order_id)
+            ):
+                marked_for_repair.add(order_id)
+        if not marked_for_repair and not self._should_reprice(targets):
+            return False
+
+        maker_by_side = {}
+        for tracked in open_makers:
+            order = tracked.order
+            if (
+                order is None
+                or order.is_done
+                or order.order_type is not OrderType.LIMIT_MAKER
+                or order.executed_amount_base != ZERO
+            ):
+                return False
+            side = Side.SELL if order.trade_type is TradeType.SELL else Side.BUY
+            maker_by_side.setdefault(side, []).append(tracked)
+
+        targets_by_side = {}
+        for target in targets:
+            targets_by_side.setdefault(target.side, []).append(target)
+        if set(maker_by_side.keys()) != set(targets_by_side.keys()):
+            return False
+
+        matched = []
+        for side in targets_by_side:
+            side_makers = sorted(maker_by_side[side], key=lambda tracked: tracked.order.price)
+            side_targets = sorted(targets_by_side[side], key=lambda target: target.price)
+            if len(side_makers) != len(side_targets):
+                return False
+            for tracked, target in zip(side_makers, side_targets):
+                order = tracked.order
+                trade_type, position_action = self._target_side_and_position_action(target)
+                if (
+                    order.amount != target.size
+                    or order.trade_type is not trade_type
+                    or order.position != position_action
+                ):
+                    return False
+                matched.append((tracked.order_id, target, trade_type, position_action))
+
+        if not matched:
+            return False
+
+        if marked_for_repair:
+            fallback_ids = [
+                order_id for order_id, _target, _trade_type, _position_action in matched
+                if order_id in marked_for_repair
+            ]
+            fallback_targets = [
+                target for order_id, target, _trade_type, _position_action in matched
+                if order_id in marked_for_repair
+            ]
+            self._cancel_maker_order_ids(fallback_ids)
+            self._place_targets_subset(fallback_targets)
+            if hasattr(connector, "clear_hyperliquid_batch_modify_rejected"):
+                connector.clear_hyperliquid_batch_modify_rejected(fallback_ids)
+            if hasattr(connector, "clear_hyperliquid_batch_modify_ambiguous"):
+                connector.clear_hyperliquid_batch_modify_ambiguous(fallback_ids)
+            return True
+
+        requests = [
+            HyperliquidBatchModifyRequest(
+                client_order_id=order_id,
+                trading_pair=self.maker_trading_pair,
+                price=target.price,
+                amount=target.size,
+                trade_type=trade_type,
+                order_type=OrderType.LIMIT_MAKER,
+                position_action=position_action,
+            )
+            for order_id, target, trade_type, position_action in matched
+        ]
+        self._hyperliquid_batch_modify_pending_order_ids = set(pending_ids).union(
+            request.client_order_id for request in requests
+        )
+        self._last_reprice_ts = self._strategy.current_timestamp
+        safe_ensure_future(self._execute_hyperliquid_batch_modify(requests, matched))
+        return True
+
+    async def _execute_hyperliquid_batch_modify(self, requests: List[HyperliquidBatchModifyRequest], matched: List) -> None:
+        connector = self.connectors[self.maker_connector]
+        target_by_order_id = {order_id: target for order_id, target, _trade_type, _position_action in matched}
+        submitted_ids = [request.client_order_id for request in requests]
+        try:
+            result = await connector.batch_modify_orders(requests)
+            for order_id in result.accepted_order_ids:
+                target = target_by_order_id.get(order_id)
+                if target is None:
+                    continue
+                self._record_placed_rung(order_id, target)
+                _side, position_action = self._target_side_and_position_action(target)
+                if position_action == PositionAction.OPEN:
+                    if not hasattr(self, "_maker_placed_edge_bps"):
+                        self._maker_placed_edge_bps = {}
+                    self._maker_placed_edge_bps[order_id] = Decimal(target.edge_bps)
+            fallback_ids = list(dict.fromkeys(result.rejected_order_ids + result.ambiguous_order_ids))
+            if fallback_ids:
+                fallback_targets = [target_by_order_id[order_id] for order_id in fallback_ids if order_id in target_by_order_id]
+                self._cancel_maker_order_ids(fallback_ids)
+                self._place_targets_subset(fallback_targets)
+                if hasattr(connector, "clear_hyperliquid_batch_modify_rejected"):
+                    connector.clear_hyperliquid_batch_modify_rejected(fallback_ids)
+                if hasattr(connector, "clear_hyperliquid_batch_modify_ambiguous"):
+                    connector.clear_hyperliquid_batch_modify_ambiguous(fallback_ids)
+        except Exception:
+            self.logger().exception("Hyperliquid batch modify failed; falling back to cancel/place.")
+            fallback_targets = [target_by_order_id[order_id] for order_id in submitted_ids if order_id in target_by_order_id]
+            self._cancel_maker_order_ids(submitted_ids)
+            self._place_targets_subset(fallback_targets)
+        finally:
+            pending = getattr(self, "_hyperliquid_batch_modify_pending_order_ids", set())
+            pending.difference_update(submitted_ids)
+            self._hyperliquid_batch_modify_pending_order_ids = pending
+
+    def _place_targets_subset(self, targets: List[RungTarget]) -> None:
+        if not targets:
+            return
+        if not self._hyperliquid_batch_orders_enabled():
+            return super()._place_targets_subset(targets)
+
+        connector = self.connectors[self.maker_connector]
+        for i in range(0, len(targets), 8):
+            chunk = targets[i:i + 8]
+            requests = []
+            request_contexts = []
+            for target in chunk:
+                side, position_action = self._target_side_and_position_action(target)
+                request_contexts.append((target, side, position_action))
+                requests.append(HyperliquidBatchOrderRequest(
+                    trading_pair=self.maker_trading_pair,
+                    amount=target.size,
+                    trade_type=side,
+                    order_type=OrderType.LIMIT_MAKER,
+                    price=target.price,
+                    position_action=position_action,
+                    metadata={"order_role": "maker", "edge_bps": str(target.edge_bps)},
+                ))
+            try:
+                order_ids = connector.batch_place_orders(requests)
+            except Exception:
+                self.logger().exception("Hyperliquid batch place validation failed; falling back to single-order path.")
+                return super()._place_targets_subset(targets[i:])
+            if len(order_ids) != len(chunk):
+                self.logger().error(
+                    "Hyperliquid batch place returned %s order ids for %s targets; "
+                    "skipping fallback and %s remaining targets to avoid duplicates.",
+                    len(order_ids),
+                    len(chunk),
+                    len(targets) - i - len(chunk),
+                )
+                return
+            for order_id, (target, _side, position_action) in zip(order_ids, request_contexts):
+                self.maker_orders[order_id] = TrackedOrder(order_id=order_id)
+                self._record_placed_rung(order_id, target)
+                if position_action == PositionAction.OPEN:
+                    if not hasattr(self, "_maker_placed_edge_bps"):
+                        self._maker_placed_edge_bps = {}
+                    self._maker_placed_edge_bps[order_id] = Decimal(target.edge_bps)
+                self._note_maker_placement()
+        self._last_reprice_ts = self._strategy.current_timestamp
+
+    def _cancel_maker_order_ids(self, order_ids: List[str]) -> None:
+        if not order_ids:
+            return
+        if not self._hyperliquid_batch_orders_enabled():
+            return super()._cancel_maker_order_ids(order_ids)
+        connector = self.connectors[self.maker_connector]
+        try:
+            connector.batch_cancel_by_cloid([
+                HyperliquidBatchCancelRequest(client_order_id=order_id, trading_pair=self.maker_trading_pair)
+                for order_id in order_ids
+            ])
+        except Exception:
+            self.logger().exception("Hyperliquid batch cancel validation failed; falling back to single-order path.")
+            return super()._cancel_maker_order_ids(order_ids)
 
     def _flatten_unwind_step(self) -> bool:
         self._process_hedges()
@@ -815,12 +1057,27 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         # the balance candidate must be a PerpetualOrderCandidate -- the perp budget
         # checker reads .position_close/.leverage, which a plain OrderCandidate lacks
         # (AttributeError in validate_sufficient_balance -> executor never quotes).
+        # JEP-270: gate only needs to fund the realizable one-ladder maker-open commitment, not the
+        # full total_size_cap at phantom leverage=1 (which over-demands ~Nx vs HL's real isolated
+        # leverage and silently terminates a funded executor with INSUFFICIENT_BALANCE).
+        # build_ladder_targets (ladder_policy) clips the RUNNING open sum to total_size_cap - |pos|
+        # AND each open to min(rung.size, remaining); disabled and non-positive rungs place nothing.
+        # So the true upper bound on simultaneously-open maker size is
+        #   min(sum of enabled positive rung sizes, total_size_cap)
+        # -- raw rung-sum alone over-demands when rungs sum past the cap (re-triggering the churn).
+        # If no positive enabled rung exists, placement creates no targets, so skip the gate
+        # entirely rather than over-demanding the full cap. (The deploy controller also validates
+        # sum(rungs) <= cap and size > 0, but gate defensively so the executor is self-consistent.)
+        ladder_size = sum((r.size for r in self.config.rungs if r.enabled and r.size > ZERO), ZERO)
+        if ladder_size <= ZERO:
+            return None
+        gate_amount = min(ladder_size, self.config.total_size_cap)
         return PerpetualOrderCandidate(
             trading_pair=self.maker_trading_pair,
             is_maker=True,
             order_type=OrderType.LIMIT_MAKER,
             order_side=self.entry_side,
-            amount=self.config.total_size_cap,
+            amount=gate_amount,
             price=fair,
             leverage=Decimal(str(self.config.leverage)),
         )

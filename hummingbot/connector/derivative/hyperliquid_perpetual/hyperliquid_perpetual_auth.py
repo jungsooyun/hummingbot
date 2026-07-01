@@ -136,9 +136,12 @@ class HyperliquidPerpetualAuth(AuthBase):
         return payload
 
     def _sign_cancel_params(self, params, base_url, timestamp):
+        cancels = params["cancels"]
+        if not isinstance(cancels, list):
+            cancels = [cancels]
         order_action = {
             "type": "cancelByCloid",
-            "cancels": [params["cancels"]],
+            "cancels": cancels,
         }
         signature = self.sign_l1_action(
             self.wallet,
@@ -156,11 +159,13 @@ class HyperliquidPerpetualAuth(AuthBase):
         }
 
     def _sign_order_params(self, params, base_url, timestamp):
-        order = params["orders"]
+        orders = params["orders"]
+        if not isinstance(orders, list):
+            orders = [orders]
         grouping = params["grouping"]
         order_action = {
             "type": "order",
-            "orders": [order_spec_to_order_wire(order)],
+            "orders": [order_spec_to_order_wire(order) for order in orders],
             "grouping": grouping,
         }
         # The builder field is part of the signed payload. It must be added to the action dict
@@ -168,6 +173,32 @@ class HyperliquidPerpetualAuth(AuthBase):
         builder = params.get("builder")
         if builder is not None:
             order_action["builder"] = builder
+        signature = self.sign_l1_action(
+            self.wallet,
+            order_action,
+            self._vault_address,
+            timestamp,
+            CONSTANTS.PERPETUAL_BASE_URL in base_url,
+        )
+
+        return {
+            "action": order_action,
+            "nonce": timestamp,
+            "signature": signature,
+            "vaultAddress": self._vault_address,
+        }
+
+    def _sign_batch_modify_params(self, params, base_url, timestamp):
+        order_action = {
+            "type": "batchModify",
+            "modifies": [
+                {
+                    "oid": modify["oid"],
+                    "order": order_spec_to_order_wire(modify["order"]),
+                }
+                for modify in params["modifies"]
+            ],
+        }
         signature = self.sign_l1_action(
             self.wallet,
             order_action,
@@ -198,6 +229,8 @@ class HyperliquidPerpetualAuth(AuthBase):
             payload = self._sign_order_params(request_params, base_url, timestamp)
         elif request_type == "cancel":
             payload = self._sign_cancel_params(request_params, base_url, timestamp)
+        elif request_type == "batchModify":
+            payload = self._sign_batch_modify_params(request_params, base_url, timestamp)
         elif request_type == "updateLeverage":
             payload = self._sign_update_leverage_params(request_params, base_url, timestamp)
         payload = json.dumps(payload)

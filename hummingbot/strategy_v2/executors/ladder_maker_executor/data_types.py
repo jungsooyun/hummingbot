@@ -61,6 +61,9 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
     # rung fills as a taker at a price >= its edge instead of being rejected; resting orders are
     # still maker fills. Only profitable immediate fills happen (the limit price is the floor).
     maker_post_only: bool = True
+    # JEP-290: opt-in Hyperliquid batch place/cancel for maker ladder orders. Default OFF until
+    # smoke evidence proves response ordering and orphan-free cancel behavior in live.
+    enable_hyperliquid_batch_orders: bool = False
 
     # Reprice guards
     min_reprice_interval_s: float = 0.75
@@ -145,4 +148,8 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
     adopt_existing_inventory: bool = False
     # JEP-184: per-tick decision-pipeline latency profiling (read-only, off by default).
     latency_profiling: bool = False
+    # JEP-271: account-truth snapshots are an opt-in daemon sink; default must stay OFF.
+    account_truth_snapshot_enabled: bool = False
+    account_truth_snapshot_interval_s: float = 60.0
+    account_truth_snapshot_path: Optional[str] = None
     execution_purpose: str = Field(default="ladder_market_making")
