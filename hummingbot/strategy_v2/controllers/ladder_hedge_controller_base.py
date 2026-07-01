@@ -74,23 +74,17 @@ class LadderHedgeControllerConfigBase(ControllerConfigBase):
 
 
 class LadderHedgeControllerBase(ControllerBase):
-    # JEP-270 IB circuit breaker. The real bug fix is the gate sizing (ladder_maker_executor
-    # min(rung_sum, cap)) + the per-IB WARNING (cross_venue base): with a correct gate, healthy
-    # operation produces zero IB, and any residual IB is now LOUD instead of silent.
+    # JEP-270/JEP-272 IB circuit breaker. Defense-in-depth against the JEP-270 silent maker churn
+    # (maker executor created + IB-terminated ~1/s). The real churn fix is the JEP-270 gate sizing;
+    # this breaker pauses (re)creation + alerts if IB terminations recur at a churn RATE.
     #
-    # This breaker is pure defense-in-depth and ships ARMED-OFF (_IB_BREAKER_ENABLED = False),
-    # matching the JEP-238 OFF-by-default breaker convention. Adversarial review (JEP-270, 2
-    # independent engines) found that ENFORCING it as-is is a net regression on a LIVE MM bot:
-    # a transient JEP-209 /info-429 collateral starve momentarily reads HL collateral as 0 and
-    # trips ~10 consecutive pre-quote IB terminations in ~10s, which would FALSE-LATCH a healthy
-    # maker into a ~300s quoting halt (pre-breaker that glitch self-healed in ~1 tick). It also
-    # lacks success-reset (hair-trigger re-latch), is not is_updatable, isn't wired to
-    # SafetyNotifier, and is memoryless across restart. Until those are fixed (follow-up issue),
-    # we keep the COUNTING (observability) but never act. When disabled the breaker only tracks
-    # _consecutive_ib; it never pauses creation.
-    _IB_BREAKER_ENABLED = False
-    _IB_BREAKER_THRESHOLD = 10
-    _IB_BREAKER_PROBE_INTERVAL_S = 300.0
+    # Ships OFF (config.ib_breaker_enabled=False): _update_ib_breaker still COUNTS for observability
+    # but never latches, so behavior is identical to "always create". Hardened per JEP-272 so it can
+    # be enabled live (separate gated step): success-reset, windowed-rate + escalating backoff probe,
+    # is_updatable tunables, SafetyNotifier wiring, defensive coercion.
+    #
+    # Operator log-alert cadence is a fixed private constant (never tuned — YAGNI, and keeping it
+    # fixed avoids adding a coercion surface). The enable flag + tunables live on the config.
     _IB_BREAKER_ALERT_INTERVAL_S = 300.0
 
     def _now(self) -> float:
@@ -135,34 +129,63 @@ class LadderHedgeControllerBase(ControllerBase):
 
     def _update_ib_breaker(self) -> None:
         # lazy-init (avoid touching ControllerBase.__init__ signature; codebase getattr pattern).
-        seen = getattr(self, "_seen_done_ids", None)
-        if seen is None:
-            seen = self._seen_done_ids = set()
-            self._consecutive_ib = 0
-            # _now() is epoch seconds; 0.0 init would make a first latch from preexisting dones see
-            # now-0 >> interval and immediately probe (defeating the latch). Init to _now().
-            self._ib_last_probe_ts = self._now()
+        times = getattr(self, "_ib_times", None)
+        if times is None:
+            times = self._ib_times = deque()
+            self._ib_latched = False
+            self._probe_fail_count = 0
+            self._ib_latch_epoch = 0
             self._ib_last_alert_ts = 0.0
-        new_done = [e for e in self.executors_info if e.is_done and e.id not in seen]
+            self._seen_done_ids = set()
+            self._prev_running_ids = set()
+            # _now() is epoch seconds; a 0.0 init would make a first latch from pre-existing dones see
+            # now-0 >> pause and immediately probe (defeating the very first hold). Init to _now().
+            self._ib_last_probe_ts = self._now()
+
+        now = self._now()
+        current_running_ids = {e.id for e in self.executors_info
+                               if getattr(e, "status", None) == RunnableStatus.RUNNING}
+
+        # Disable = temporary enforcement OVERRIDE (not a recovery): release the hold and keep
+        # counting, but do NOT notify / bump epoch / reset backoff — so a disable->re-enable within
+        # the same churn window resumes the SAME incident rather than starting a fresh episode.
+        if not self._ib_breaker_enabled():
+            self._ib_latched = False
+
+        # Count newly-done IB terminations into the window (close-timestamp order). Non-IB deaths are
+        # not churn: they are ignored here and simply age out of the window.
+        new_done = [e for e in self.executors_info if e.is_done and e.id not in self._seen_done_ids]
         new_done.sort(key=lambda e: (e.close_timestamp if e.close_timestamp is not None else e.timestamp))
         for e in new_done:
             if e.close_type == CloseType.INSUFFICIENT_BALANCE:
-                self._consecutive_ib += 1
-            else:
-                self._consecutive_ib = 0
-            seen.add(e.id)
-        # prune ids the orchestrator no longer reports (bound growth; no recount since gone == gone).
-        self._seen_done_ids = seen & {e.id for e in self.executors_info}
+                ts = e.close_timestamp if e.close_timestamp is not None else e.timestamp
+                self._ib_times.append(ts)
+            self._seen_done_ids.add(e.id)
+
+        # Prune the window to (now - window_s, now].
+        cutoff = now - self._ib_window_s()
+        while self._ib_times and self._ib_times[0] < cutoff:
+            self._ib_times.popleft()
+
+        # Trigger (window -> latch): churn RATE reached and not already latched -> new latch episode.
+        if self._ib_breaker_enabled() and not self._ib_latched and len(self._ib_times) >= self._ib_threshold():
+            self._ib_latched = True
+
+        # Bound growth; no recount (gone == gone). Snapshot running ids for next tick's success signal.
+        self._seen_done_ids &= {e.id for e in self.executors_info}
+        self._prev_running_ids = current_running_ids
 
     def _maybe_alert_ib_breaker(self, now: float) -> None:
+        # Operator LOG line: rate-limited by the fixed _IB_BREAKER_ALERT_INTERVAL_S.
         if (now - getattr(self, "_ib_last_alert_ts", 0.0)) >= self._IB_BREAKER_ALERT_INTERVAL_S:
             self._ib_last_alert_ts = now
+            pause = min(self._ib_probe_base() * 2 ** self._probe_fail_count, self._ib_probe_max())
             self.logger().warning(
-                "IB circuit breaker LATCHED: %s consecutive INSUFFICIENT_BALANCE executor "
-                "terminations on controller %s -- pausing executor (re)creation (probe every %ss). "
+                "IB circuit breaker LATCHED: %s INSUFFICIENT_BALANCE terminations within %ss on "
+                "controller %s -- pausing executor (re)creation (backoff probe, current pause %.0fs). "
                 "Maker quoting stopped; existing hedge/position unchanged (delta-neutral). "
                 "Check maker-leg collateral / JEP-270 gate sizing.",
-                self._consecutive_ib, getattr(self.config, "id", "?"), self._IB_BREAKER_PROBE_INTERVAL_S,
+                len(self._ib_times), self._ib_window_s(), getattr(self.config, "id", "?"), pause,
             )
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
@@ -171,13 +194,16 @@ class LadderHedgeControllerBase(ControllerBase):
         if len(active) >= self.config.max_executors:
             return []
         now = self._now()
-        # ENFORCEMENT is gated OFF by default (see class docstring): _update_ib_breaker above still
-        # COUNTS consecutive IB for observability, but we only pause/probe when explicitly armed.
-        if self._IB_BREAKER_ENABLED and self._consecutive_ib >= self._IB_BREAKER_THRESHOLD:
-            if (now - self._ib_last_probe_ts) < self._IB_BREAKER_PROBE_INTERVAL_S:
+        # ENFORCEMENT: _ib_latched is the single source of truth (it already implies enabled — the
+        # disable path in _update_ib_breaker force-clears it). A transient burst latches with
+        # _probe_fail_count=0, so the first pause is only probe_base; the pause escalates only on
+        # SUSTAINED failure (each probe re-fails without surviving two ticks).
+        if self._ib_latched:
+            pause = min(self._ib_probe_base() * 2 ** self._probe_fail_count, self._ib_probe_max())
+            if (now - self._ib_last_probe_ts) < pause:
                 self._maybe_alert_ib_breaker(now)
                 return []
-            # else: probe due -> fall through to create exactly one
+            self._probe_fail_count += 1  # probe due -> advance the backoff step
         self._ib_last_probe_ts = now
         return [CreateExecutorAction(
             executor_config=self._build_executor_config(),

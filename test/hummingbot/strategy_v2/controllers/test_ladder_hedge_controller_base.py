@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 import hummingbot.strategy_v2.controllers.ladder_hedge_controller_base as ladder_mod
 from hummingbot.strategy_v2.controllers.ladder_hedge_controller_base import LadderHedgeControllerBase
+from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType
 
 
@@ -22,98 +23,50 @@ class _Ctl(LadderHedgeControllerBase):
 
 
 def _ctl():
-    c = _Ctl.__new__(_Ctl)          # bypass framework __init__
+    c = _Ctl.__new__(_Ctl)              # bypass framework __init__
     c.config = MagicMock()
     c.config.max_executors = 1
     c.config.id = "ctl-1"
+    # A MagicMock attribute is truthy + un-coercible, so EVERY breaker field must be set explicitly.
+    c.config.ib_breaker_enabled = True  # ARM for enforcement tests (ships OFF; see OFF-default test)
+    c.config.ib_breaker_threshold = 10
+    c.config.ib_breaker_window_s = 60.0
+    c.config.ib_breaker_probe_base_s = 15.0
+    c.config.ib_breaker_probe_max_s = 300.0
     c.executors_info = []
-    c._clock = {"t": 1_700_000_000.0}     # epoch-like clock (0.0 would mask the epoch bug)
+    c._clock = {"t": 1_700_000_000.0}   # epoch-like clock (0.0 would mask the epoch-init bug)
     c._now = lambda: c._clock["t"]
-    c._IB_BREAKER_ENABLED = True           # ARM for the enforcement tests (ships OFF by default)
     return c
+
+
+def _ib_done(c, eid):
+    # IB-terminated executor stamped at the CURRENT clock (window prunes by now - window_s, so a
+    # ~0 timestamp like the old float(i) would prune instantly and never trigger).
+    e = MagicMock()
+    e.id = eid; e.is_done = True; e.close_type = CloseType.INSUFFICIENT_BALANCE
+    e.close_timestamp = c._now(); e.timestamp = c._now(); e.status = RunnableStatus.TERMINATED
+    return e
 
 
 def _done(eid, close_type, ts):
     e = MagicMock()
-    e.id = eid; e.is_done = True; e.close_type = close_type; e.close_timestamp = ts; e.timestamp = ts
+    e.id = eid; e.is_done = True; e.close_type = close_type
+    e.close_timestamp = ts; e.timestamp = ts; e.status = RunnableStatus.TERMINATED
     return e
 
 
-def test_breaker_latches_after_threshold_consecutive_ib():
-    c = _ctl()
-    for i in range(c._IB_BREAKER_THRESHOLD):
-        c.executors_info = [_done(f"e{i}", CloseType.INSUFFICIENT_BALANCE, float(i))]
+def _running(eid):
+    e = MagicMock()
+    e.id = eid; e.is_done = False; e.status = RunnableStatus.RUNNING
+    return e
+
+
+def _latch(c, n=None):
+    # Drive n IB terminations at the current clock to trip the latch. Uses distinct ids each tick.
+    n = c.config.ib_breaker_threshold if n is None else n
+    for i in range(n):
+        c.executors_info = [_ib_done(c, f"e{i}")]
         c.determine_executor_actions()
-    assert c._consecutive_ib >= c._IB_BREAKER_THRESHOLD
-    c.executors_info = []
-    assert c.determine_executor_actions() == []
-
-
-def test_non_ib_done_resets_counter_and_resumes():
-    c = _ctl()
-    for i in range(c._IB_BREAKER_THRESHOLD):
-        c.executors_info = [_done(f"e{i}", CloseType.INSUFFICIENT_BALANCE, float(i))]
-        c.determine_executor_actions()
-    c.executors_info = [_done("ok", CloseType.COMPLETED, 100.0)]
-    c.determine_executor_actions()
-    assert c._consecutive_ib == 0
-    c.executors_info = []
-    assert len(c.determine_executor_actions()) == 1
-
-
-def test_first_latch_from_preexisting_dones_holds():
-    c = _ctl()
-    c.executors_info = [_done(f"pre{i}", CloseType.INSUFFICIENT_BALANCE, float(i))
-                        for i in range(c._IB_BREAKER_THRESHOLD)]
-    actions = c.determine_executor_actions()
-    assert c._consecutive_ib >= c._IB_BREAKER_THRESHOLD
-    assert actions == []
-
-
-def test_latched_probe_allows_exactly_one_create_per_interval():
-    c = _ctl()
-    for i in range(c._IB_BREAKER_THRESHOLD):
-        c.executors_info = [_done(f"e{i}", CloseType.INSUFFICIENT_BALANCE, float(i))]
-        c.determine_executor_actions()
-    c.executors_info = []
-    c._clock["t"] += c._IB_BREAKER_PROBE_INTERVAL_S + 1.0
-    assert len(c.determine_executor_actions()) == 1
-    assert c.determine_executor_actions() == []
-    c._clock["t"] += c._IB_BREAKER_PROBE_INTERVAL_S + 1.0
-    assert len(c.determine_executor_actions()) == 1
-
-
-def test_mixed_batch_evaluated_in_close_timestamp_order():
-    c = _ctl()
-    c.executors_info = [_done("ib", CloseType.INSUFFICIENT_BALANCE, 1.0),
-                        _done("ok", CloseType.COMPLETED, 2.0)]
-    c.determine_executor_actions()
-    assert c._consecutive_ib == 0
-
-
-def test_seen_ids_pruned_no_recount():
-    c = _ctl()
-    c.executors_info = [_done("e0", CloseType.INSUFFICIENT_BALANCE, 0.0)]
-    c.determine_executor_actions()
-    assert c._consecutive_ib == 1
-    c.determine_executor_actions()
-    assert c._consecutive_ib == 1
-
-
-def test_breaker_ships_off_by_default_observes_without_pausing():
-    # JEP-270 (adversarial review BLOCKERs): the IB breaker enforcement ships armed-OFF
-    # (matches the JEP-238 OFF-by-default breaker convention). Disabled it must NOT pause
-    # creation (so it cannot false-latch a healthy maker for ~300s on a transient JEP-209
-    # /info starve), but it MUST still COUNT consecutive IB for observability. Operators
-    # arm + tune it in a follow-up once it is hardened (success-reset, backoff, is_updatable,
-    # SafetyNotifier wiring).
-    assert LadderHedgeControllerBase._IB_BREAKER_ENABLED is False  # default OFF
-    c = _ctl()
-    c._IB_BREAKER_ENABLED = False  # restore class default (_ctl() arms it for the enforcement tests)
-    for i in range(c._IB_BREAKER_THRESHOLD + 3):
-        c.executors_info = [_done(f"e{i}", CloseType.INSUFFICIENT_BALANCE, float(i))]
-        assert len(c.determine_executor_actions()) == 1  # never pauses while disabled
-    assert c._consecutive_ib >= c._IB_BREAKER_THRESHOLD  # but still counts (observability preserved)
 
 
 def test_config_fields_default_off_and_tunable():
@@ -144,3 +97,97 @@ def test_accessors_coerce_malformed_config_without_crashing():
     c.config.ib_breaker_probe_base_s = 40.0      # valid base
     c.config.ib_breaker_probe_max_s = 20.0       # < base -> max(40, 300)
     assert c._ib_probe_max() == 300.0
+
+
+def test_windowed_trigger_latches_then_holds():
+    c = _ctl()
+    _latch(c)                                   # threshold IBs at the current clock
+    assert c._ib_latched is True
+    assert len(c._ib_times) >= c.config.ib_breaker_threshold
+    c.executors_info = []
+    assert c.determine_executor_actions() == []  # held (first pause = base, clock not advanced)
+
+
+def test_windowed_aging_below_threshold_does_not_latch():
+    c = _ctl()
+    _latch(c, n=c.config.ib_breaker_threshold - 1)   # threshold-1 IBs
+    c._clock["t"] += c.config.ib_breaker_window_s + 1.0   # age them all out
+    c.executors_info = [_ib_done(c, "late")]         # +1 IB, but the old ones pruned
+    c.determine_executor_actions()
+    assert c._ib_latched is False
+    assert len(c._ib_times) == 1
+
+
+def test_non_ib_death_is_ignored_not_reset():
+    c = _ctl()
+    c.executors_info = [_ib_done(c, "ib0")]
+    c.determine_executor_actions()
+    c.executors_info = [_done("ok", CloseType.COMPLETED, c._now())]  # non-IB: ignored, not a reset
+    c.determine_executor_actions()
+    assert len(c._ib_times) == 1                     # still 1 (COMPLETED neither added nor reset)
+
+
+def test_seen_ids_pruned_no_recount():
+    c = _ctl()
+    c.executors_info = [_ib_done(c, "e0")]
+    c.determine_executor_actions()
+    assert len(c._ib_times) == 1
+    c.determine_executor_actions()                   # same done still reported
+    assert len(c._ib_times) == 1                     # not recounted
+
+
+def test_first_latch_from_preexisting_dones_holds():
+    c = _ctl()
+    c.executors_info = [_ib_done(c, f"pre{i}") for i in range(c.config.ib_breaker_threshold)]
+    actions = c.determine_executor_actions()         # first-ever call
+    assert c._ib_latched is True
+    assert actions == []                             # _ib_last_probe_ts lazy-inits to _now(), so it HOLDS
+
+
+def test_transient_first_pause_is_base_not_max():
+    c = _ctl()
+    _latch(c)
+    c.executors_info = []
+    assert c.determine_executor_actions() == []      # base pause not yet elapsed
+    c._clock["t"] += c.config.ib_breaker_probe_base_s + 1.0
+    assert len(c.determine_executor_actions()) == 1  # exactly one probe at +base (NOT +max/300s)
+
+
+def test_backoff_escalates_across_window_aging():
+    # BLOCKING-1 regression: sustained failure where the original burst ages out of the window must
+    # STILL hold (latch persists) and the pause must grow base -> 2x -> ... -> cap.
+    c = _ctl()
+    _latch(c)
+    base = c.config.ib_breaker_probe_base_s
+    cap = c.config.ib_breaker_probe_max_s
+    seen_pauses = []
+    for step in range(6):
+        pause = min(base * 2 ** c._probe_fail_count, cap)
+        seen_pauses.append(pause)
+        c._clock["t"] += pause + 1.0                 # let this probe fire
+        c.executors_info = []
+        acted = c.determine_executor_actions()       # probe due -> one create, probe_fail++
+        assert len(acted) == 1
+        # the probe immediately IB-dies (sustained failure) before surviving two ticks:
+        c.executors_info = [_ib_done(c, f"probe{step}")]
+        c.determine_executor_actions()
+    assert c._ib_latched is True                     # window aged out, but latch persists
+    assert seen_pauses[0] == base and seen_pauses[1] == base * 2
+    assert seen_pauses[-1] == cap                    # escalated to cap
+
+
+def test_log_rate_limited_and_never_raises(monkeypatch):
+    # BLOCKING-2 regression: many held ticks -> at most one warning per _IB_BREAKER_ALERT_INTERVAL_S,
+    # and no crash from a missing config field for the alert interval. Install the capturing logger
+    # BEFORE _latch: the latch trips on the threshold-th tick without the clock advancing, so that
+    # tick is itself the first HELD tick and emits the single warning; the 20 further held ticks are
+    # all inside the same 300s log window and add none.
+    c = _ctl()
+    warnings = []
+    monkeypatch.setattr(c, "logger", lambda: MagicMock(warning=lambda *a, **k: warnings.append(a)))
+    _latch(c)
+    c.executors_info = []
+    for _ in range(20):
+        c._clock["t"] += 0.5                          # 20 * 0.5 = +10s < base 15s -> every tick HOLDs
+        c.determine_executor_actions()
+    assert len(warnings) == 1                          # one warning per 300s window despite 21 held ticks
