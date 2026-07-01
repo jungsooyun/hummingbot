@@ -322,3 +322,80 @@ def test_ships_off_by_default_observes_without_pausing():
         assert len(c.determine_executor_actions()) == 1  # never pauses while disabled
     assert len(c._ib_times) >= c.config.ib_breaker_threshold  # but still counts (observability)
     assert c._ib_latched is False
+
+
+# ---- R1 hardening (Codex adversarial challenge) ---------------------------------------------------
+
+def test_enable_coercion_false_like_values_stay_off():
+    # Challenge finding 1: a naive bool() would arm the breaker on any truthy junk (a "ships OFF,
+    # behavior-neutral" flag must default to OFF on ambiguous input). False-like strings, None, NaN,
+    # and non-1 numbers stay OFF; only real True or a known true-string arms it.
+    c = _ctl()
+    for bad in ("false", "False", "0", "no", "off", "", None, float("nan"), -1, 0, 2):
+        c.config.ib_breaker_enabled = bad
+        assert c._ib_breaker_enabled() is False, bad
+    for good in (True, "true", "True", "1", "yes", "on", 1):
+        c.config.ib_breaker_enabled = good
+        assert c._ib_breaker_enabled() is True, good
+    # a malformed false-like enable must NOT latch/pause a churning maker (stays behavior-neutral)
+    c.config.ib_breaker_enabled = "false"
+    for i in range(c.config.ib_breaker_threshold + 2):
+        c.executors_info = [_ib_done(c, f"e{i}")]
+        assert len(c.determine_executor_actions()) == 1
+    assert c._ib_latched is False
+
+
+def test_backoff_saturates_without_overflow():
+    # Challenge finding 2: base * 2**_probe_fail_count OverflowErrors (~fail>=1024) inside the per-tick
+    # loop. A pathological sustained-failure count must saturate at max, never raise.
+    c = _ctl()
+    _latch(c)
+    c._probe_fail_count = 5000                          # ~days of capped probes
+    c.executors_info = []
+    assert c.determine_executor_actions() == []         # held; pause computed without OverflowError
+    assert c._ib_pause() == c.config.ib_breaker_probe_max_s
+
+
+def test_accessors_reject_non_finite_and_bool():
+    # Challenge finding 3: inf/NaN/bool slip through coercion -> degenerate live behavior (window=inf
+    # never prunes; base=inf never probes; threshold=True==1 latches on a single IB).
+    c = _ctl()
+    c.config.ib_breaker_window_s = float("inf")
+    assert c._ib_window_s() == 60.0
+    c.config.ib_breaker_window_s = float("nan")
+    assert c._ib_window_s() == 60.0
+    c.config.ib_breaker_probe_base_s = float("inf")
+    assert c._ib_probe_base() == 15.0
+    c.config.ib_breaker_probe_max_s = float("inf")
+    assert c._ib_probe_max() == 300.0
+    c.config.ib_breaker_threshold = float("inf")        # int(inf) raises OverflowError
+    assert c._ib_threshold() == 10
+    c.config.ib_breaker_threshold = True                # bool -> default (avoid threshold==1)
+    assert c._ib_threshold() == 10
+
+
+def test_future_close_timestamp_does_not_block_pruning():
+    # Challenge finding 5a: an out-of-order/future close_timestamp must not wedge left-edge pruning.
+    # Counting at OBSERVATION time (now, monotonic across ticks) keeps the window prune-able.
+    c = _ctl()
+    fut = _ib_done(c, "future"); fut.close_timestamp = c._now() + 10_000.0  # bogus far-future close ts
+    c.executors_info = [fut]
+    c.determine_executor_actions()                      # observed at T
+    assert len(c._ib_times) == 1
+    c._clock["t"] += c.config.ib_breaker_window_s + 1.0  # advance past the window
+    c.executors_info = []
+    c.determine_executor_actions()
+    assert len(c._ib_times) == 0                         # aged out by observation time, not blocked
+
+
+def test_prune_open_left_at_exact_boundary():
+    # Challenge finding 7: prune must match the documented open-left window (now - window_s, now] —
+    # an entry exactly at now - window_s ages out.
+    c = _ctl()
+    c.executors_info = [_ib_done(c, "edge")]
+    c.determine_executor_actions()                      # observed at T
+    assert len(c._ib_times) == 1
+    c._clock["t"] += c.config.ib_breaker_window_s       # now == T + window -> cutoff == T
+    c.executors_info = []
+    c.determine_executor_actions()
+    assert len(c._ib_times) == 0                         # entry exactly at cutoff pruned (open-left)

@@ -1,3 +1,4 @@
+import math
 import time
 from collections import deque
 from decimal import Decimal
@@ -96,12 +97,25 @@ class LadderHedgeControllerBase(ControllerBase):
     # ---- is_updatable config accessors with defensive coercion (a malformed hot-edit falls back to
     # ---- the field default rather than raising inside the control loop — JEP-283 robust-coercion). ----
     def _ib_breaker_enabled(self) -> bool:
-        return bool(getattr(self.config, "ib_breaker_enabled", False))
+        # A "ships OFF, behavior-neutral" enable flag must default to OFF on ambiguous input: a naive
+        # bool() would arm the breaker on any truthy junk (a false-like string, NaN, a stray object).
+        # Only a real True, a known true-string, or exactly 1 arms it; everything else stays OFF.
+        v = getattr(self.config, "ib_breaker_enabled", False)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.strip().lower() in ("true", "1", "yes", "on")
+        if isinstance(v, (int, float)):
+            return v == 1
+        return False
 
     def _ib_threshold(self) -> int:
+        v = getattr(self.config, "ib_breaker_threshold", 10)
+        if isinstance(v, bool):
+            return 10  # threshold=True would coerce to 1 -> a single IB latches; reject it
         try:
-            v = int(getattr(self.config, "ib_breaker_threshold", 10))
-        except (TypeError, ValueError):
+            v = int(v)
+        except (TypeError, ValueError, OverflowError):  # int(inf) raises OverflowError
             return 10
         return v if v >= 1 else 10
 
@@ -110,14 +124,14 @@ class LadderHedgeControllerBase(ControllerBase):
             v = float(getattr(self.config, "ib_breaker_window_s", 60.0))
         except (TypeError, ValueError):
             return 60.0
-        return v if v > 0 else 60.0
+        return v if (math.isfinite(v) and v > 0) else 60.0  # reject inf (never prunes) / NaN
 
     def _ib_probe_base(self) -> float:
         try:
             v = float(getattr(self.config, "ib_breaker_probe_base_s", 15.0))
         except (TypeError, ValueError):
             return 15.0
-        return v if v > 0 else 15.0
+        return v if (math.isfinite(v) and v > 0) else 15.0  # reject inf (never probes) / NaN
 
     def _ib_probe_max(self) -> float:
         base = self._ib_probe_base()
@@ -125,7 +139,17 @@ class LadderHedgeControllerBase(ControllerBase):
             v = float(getattr(self.config, "ib_breaker_probe_max_s", 300.0))
         except (TypeError, ValueError):
             return max(base, 300.0)
+        if not math.isfinite(v):  # reject inf/NaN cap (would let the pause grow unbounded)
+            return max(base, 300.0)
         return v if v >= base else max(base, 300.0)
+
+    def _ib_pause(self) -> float:
+        # Backoff pause = min(base * 2**fail, max). The exponent is BOUNDED so a pathological
+        # sustained-failure _probe_fail_count (thousands of capped cycles) can't raise OverflowError
+        # converting a huge int to float inside the per-tick control loop — once 2**fail overshoots
+        # max, min() already saturates, so clamping the exponent is behavior-preserving.
+        fail = self._probe_fail_count if self._probe_fail_count < 64 else 64
+        return min(self._ib_probe_base() * 2 ** fail, self._ib_probe_max())
 
     def _update_ib_breaker(self) -> None:
         # lazy-init (avoid touching ControllerBase.__init__ signature; codebase getattr pattern).
@@ -156,6 +180,10 @@ class LadderHedgeControllerBase(ControllerBase):
         # pre-funding gate (a doomed IB executor is only briefly RUNNING before it IB-terminates;
         # RunnableBase.start() sets RUNNING synchronously before validate). RUNNING-across-two-ticks is
         # the robust controller-only "quote-capable" signal (NOT is_trading, which needs a fill).
+        # Envelope note: this assumes the LadderHedge single-executor design (max_executors=1). While
+        # latched, creation is paused except the one probe, so the only two-tick survivor IS the probe.
+        # At max_executors>1 a pre-existing healthy executor could clear the latch; that is out of
+        # scope here and self-corrects (re-latches if the underlying churn persists).
         survived = current_running_ids & self._prev_running_ids
         if survived:
             was_latched = self._ib_latched
@@ -167,19 +195,23 @@ class LadderHedgeControllerBase(ControllerBase):
                 self._ib_latch_epoch += 1
                 self._ib_last_alert_ts = 0.0  # let the next episode log/alert immediately
 
-        # Count newly-done IB terminations into the window (close-timestamp order). Non-IB deaths are
-        # not churn: they are ignored here and simply age out of the window.
+        # Count newly-done IB terminations into the window. Non-IB deaths are not churn: they are
+        # ignored here and simply age out of the window. Sort the batch by close time only for a
+        # deterministic seen-order; the value APPENDED is the OBSERVATION time (now), not the
+        # executor-reported close_timestamp — now is monotonic across ticks, so the deque stays
+        # ordered and left-edge pruning is correct even if an executor reports an out-of-order or
+        # future close_timestamp (which would otherwise wedge pruning and hold the latch on stale data).
         new_done = [e for e in self.executors_info if e.is_done and e.id not in self._seen_done_ids]
         new_done.sort(key=lambda e: (e.close_timestamp if e.close_timestamp is not None else e.timestamp))
         for e in new_done:
             if e.close_type == CloseType.INSUFFICIENT_BALANCE:
-                ts = e.close_timestamp if e.close_timestamp is not None else e.timestamp
-                self._ib_times.append(ts)
+                self._ib_times.append(now)
             self._seen_done_ids.add(e.id)
 
-        # Prune the window to (now - window_s, now].
+        # Prune the window to the open-left interval (now - window_s, now]: an entry exactly at the
+        # cutoff (now - window_s) ages out, matching the documented interval.
         cutoff = now - self._ib_window_s()
-        while self._ib_times and self._ib_times[0] < cutoff:
+        while self._ib_times and self._ib_times[0] <= cutoff:
             self._ib_times.popleft()
 
         # Trigger (window -> latch): churn RATE reached and not already latched -> new latch episode.
@@ -219,7 +251,7 @@ class LadderHedgeControllerBase(ControllerBase):
         # Operator LOG line: rate-limited by the fixed _IB_BREAKER_ALERT_INTERVAL_S.
         if (now - getattr(self, "_ib_last_alert_ts", 0.0)) >= self._IB_BREAKER_ALERT_INTERVAL_S:
             self._ib_last_alert_ts = now
-            pause = min(self._ib_probe_base() * 2 ** self._probe_fail_count, self._ib_probe_max())
+            pause = self._ib_pause()
             self.logger().warning(
                 "IB circuit breaker LATCHED: %s INSUFFICIENT_BALANCE terminations within %ss on "
                 "controller %s -- pausing executor (re)creation (backoff probe, current pause %.0fs). "
@@ -239,11 +271,11 @@ class LadderHedgeControllerBase(ControllerBase):
         # _probe_fail_count=0, so the first pause is only probe_base; the pause escalates only on
         # SUSTAINED failure (each probe re-fails without surviving two ticks).
         if self._ib_latched:
-            pause = min(self._ib_probe_base() * 2 ** self._probe_fail_count, self._ib_probe_max())
+            pause = self._ib_pause()
             if (now - self._ib_last_probe_ts) < pause:
                 self._maybe_alert_ib_breaker(now)
                 return []
-            self._probe_fail_count += 1  # probe due -> advance the backoff step
+            self._probe_fail_count = min(self._probe_fail_count + 1, 64)  # advance backoff (bounded)
         self._ib_last_probe_ts = now
         return [CreateExecutorAction(
             executor_config=self._build_executor_config(),
