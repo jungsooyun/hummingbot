@@ -163,7 +163,7 @@ class LadderHedgeControllerBase(ControllerBase):
             self._probe_fail_count = 0
             self._ib_latched = False
             if was_latched:
-                # Task 5 wires the SafetyNotifier "recovered" push here (before the epoch bump).
+                self._emit_ib_alert("recovered", "a probe executor survived two consecutive ticks")
                 self._ib_latch_epoch += 1
                 self._ib_last_alert_ts = 0.0  # let the next episode log/alert immediately
 
@@ -190,7 +190,32 @@ class LadderHedgeControllerBase(ControllerBase):
         self._seen_done_ids &= {e.id for e in self.executors_info}
         self._prev_running_ids = current_running_ids
 
+    def _emit_ib_alert(self, event: str, detail: str) -> None:
+        # Route latch/recovery to the JEP-258/259 SafetyNotifier. Lazy-import + fully guarded: a test
+        # env without the module (or any notify failure) must never crash the control loop. The key
+        # carries the latch epoch so a re-latch after a recovery alerts again (SafetyNotifier dedup is
+        # process-permanent, so a fixed key would alert only once per process).
+        try:
+            from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.safety_notifier import (
+                SafetyNotifier,
+            )
+            cid = getattr(self.config, "id", "?")
+            key = f"{cid}:ib_breaker_{event}:{self._ib_latch_epoch}"
+            if event == "latched":
+                msg = (f"IB circuit breaker LATCHED on {cid}: {detail}. Maker quoting paused "
+                       f"(delta-neutral; existing hedge/position unchanged). Check maker-leg "
+                       f"collateral / JEP-270 gate sizing.")
+            else:
+                msg = f"IB circuit breaker RECOVERED on {cid}: {detail}; maker quoting resumes."
+            SafetyNotifier.get_instance().notify(key, msg)
+        except Exception:
+            pass
+
     def _maybe_alert_ib_breaker(self, now: float) -> None:
+        # SafetyNotifier push: attempted every held tick, deduped once-per-episode by the epoch key
+        # (independent of the log rate-limit below).
+        self._emit_ib_alert("latched", f"{len(self._ib_times)} IB terminations within "
+                                       f"{self._ib_window_s():.0f}s")
         # Operator LOG line: rate-limited by the fixed _IB_BREAKER_ALERT_INTERVAL_S.
         if (now - getattr(self, "_ib_last_alert_ts", 0.0)) >= self._IB_BREAKER_ALERT_INTERVAL_S:
             self._ib_last_alert_ts = now

@@ -259,3 +259,66 @@ def test_disable_releases_active_hold():
     c.executors_info = [_ib_done(c, "still")]           # counting still updates while disabled
     c.determine_executor_actions()
     assert len(c._ib_times) >= 1
+
+
+class _FakeNotifier:
+    # Model SafetyNotifier's process-permanent key dedup so the test proves the CONTROLLER's key
+    # contract (once-per-episode via the epoch key), not the fake's. `calls` = unique keys, in order.
+    def __init__(self): self.calls = []; self._seen = set()
+    def notify(self, key, message):
+        if key in self._seen:
+            return
+        self._seen.add(key); self.calls.append(key)
+
+
+@pytest.fixture(autouse=True)
+def fake_notifier():
+    # autouse: EVERY test in this module installs a silent fake, so a latch that fires _emit_ib_alert
+    # can never construct the real (atexit-registered, network-capable) SafetyNotifier singleton.
+    from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.safety_notifier import (
+        SafetyNotifier,
+    )
+    fake = _FakeNotifier()
+    SafetyNotifier.set_instance(fake)
+    yield fake
+    SafetyNotifier.set_instance(None)
+
+
+def test_safetynotifier_latch_recovery_and_relatch(fake_notifier):
+    c = _ctl()
+    _latch(c)
+    c.executors_info = []
+    c.determine_executor_actions()                     # held -> latched notify (epoch 0), once
+    c.determine_executor_actions()
+    latched0 = [k for k in fake_notifier.calls if k == "ctl-1:ib_breaker_latched:0"]
+    assert len(latched0) == 1                          # deduped within the episode
+    # recover
+    surv = _running("probe")
+    c.executors_info = [surv]; c.determine_executor_actions()
+    c.executors_info = [surv]; c.determine_executor_actions()
+    assert "ctl-1:ib_breaker_recovered:0" in fake_notifier.calls
+    assert c._ib_latch_epoch == 1
+    # re-latch -> alerts again under the NEW epoch key
+    _latch(c)
+    c.executors_info = []
+    c.determine_executor_actions()
+    assert "ctl-1:ib_breaker_latched:1" in fake_notifier.calls
+
+
+def test_safetynotifier_silent_while_disabled(fake_notifier):
+    c = _ctl()
+    c.config.ib_breaker_enabled = False
+    for i in range(c.config.ib_breaker_threshold + 3):
+        c.executors_info = [_ib_done(c, f"e{i}")]
+        c.determine_executor_actions()
+    assert fake_notifier.calls == []                   # counts only, never latches -> never notifies
+
+
+def test_ships_off_by_default_observes_without_pausing():
+    c = _ctl()
+    c.config.ib_breaker_enabled = False                # class default is False (asserted in Task 2)
+    for i in range(c.config.ib_breaker_threshold + 3):
+        c.executors_info = [_ib_done(c, f"e{i}")]
+        assert len(c.determine_executor_actions()) == 1  # never pauses while disabled
+    assert len(c._ib_times) >= c.config.ib_breaker_threshold  # but still counts (observability)
+    assert c._ib_latched is False
