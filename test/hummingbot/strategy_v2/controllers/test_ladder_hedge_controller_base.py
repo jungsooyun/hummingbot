@@ -191,3 +191,71 @@ def test_log_rate_limited_and_never_raises(monkeypatch):
         c._clock["t"] += 0.5                          # 20 * 0.5 = +10s < base 15s -> every tick HOLDs
         c.determine_executor_actions()
     assert len(warnings) == 1                          # one warning per 300s window despite 21 held ticks
+
+
+def test_success_reset_survives_two_ticks():
+    c = _ctl()
+    _latch(c)
+    assert c._ib_latched is True
+    surv = _running("probe")
+    c.executors_info = [surv]                          # tick 1: RUNNING (also snapshots prev_running)
+    c.determine_executor_actions()
+    c.executors_info = [surv]                          # tick 2: RUNNING on two consecutive ticks
+    c.determine_executor_actions()
+    assert c._ib_latched is False
+    assert len(c._ib_times) == 0
+    assert c._probe_fail_count == 0
+    c.executors_info = [_ib_done(c, "again")]          # a later IB now counts from 1
+    c.determine_executor_actions()
+    assert len(c._ib_times) == 1
+
+
+def test_zero_pnl_running_still_clears_latch():
+    # The survivor is RUNNING + is_active but is_trading==False (no fill). It MUST still clear the
+    # latch across two ticks — proving the signal is RUNNING-survival, not is_trading.
+    c = _ctl()
+    _latch(c)
+    surv = _running("probe"); surv.is_trading = False; surv.is_active = True; surv.net_pnl_quote = 0
+    c.executors_info = [surv]; c.determine_executor_actions()
+    c.executors_info = [surv]; c.determine_executor_actions()
+    assert c._ib_latched is False
+
+
+def test_single_tick_running_then_ib_does_not_reset():
+    # The doomed-probe race: RUNNING one tick, TERMINATED(IB) the next -> never RUNNING on two ticks.
+    c = _ctl()
+    _latch(c)
+    c.executors_info = [_running("doomed")]            # tick 1: briefly RUNNING (start() pre-validate)
+    c.determine_executor_actions()
+    c.executors_info = [_ib_done(c, "doomed")]         # tick 2: same id IB-terminated
+    c.determine_executor_actions()
+    assert c._ib_latched is True                       # not cleared
+
+
+def test_transient_false_latch_heals_within_base_pause():
+    # Full false-latch defense: latch, one probe at +base, the probe survives two ticks -> un-latched,
+    # and NO 300s halt ever occurred.
+    c = _ctl()
+    _latch(c)
+    c._clock["t"] += c.config.ib_breaker_probe_base_s + 1.0
+    c.executors_info = []
+    acted = c.determine_executor_actions()             # probe emitted
+    assert len(acted) == 1
+    surv = _running("probe")
+    c.executors_info = [surv]; c.determine_executor_actions()   # tick 1 RUNNING
+    c.executors_info = [surv]; c.determine_executor_actions()   # tick 2 RUNNING -> reset
+    assert c._ib_latched is False
+    assert c._probe_fail_count == 0
+
+
+def test_disable_releases_active_hold():
+    c = _ctl()
+    _latch(c)
+    assert c._ib_latched is True
+    c.config.ib_breaker_enabled = False                # operator disables mid-latch
+    c.executors_info = []
+    assert len(c.determine_executor_actions()) == 1    # hold released next tick, creation resumes
+    assert c._ib_latched is False
+    c.executors_info = [_ib_done(c, "still")]           # counting still updates while disabled
+    c.determine_executor_actions()
+    assert len(c._ib_times) >= 1

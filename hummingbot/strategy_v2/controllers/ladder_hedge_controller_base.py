@@ -152,6 +152,21 @@ class LadderHedgeControllerBase(ControllerBase):
         if not self._ib_breaker_enabled():
             self._ib_latched = False
 
+        # Success-reset (item 1): an id RUNNING on THIS tick AND the previous one passed its on_start
+        # pre-funding gate (a doomed IB executor is only briefly RUNNING before it IB-terminates;
+        # RunnableBase.start() sets RUNNING synchronously before validate). RUNNING-across-two-ticks is
+        # the robust controller-only "quote-capable" signal (NOT is_trading, which needs a fill).
+        survived = current_running_ids & self._prev_running_ids
+        if survived:
+            was_latched = self._ib_latched
+            self._ib_times.clear()
+            self._probe_fail_count = 0
+            self._ib_latched = False
+            if was_latched:
+                # Task 5 wires the SafetyNotifier "recovered" push here (before the epoch bump).
+                self._ib_latch_epoch += 1
+                self._ib_last_alert_ts = 0.0  # let the next episode log/alert immediately
+
         # Count newly-done IB terminations into the window (close-timestamp order). Non-IB deaths are
         # not churn: they are ignored here and simply age out of the window.
         new_done = [e for e in self.executors_info if e.is_done and e.id not in self._seen_done_ids]
