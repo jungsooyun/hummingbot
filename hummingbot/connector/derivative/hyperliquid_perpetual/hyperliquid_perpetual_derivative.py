@@ -17,6 +17,8 @@ from hummingbot.connector.derivative.hyperliquid_perpetual.hyperliquid_perpetual
 from hummingbot.connector.derivative.hyperliquid_perpetual.hyperliquid_perpetual_auth import HyperliquidPerpetualAuth
 from hummingbot.connector.derivative.hyperliquid_perpetual.hyperliquid_perpetual_batch import (
     HyperliquidBatchCancelRequest,
+    HyperliquidBatchModifyRequest,
+    HyperliquidBatchModifyResult,
     HyperliquidBatchOrderRequest,
 )
 from hummingbot.connector.derivative.hyperliquid_perpetual.hyperliquid_perpetual_user_stream_data_source import (
@@ -80,6 +82,8 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         self._abstraction_fallback_warned: bool = False
         self._hyperliquid_batch_orders_disabled: bool = False
         self._hyperliquid_batch_reconcile_order_ids = set()
+        self._hyperliquid_batch_modify_ambiguous_order_ids = set()
+        self._hyperliquid_batch_modify_rejected_order_ids = set()
         # Builder code (HGP-87). Fee starts at 0 and is resolved at startup (_initialize_builder_fee).
         self._builder_address: str = CONSTANTS.FOUNDATION_BUILDER_ADDRESS.lower()
         self._builder_fee_tenths_bps: int = 0
@@ -663,6 +667,166 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         order_ids = [cancel["client_order_id"] for cancel in validated_cancels]
         safe_ensure_future(self._execute_batch_cancel_by_cloid(validated_cancels))
         return order_ids
+
+    def _validate_batch_modify_requests(self, modifies: List[HyperliquidBatchModifyRequest]) -> List[Dict[str, Any]]:
+        if self._hyperliquid_batch_orders_disabled:
+            raise ValueError("Hyperliquid batch modify is disabled after an unsafe batch response.")
+        if not modifies:
+            raise ValueError("Batch modify request must contain at least one order.")
+        if len(modifies) > 8:
+            raise ValueError(f"Hyperliquid batch modify request too large: {len(modifies)} > 8.")
+
+        validated_modifies = []
+        for modify in modifies:
+            tracked_order = self._order_tracker.fetch_tracked_order(modify.client_order_id)
+            if tracked_order is None:
+                raise ValueError(f"Cannot batch modify untracked order {modify.client_order_id}.")
+            if tracked_order.is_done:
+                raise ValueError(f"Cannot batch modify done order {modify.client_order_id}.")
+            if tracked_order.order_type is not OrderType.LIMIT_MAKER:
+                raise ValueError("Hyperliquid batch modify only supports tracked LIMIT_MAKER orders.")
+            if modify.order_type is not OrderType.LIMIT_MAKER:
+                raise ValueError("Hyperliquid batch modify only supports LIMIT_MAKER requests.")
+            if tracked_order.executed_amount_base > Decimal("0"):
+                raise ValueError(f"Cannot batch modify partially filled order {modify.client_order_id}.")
+            if modify.amount != tracked_order.amount:
+                raise ValueError(f"Batch modify amount mismatch for {modify.client_order_id}.")
+            if modify.trade_type is not tracked_order.trade_type:
+                raise ValueError(f"Batch modify side mismatch for {modify.client_order_id}.")
+            if modify.position_action != tracked_order.position:
+                raise ValueError(f"Batch modify position action mismatch for {modify.client_order_id}.")
+            if modify.trading_pair != tracked_order.trading_pair:
+                raise ValueError(f"Batch modify trading pair mismatch for {modify.client_order_id}.")
+
+            coin = self._coin_from_trading_pair(modify.trading_pair)
+            if coin not in self.coin_to_asset:
+                raise ValueError(f"Coin {coin} not found in coin_to_asset mapping.")
+            validated_modifies.append({
+                "client_order_id": modify.client_order_id,
+                "trading_pair": modify.trading_pair,
+                "coin": coin,
+                "price": self.quantize_order_price(modify.trading_pair, modify.price),
+                "amount": tracked_order.amount,
+                "trade_type": tracked_order.trade_type,
+                "order_type": tracked_order.order_type,
+                "position_action": tracked_order.position,
+            })
+        return validated_modifies
+
+    async def batch_modify_orders(
+        self, modifies: List[HyperliquidBatchModifyRequest]
+    ) -> HyperliquidBatchModifyResult:
+        validated_modifies = self._validate_batch_modify_requests(modifies)
+        return await self._execute_batch_modify_orders(validated_modifies)
+
+    def is_hyperliquid_batch_modify_ambiguous(self, client_order_id: str) -> bool:
+        return client_order_id in self._hyperliquid_batch_modify_ambiguous_order_ids
+
+    def clear_hyperliquid_batch_modify_ambiguous(self, client_order_ids: List[str]) -> None:
+        self._hyperliquid_batch_modify_ambiguous_order_ids.difference_update(client_order_ids)
+
+    def is_hyperliquid_batch_modify_rejected(self, client_order_id: str) -> bool:
+        return client_order_id in self._hyperliquid_batch_modify_rejected_order_ids
+
+    def clear_hyperliquid_batch_modify_rejected(self, client_order_ids: List[str]) -> None:
+        self._hyperliquid_batch_modify_rejected_order_ids.difference_update(client_order_ids)
+
+    async def _execute_batch_modify_orders(
+        self, validated_modifies: List[Dict[str, Any]]
+    ) -> HyperliquidBatchModifyResult:
+        submitted_order_ids = [modify["client_order_id"] for modify in validated_modifies]
+        api_modifies = [
+            {
+                "oid": modify["client_order_id"],
+                "order": {
+                    "asset": self.coin_to_asset[modify["coin"]],
+                    "isBuy": modify["trade_type"] is TradeType.BUY,
+                    "limitPx": float(modify["price"]),
+                    "sz": float(modify["amount"]),
+                    "reduceOnly": modify["position_action"] == PositionAction.CLOSE,
+                    "orderType": {"limit": {"tif": "Alo"}},
+                    "cloid": modify["client_order_id"],
+                },
+            }
+            for modify in validated_modifies
+        ]
+        try:
+            modify_result = await self._api_post(
+                path_url=CONSTANTS.CREATE_ORDER_URL,
+                data={"type": "batchModify", "modifies": api_modifies},
+                is_auth_required=True,
+            )
+            response = modify_result["response"]
+            # Live HIP-3 batchModify returns the same request-ordered statuses under response.type
+            # "order". Keep the stricter shape/count gates below; only accept the observed wrapper.
+            if modify_result.get("status") != "ok" or response.get("type") not in {"batchModify", "order"}:
+                raise ValueError(f"Unexpected batchModify response type: {modify_result}")
+            statuses = response["data"]["statuses"]
+        except Exception:
+            self.logger().exception(
+                "Hyperliquid batch modify returned ambiguous response; reconciling submitted orders."
+            )
+            self._hyperliquid_batch_modify_ambiguous_order_ids.update(submitted_order_ids)
+            await self._bounded_reconcile_client_order_ids(submitted_order_ids)
+            return HyperliquidBatchModifyResult(submitted_order_ids, [], [], submitted_order_ids)
+
+        if len(statuses) != len(validated_modifies):
+            self.logger().error(
+                "Hyperliquid batch modify returned %s statuses for %s submitted modifies; "
+                "leaving orders tracked for normal reconciliation.",
+                len(statuses),
+                len(validated_modifies),
+            )
+            self._hyperliquid_batch_modify_ambiguous_order_ids.update(submitted_order_ids)
+            await self._bounded_reconcile_client_order_ids(submitted_order_ids)
+            return HyperliquidBatchModifyResult(submitted_order_ids, [], [], submitted_order_ids)
+
+        accepted_order_ids = []
+        rejected_order_ids = []
+        ambiguous_order_ids = []
+        for modify, status in zip(validated_modifies, statuses):
+            client_order_id = modify["client_order_id"]
+            resting = status.get("resting") if isinstance(status, dict) else None
+            if isinstance(resting, dict) and resting.get("oid") is not None:
+                returned_cloid = resting.get("cloid")
+                if returned_cloid is not None and returned_cloid != client_order_id:
+                    self._hyperliquid_batch_modify_ambiguous_order_ids.add(client_order_id)
+                    ambiguous_order_ids.append(client_order_id)
+                    await self._bounded_reconcile_client_order_ids([client_order_id])
+                    continue
+                order_data = resting
+                tracked_order = self._order_tracker.fetch_tracked_order(client_order_id)
+                if tracked_order is not None and not tracked_order.is_done:
+                    tracked_order.price = modify["price"]
+                    tracked_order.update_exchange_order_id(str(order_data["oid"]))
+                    tracked_order.last_update_timestamp = self.current_timestamp
+                self._hyperliquid_batch_modify_ambiguous_order_ids.discard(client_order_id)
+                self._hyperliquid_batch_modify_rejected_order_ids.discard(client_order_id)
+                accepted_order_ids.append(client_order_id)
+            elif isinstance(status, dict) and "filled" in status:
+                self._hyperliquid_batch_orders_disabled = True
+                self._hyperliquid_batch_modify_ambiguous_order_ids.add(client_order_id)
+                ambiguous_order_ids.append(client_order_id)
+                await self._bounded_reconcile_client_order_ids([client_order_id])
+            elif isinstance(status, dict) and "error" in status:
+                self._hyperliquid_batch_modify_rejected_order_ids.add(client_order_id)
+                rejected_order_ids.append(client_order_id)
+            else:
+                self._hyperliquid_batch_modify_ambiguous_order_ids.add(client_order_id)
+                ambiguous_order_ids.append(client_order_id)
+                await self._bounded_reconcile_client_order_ids([client_order_id])
+
+        self.logger().info(
+            "Hyperliquid batch modify accepted %s/%s LIMIT_MAKER orders",
+            len(accepted_order_ids),
+            len(validated_modifies),
+        )
+        return HyperliquidBatchModifyResult(
+            submitted_order_ids=submitted_order_ids,
+            accepted_order_ids=accepted_order_ids,
+            rejected_order_ids=rejected_order_ids,
+            ambiguous_order_ids=ambiguous_order_ids,
+        )
 
     async def _execute_batch_cancel_by_cloid(self, validated_cancels: List[Dict[str, Any]]) -> None:
         api_cancels = [

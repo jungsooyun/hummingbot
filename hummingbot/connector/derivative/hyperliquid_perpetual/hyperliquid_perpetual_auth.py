@@ -188,6 +188,32 @@ class HyperliquidPerpetualAuth(AuthBase):
             "vaultAddress": self._vault_address,
         }
 
+    def _sign_batch_modify_params(self, params, base_url, timestamp):
+        order_action = {
+            "type": "batchModify",
+            "modifies": [
+                {
+                    "oid": modify["oid"],
+                    "order": order_spec_to_order_wire(modify["order"]),
+                }
+                for modify in params["modifies"]
+            ],
+        }
+        signature = self.sign_l1_action(
+            self.wallet,
+            order_action,
+            self._vault_address,
+            timestamp,
+            CONSTANTS.PERPETUAL_BASE_URL in base_url,
+        )
+
+        return {
+            "action": order_action,
+            "nonce": timestamp,
+            "signature": signature,
+            "vaultAddress": self._vault_address,
+        }
+
     def add_auth_to_params_post(self, params: str, base_url):
         """
         Adds authentication to a request.
@@ -203,6 +229,8 @@ class HyperliquidPerpetualAuth(AuthBase):
             payload = self._sign_order_params(request_params, base_url, timestamp)
         elif request_type == "cancel":
             payload = self._sign_cancel_params(request_params, base_url, timestamp)
+        elif request_type == "batchModify":
+            payload = self._sign_batch_modify_params(request_params, base_url, timestamp)
         elif request_type == "updateLeverage":
             payload = self._sign_update_leverage_params(request_params, base_url, timestamp)
         payload = json.dumps(payload)
