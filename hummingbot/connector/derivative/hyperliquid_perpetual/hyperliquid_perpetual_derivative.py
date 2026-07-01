@@ -2,7 +2,7 @@ import asyncio
 import hashlib
 import time
 from decimal import Decimal
-from typing import Any, AsyncIterable, Dict, List, Literal, Optional, Tuple
+from typing import Any, AsyncIterable, Dict, List, Literal, Mapping, Optional, Tuple
 
 from bidict import bidict
 
@@ -72,6 +72,7 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         self._exchange_info_dex_to_symbol = bidict({})
         self._dex_markets: List[Dict] = []  # Store HIP-3 DEX market info separately
         self._is_hip3_market: Dict[str, bool] = {}  # Track which coins are HIP-3
+        self._trading_pair_to_exchange_symbol: Dict[str, str] = {}
         self._user_abstraction_mode: Optional[str] = None
         self._user_abstraction_mode_ts: Optional[float] = None
         # JEP-209: latch so the unified-account-safe balance fallback warns once per degraded
@@ -106,6 +107,13 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
     @property
     def domain(self) -> str:
         return self._domain
+
+    def _set_trading_pair_symbol_map(self, trading_pair_and_symbol_map: Optional[Mapping[str, str]]):
+        mapping = trading_pair_and_symbol_map or {}
+        self._trading_pair_to_exchange_symbol = {
+            trading_pair: exchange_symbol for exchange_symbol, trading_pair in mapping.items()
+        }
+        super()._set_trading_pair_symbol_map(trading_pair_and_symbol_map)
 
     @property
     def client_order_id_max_length(self) -> int:
@@ -564,8 +572,10 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         md5.update(order_id.encode('utf-8'))
         return f"0x{md5.hexdigest()}"
 
-    @staticmethod
-    def _coin_from_trading_pair(trading_pair: str) -> str:
+    def _coin_from_trading_pair(self, trading_pair: str) -> str:
+        exchange_symbol = self._trading_pair_to_exchange_symbol.get(trading_pair)
+        if exchange_symbol is not None:
+            return exchange_symbol
         return trading_pair.rsplit("-", 1)[0]
 
     def _validate_batch_order_requests(self, orders: List[HyperliquidBatchOrderRequest]) -> List[Dict[str, Any]]:

@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 import pandas as pd
 from aioresponses import aioresponses
 from aioresponses.core import RequestCall
+from bidict import bidict
 
 import hummingbot.connector.derivative.hyperliquid_perpetual.hyperliquid_perpetual_constants as CONSTANTS
 import hummingbot.connector.derivative.hyperliquid_perpetual.hyperliquid_perpetual_web_utils as web_utils
@@ -1966,6 +1967,45 @@ class HyperliquidPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpe
         self.assertEqual([order_ids[0], order_ids[1]], list(self.exchange.in_flight_orders.keys()))
         self.assertEqual("111", self.exchange.in_flight_orders[order_ids[0]].exchange_order_id)
         self.assertEqual("222", self.exchange.in_flight_orders[order_ids[1]].exchange_order_id)
+
+    def test_batch_place_orders_uses_exchange_symbol_map_for_hip3_assets(self):
+        self._simulate_trading_rules_initialized()
+        self.exchange._set_trading_pair_symbol_map(bidict({"@107": "XYZ:SKHX-USD"}))
+        self.exchange.coin_to_asset = {"@107": 107}
+        self.exchange._trading_rules = {
+            "XYZ:SKHX-USD": TradingRule(
+                trading_pair="XYZ:SKHX-USD",
+                min_order_size=Decimal("1"),
+                min_price_increment=Decimal("0.1"),
+                min_base_amount_increment=Decimal("1"),
+            )
+        }
+        self.exchange._set_current_timestamp(1640780000)
+        self.exchange._perpetual_trading.set_leverage("XYZ:SKHX-USD", 1)
+        api_post_mock = AsyncMock(return_value={
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {"statuses": [{"resting": {"oid": 111}}]},
+            },
+        })
+        self.exchange._api_post = api_post_mock
+
+        order_ids = self.exchange.batch_place_orders([
+            HyperliquidBatchOrderRequest(
+                trading_pair="XYZ:SKHX-USD",
+                amount=Decimal("1"),
+                trade_type=TradeType.BUY,
+                order_type=OrderType.LIMIT_MAKER,
+                price=Decimal("1632.9"),
+                position_action=PositionAction.CLOSE,
+            )
+        ])
+        self.async_run_with_timeout(asyncio.sleep(0))
+
+        submitted = api_post_mock.await_args.kwargs["data"]
+        self.assertEqual(107, submitted["orders"][0]["asset"])
+        self.assertEqual(order_ids[0], submitted["orders"][0]["cloid"])
 
     def test_batch_place_orders_response_count_mismatch_reconciles_tracked_orders(self):
         self._simulate_trading_rules_initialized()
