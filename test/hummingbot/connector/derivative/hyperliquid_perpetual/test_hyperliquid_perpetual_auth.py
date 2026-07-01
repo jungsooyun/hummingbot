@@ -64,3 +64,65 @@ class HyperliquidPerpetualAuthTests(TestCase):
         self.assertEqual(4, len(params))
         self.assertEqual(None, params.get("vaultAddress"))
         self.assertEqual("order", params.get("action")["type"])
+
+    @patch(
+        "hummingbot.connector.derivative.hyperliquid_perpetual.hyperliquid_perpetual_auth.HyperliquidPerpetualAuth._get_timestamp")
+    def test_sign_order_params_accepts_order_list_in_request_order(self, ts_mock: MagicMock):
+        orders = [
+            {
+                "asset": 4,
+                "isBuy": True,
+                "limitPx": 1201,
+                "sz": 0.01,
+                "reduceOnly": False,
+                "orderType": {"limit": {"tif": "Alo"}},
+                "cloid": "0x00000000000000000000000000000001",
+            },
+            {
+                "asset": 4,
+                "isBuy": False,
+                "limitPx": 1202,
+                "sz": 0.02,
+                "reduceOnly": False,
+                "orderType": {"limit": {"tif": "Alo"}},
+                "cloid": "0x00000000000000000000000000000002",
+            },
+        ]
+        request = RESTRequest(
+            method=RESTMethod.POST,
+            url="https://test.url/exchange",
+            data=json.dumps({"type": "order", "grouping": "na", "orders": orders}),
+            is_auth_required=True,
+        )
+        ts_mock.return_value = self._get_timestamp()
+
+        self.async_run_with_timeout(self.auth.rest_authenticate(request))
+
+        params = json.loads(request.data)
+        action_orders = params["action"]["orders"]
+        self.assertEqual(2, len(action_orders))
+        self.assertEqual("0x00000000000000000000000000000001", action_orders[0]["c"])
+        self.assertEqual("0x00000000000000000000000000000002", action_orders[1]["c"])
+
+    @patch(
+        "hummingbot.connector.derivative.hyperliquid_perpetual.hyperliquid_perpetual_auth.HyperliquidPerpetualAuth._get_timestamp")
+    def test_sign_cancel_params_accepts_cancel_list_in_request_order(self, ts_mock: MagicMock):
+        cancels = [
+            {"asset": 4, "cloid": "0x00000000000000000000000000000001"},
+            {"asset": 4, "cloid": "0x00000000000000000000000000000002"},
+        ]
+        request = RESTRequest(
+            method=RESTMethod.POST,
+            url="https://test.url/exchange",
+            data=json.dumps({"type": "cancel", "cancels": cancels}),
+            is_auth_required=True,
+        )
+        ts_mock.return_value = self._get_timestamp()
+
+        self.async_run_with_timeout(self.auth.rest_authenticate(request))
+
+        params = json.loads(request.data)
+        action_cancels = params["action"]["cancels"]
+        self.assertEqual(2, len(action_cancels))
+        self.assertEqual("0x00000000000000000000000000000001", action_cancels[0]["cloid"])
+        self.assertEqual("0x00000000000000000000000000000002", action_cancels[1]["cloid"])

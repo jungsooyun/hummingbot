@@ -143,6 +143,21 @@ class TestHip3KisLadderController(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("50"), executor_config.pnl_loss_limit_quote)
         self.assertEqual("flatten", executor_config.pnl_breach_action)
 
+    def test_hyperliquid_batch_orders_default_off(self):
+        self.controller.executors_info = []
+
+        executor_config = self.controller.determine_executor_actions()[0].executor_config
+
+        self.assertIs(executor_config.enable_hyperliquid_batch_orders, False)
+
+    def test_hyperliquid_batch_orders_passthrough(self):
+        self.config.enable_hyperliquid_batch_orders = True
+        self.controller.executors_info = []
+
+        executor_config = self.controller.determine_executor_actions()[0].executor_config
+
+        self.assertIs(executor_config.enable_hyperliquid_batch_orders, True)
+
     def test_adopt_existing_inventory_defaults_false(self):
         self.controller.executors_info = []
 

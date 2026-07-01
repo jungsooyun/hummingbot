@@ -716,10 +716,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                 radius=radius,
                 granular=bool(granular),
             )
-            for oid in diff.to_cancel:
-                if oid in inflight_ids:
-                    continue
-                self._strategy.cancel(self.maker_connector, self.maker_trading_pair, oid)
+            self._cancel_maker_order_ids([oid for oid in diff.to_cancel if oid not in inflight_ids])
             self._place_targets_subset(to_place)
             if rec is not None:
                 rec.mark("submit")
@@ -828,8 +825,11 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         self._last_reprice_ts = self._strategy.current_timestamp
 
     def _cancel_all_maker(self) -> None:
-        for order in self._open_maker_orders():
-            self._strategy.cancel(self.maker_connector, self.maker_trading_pair, order.order_id)
+        self._cancel_maker_order_ids([order.order_id for order in self._open_maker_orders()])
+
+    def _cancel_maker_order_ids(self, order_ids: List[str]) -> None:
+        for order_id in order_ids:
+            self._strategy.cancel(self.maker_connector, self.maker_trading_pair, order_id)
 
     # ============================================ JEP-221 #2 order-rate circuit breaker
 

@@ -25,6 +25,10 @@ from typing import Dict, List, Optional
 
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
+from hummingbot.connector.derivative.hyperliquid_perpetual.hyperliquid_perpetual_batch import (
+    HyperliquidBatchCancelRequest,
+    HyperliquidBatchOrderRequest,
+)
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.cross_venue_hedged_executor_base import (
@@ -33,6 +37,7 @@ from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.cross_venue_he
 from hummingbot.strategy_v2.executors.ladder_maker_executor.data_types import LadderMakerExecutorConfig
 from hummingbot.strategy_v2.executors.cross_venue_hedged_executor.fx_bridged_fair_source import FxBridgedFairSource
 from hummingbot.strategy_v2.executors.ladder_maker_executor.ladder_policy import (
+    RungTarget,
     RungSpec,
     Side,
     TwoSidedTargets,
@@ -539,9 +544,90 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             if now - self._last_observe_log_ts >= self._OBSERVE_LOG_INTERVAL_S:
                 self._last_observe_log_ts = now
                 self.logger().info(self._format_observe_line(self._last_observe))
-        for target in targets:
-            self._place_target_one(target)
+        self._place_targets_subset(targets)
         self._last_reprice_ts = self._strategy.current_timestamp
+
+    def _hyperliquid_batch_orders_enabled(self) -> bool:
+        if not getattr(self.config, "enable_hyperliquid_batch_orders", False):
+            return False
+        if not getattr(self.config, "maker_post_only", True):
+            return False
+        connector = self.connectors.get(self.maker_connector)
+        return (
+            self.maker_connector == "hyperliquid_perpetual"
+            and connector is not None
+            and hasattr(connector, "batch_place_orders")
+            and hasattr(connector, "batch_cancel_by_cloid")
+        )
+
+    def _target_side_and_position_action(self, target) -> tuple:
+        if self._is_two_sided():
+            side = TradeType.SELL if target.side == Side.SELL else TradeType.BUY
+            position_action = PositionAction.OPEN if side == self.entry_side else PositionAction.CLOSE
+            return side, position_action
+        return self.entry_side, PositionAction.OPEN
+
+    def _place_targets_subset(self, targets: List[RungTarget]) -> None:
+        if not targets:
+            return
+        if not self._hyperliquid_batch_orders_enabled():
+            return super()._place_targets_subset(targets)
+
+        connector = self.connectors[self.maker_connector]
+        for i in range(0, len(targets), 8):
+            chunk = targets[i:i + 8]
+            requests = []
+            request_contexts = []
+            for target in chunk:
+                side, position_action = self._target_side_and_position_action(target)
+                request_contexts.append((target, side, position_action))
+                requests.append(HyperliquidBatchOrderRequest(
+                    trading_pair=self.maker_trading_pair,
+                    amount=target.size,
+                    trade_type=side,
+                    order_type=OrderType.LIMIT_MAKER,
+                    price=target.price,
+                    position_action=position_action,
+                    metadata={"order_role": "maker", "edge_bps": str(target.edge_bps)},
+                ))
+            try:
+                order_ids = connector.batch_place_orders(requests)
+            except Exception:
+                self.logger().exception("Hyperliquid batch place validation failed; falling back to single-order path.")
+                return super()._place_targets_subset(targets[i:])
+            if len(order_ids) != len(chunk):
+                self.logger().error(
+                    "Hyperliquid batch place returned %s order ids for %s targets; "
+                    "skipping fallback and %s remaining targets to avoid duplicates.",
+                    len(order_ids),
+                    len(chunk),
+                    len(targets) - i - len(chunk),
+                )
+                return
+            for order_id, (target, _side, position_action) in zip(order_ids, request_contexts):
+                self.maker_orders[order_id] = TrackedOrder(order_id=order_id)
+                self._record_placed_rung(order_id, target)
+                if position_action == PositionAction.OPEN:
+                    if not hasattr(self, "_maker_placed_edge_bps"):
+                        self._maker_placed_edge_bps = {}
+                    self._maker_placed_edge_bps[order_id] = Decimal(target.edge_bps)
+                self._note_maker_placement()
+        self._last_reprice_ts = self._strategy.current_timestamp
+
+    def _cancel_maker_order_ids(self, order_ids: List[str]) -> None:
+        if not order_ids:
+            return
+        if not self._hyperliquid_batch_orders_enabled():
+            return super()._cancel_maker_order_ids(order_ids)
+        connector = self.connectors[self.maker_connector]
+        try:
+            connector.batch_cancel_by_cloid([
+                HyperliquidBatchCancelRequest(client_order_id=order_id, trading_pair=self.maker_trading_pair)
+                for order_id in order_ids
+            ])
+        except Exception:
+            self.logger().exception("Hyperliquid batch cancel validation failed; falling back to single-order path.")
+            return super()._cancel_maker_order_ids(order_ids)
 
     def _flatten_unwind_step(self) -> bool:
         self._process_hedges()

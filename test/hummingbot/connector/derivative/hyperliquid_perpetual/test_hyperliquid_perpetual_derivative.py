@@ -17,6 +17,10 @@ import hummingbot.connector.derivative.hyperliquid_perpetual.hyperliquid_perpetu
 from hummingbot.connector.derivative.hyperliquid_perpetual.hyperliquid_perpetual_derivative import (
     HyperliquidPerpetualDerivative,
 )
+from hummingbot.connector.derivative.hyperliquid_perpetual.hyperliquid_perpetual_batch import (
+    HyperliquidBatchCancelRequest,
+    HyperliquidBatchOrderRequest,
+)
 from hummingbot.connector.test_support.perpetual_derivative_test import AbstractPerpetualDerivativeTests
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
@@ -1908,6 +1912,329 @@ class HyperliquidPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpe
                 min_base_amount_increment=Decimal(str(0.000001)),
             )
         }
+
+    def test_batch_place_orders_assumes_statuses_are_request_ordered_with_fixture(self):
+        # Hyperliquid's official error-response docs define batched child results as a vector with
+        # the same length as the batched request; endpoint examples expose that vector as
+        # response.data.statuses. This fixture locks our positional mapping and the connector
+        # separately reconciles on count or shape drift.
+        # https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses
+        self._simulate_trading_rules_initialized()
+        self.exchange._set_current_timestamp(1640780000)
+        self.exchange._perpetual_trading.set_leverage(self.trading_pair, 1)
+        api_post_mock = AsyncMock(return_value={
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [
+                        {"resting": {"oid": 111}},
+                        {"resting": {"oid": 222}},
+                    ]
+                },
+            },
+        })
+        self.exchange._api_post = api_post_mock
+
+        order_ids = self.exchange.batch_place_orders([
+            HyperliquidBatchOrderRequest(
+                trading_pair=self.trading_pair,
+                amount=Decimal("1"),
+                trade_type=TradeType.BUY,
+                order_type=OrderType.LIMIT_MAKER,
+                price=Decimal("100"),
+                position_action=PositionAction.OPEN,
+            ),
+            HyperliquidBatchOrderRequest(
+                trading_pair=self.trading_pair,
+                amount=Decimal("2"),
+                trade_type=TradeType.SELL,
+                order_type=OrderType.LIMIT_MAKER,
+                price=Decimal("101"),
+                position_action=PositionAction.OPEN,
+            ),
+        ])
+        self.async_run_with_timeout(asyncio.sleep(0))
+
+        self.assertEqual(2, len(order_ids))
+        api_post_mock.assert_awaited_once()
+        submitted = api_post_mock.await_args.kwargs["data"]
+        self.assertEqual("order", submitted["type"])
+        self.assertEqual("na", submitted["grouping"])
+        self.assertEqual(order_ids[0], submitted["orders"][0]["cloid"])
+        self.assertEqual(order_ids[1], submitted["orders"][1]["cloid"])
+        self.assertEqual([order_ids[0], order_ids[1]], list(self.exchange.in_flight_orders.keys()))
+        self.assertEqual("111", self.exchange.in_flight_orders[order_ids[0]].exchange_order_id)
+        self.assertEqual("222", self.exchange.in_flight_orders[order_ids[1]].exchange_order_id)
+
+    def test_batch_place_orders_response_count_mismatch_reconciles_tracked_orders(self):
+        self._simulate_trading_rules_initialized()
+        self.exchange._set_current_timestamp(1640780000)
+        self.exchange._perpetual_trading.set_leverage(self.trading_pair, 1)
+        self.exchange._api_post = AsyncMock(return_value={
+            "status": "ok",
+            "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 111}}]}},
+        })
+        self.exchange._bounded_reconcile_client_order_ids = AsyncMock()
+
+        order_ids = self.exchange.batch_place_orders([
+            HyperliquidBatchOrderRequest(
+                trading_pair=self.trading_pair,
+                amount=Decimal("1"),
+                trade_type=TradeType.BUY,
+                order_type=OrderType.LIMIT_MAKER,
+                price=Decimal("100"),
+                position_action=PositionAction.OPEN,
+            ),
+            HyperliquidBatchOrderRequest(
+                trading_pair=self.trading_pair,
+                amount=Decimal("2"),
+                trade_type=TradeType.SELL,
+                order_type=OrderType.LIMIT_MAKER,
+                price=Decimal("101"),
+                position_action=PositionAction.OPEN,
+            ),
+        ])
+        self.async_run_with_timeout(asyncio.sleep(0))
+
+        self.assertEqual(order_ids, list(self.exchange.in_flight_orders.keys()))
+        self.exchange._bounded_reconcile_client_order_ids.assert_awaited_once_with(order_ids)
+
+    def test_batch_place_orders_transport_exception_reconciles_tracked_orders(self):
+        self._simulate_trading_rules_initialized()
+        self.exchange._set_current_timestamp(1640780000)
+        self.exchange._perpetual_trading.set_leverage(self.trading_pair, 1)
+        self.exchange._api_post = AsyncMock(side_effect=OSError("timeout after submit"))
+        self.exchange._bounded_reconcile_client_order_ids = AsyncMock()
+
+        order_ids = self.exchange.batch_place_orders([
+            HyperliquidBatchOrderRequest(
+                trading_pair=self.trading_pair,
+                amount=Decimal("1"),
+                trade_type=TradeType.BUY,
+                order_type=OrderType.LIMIT_MAKER,
+                price=Decimal("100"),
+                position_action=PositionAction.OPEN,
+            )
+        ])
+        self.async_run_with_timeout(asyncio.sleep(0))
+
+        self.assertEqual(order_ids, list(self.exchange.in_flight_orders.keys()))
+        self.exchange._bounded_reconcile_client_order_ids.assert_awaited_once_with(order_ids)
+
+    def test_batch_place_orders_malformed_response_reconciles_tracked_orders(self):
+        self._simulate_trading_rules_initialized()
+        self.exchange._set_current_timestamp(1640780000)
+        self.exchange._perpetual_trading.set_leverage(self.trading_pair, 1)
+        self.exchange._api_post = AsyncMock(return_value={"status": "ok"})
+        self.exchange._bounded_reconcile_client_order_ids = AsyncMock()
+
+        order_ids = self.exchange.batch_place_orders([
+            HyperliquidBatchOrderRequest(
+                trading_pair=self.trading_pair,
+                amount=Decimal("1"),
+                trade_type=TradeType.BUY,
+                order_type=OrderType.LIMIT_MAKER,
+                price=Decimal("100"),
+                position_action=PositionAction.OPEN,
+            )
+        ])
+        self.async_run_with_timeout(asyncio.sleep(0))
+
+        self.assertEqual(order_ids, list(self.exchange.in_flight_orders.keys()))
+        self.exchange._bounded_reconcile_client_order_ids.assert_awaited_once_with(order_ids)
+
+    def test_batch_place_orders_filled_status_disables_batch_and_reconciles(self):
+        self._simulate_trading_rules_initialized()
+        self.exchange._set_current_timestamp(1640780000)
+        self.exchange._perpetual_trading.set_leverage(self.trading_pair, 1)
+        self.exchange._api_post = AsyncMock(return_value={
+            "status": "ok",
+            "response": {"type": "order", "data": {"statuses": [{"filled": {"oid": 111}}]}},
+        })
+        self.exchange._bounded_reconcile_client_order_ids = AsyncMock()
+
+        order_ids = self.exchange.batch_place_orders([
+            HyperliquidBatchOrderRequest(
+                trading_pair=self.trading_pair,
+                amount=Decimal("1"),
+                trade_type=TradeType.BUY,
+                order_type=OrderType.LIMIT_MAKER,
+                price=Decimal("100"),
+                position_action=PositionAction.OPEN,
+            )
+        ])
+        self.async_run_with_timeout(asyncio.sleep(0))
+
+        self.assertTrue(self.exchange._hyperliquid_batch_orders_disabled)
+        self.exchange._bounded_reconcile_client_order_ids.assert_awaited_once_with(order_ids)
+        with self.assertRaises(ValueError):
+            self.exchange.batch_place_orders([
+                HyperliquidBatchOrderRequest(
+                    trading_pair=self.trading_pair,
+                    amount=Decimal("1"),
+                    trade_type=TradeType.BUY,
+                    order_type=OrderType.LIMIT_MAKER,
+                    price=Decimal("100"),
+                    position_action=PositionAction.OPEN,
+                )
+            ])
+
+    def test_batch_place_orders_rejects_non_limit_maker_without_tracking(self):
+        self._simulate_trading_rules_initialized()
+        self.exchange._api_post = AsyncMock()
+
+        with self.assertRaises(ValueError):
+            self.exchange.batch_place_orders([
+                HyperliquidBatchOrderRequest(
+                    trading_pair=self.trading_pair,
+                    amount=Decimal("1"),
+                    trade_type=TradeType.BUY,
+                    order_type=OrderType.LIMIT,
+                    price=Decimal("100"),
+                    position_action=PositionAction.OPEN,
+                )
+            ])
+
+        self.exchange._api_post.assert_not_awaited()
+        self.assertEqual({}, self.exchange.in_flight_orders)
+
+    def test_batch_cancel_by_cloid_submits_one_cancel_action_and_marks_success_canceled(self):
+        self._simulate_trading_rules_initialized()
+        self.exchange._set_current_timestamp(1640780000)
+        order_ids = ["0x00000000000000000000000000000001", "0x00000000000000000000000000000002"]
+        for order_id in order_ids:
+            self.exchange.start_tracking_order(
+                order_id=order_id,
+                exchange_order_id=None,
+                trading_pair=self.trading_pair,
+                trade_type=TradeType.BUY,
+                price=Decimal("100"),
+                amount=Decimal("1"),
+                order_type=OrderType.LIMIT_MAKER,
+                position_action=PositionAction.OPEN,
+            )
+        api_post_mock = AsyncMock(return_value={
+            "status": "ok",
+            "response": {"type": "cancel", "data": {"statuses": ["success", "success"]}},
+        })
+        self.exchange._api_post = api_post_mock
+
+        returned_ids = self.exchange.batch_cancel_by_cloid([
+            HyperliquidBatchCancelRequest(client_order_id=order_ids[0], trading_pair=self.trading_pair),
+            HyperliquidBatchCancelRequest(client_order_id=order_ids[1], trading_pair=self.trading_pair),
+        ])
+        self.async_run_with_timeout(asyncio.sleep(0))
+
+        self.assertEqual(order_ids, returned_ids)
+        api_post_mock.assert_awaited_once()
+        submitted = api_post_mock.await_args.kwargs["data"]
+        self.assertEqual("cancel", submitted["type"])
+        self.assertEqual(order_ids[0], submitted["cancels"][0]["cloid"])
+        self.assertEqual(order_ids[1], submitted["cancels"][1]["cloid"])
+        self.assertEqual({}, self.exchange.in_flight_orders)
+
+    def test_batch_cancel_by_cloid_keeps_uncertain_error_children_tracked(self):
+        self._simulate_trading_rules_initialized()
+        order_id = "0x00000000000000000000000000000001"
+        self.exchange.start_tracking_order(
+            order_id=order_id,
+            exchange_order_id=None,
+            trading_pair=self.trading_pair,
+            trade_type=TradeType.BUY,
+            price=Decimal("100"),
+            amount=Decimal("1"),
+            order_type=OrderType.LIMIT_MAKER,
+            position_action=PositionAction.OPEN,
+        )
+        self.exchange._api_post = AsyncMock(return_value={
+            "status": "ok",
+            "response": {"type": "cancel", "data": {"statuses": [{"error": "temporarily unavailable"}]}},
+        })
+        self.exchange._bounded_reconcile_client_order_ids = AsyncMock()
+
+        self.exchange.batch_cancel_by_cloid([
+            HyperliquidBatchCancelRequest(client_order_id=order_id, trading_pair=self.trading_pair),
+        ])
+        self.async_run_with_timeout(asyncio.sleep(0))
+
+        self.assertIn(order_id, self.exchange.in_flight_orders)
+        self.exchange._bounded_reconcile_client_order_ids.assert_awaited_once_with([order_id])
+
+    def test_batch_cancel_by_cloid_false_success_dict_stays_tracked_for_reconcile(self):
+        self._simulate_trading_rules_initialized()
+        order_id = "0x00000000000000000000000000000001"
+        self.exchange.start_tracking_order(
+            order_id=order_id,
+            exchange_order_id=None,
+            trading_pair=self.trading_pair,
+            trade_type=TradeType.BUY,
+            price=Decimal("100"),
+            amount=Decimal("1"),
+            order_type=OrderType.LIMIT_MAKER,
+            position_action=PositionAction.OPEN,
+        )
+        self.exchange._api_post = AsyncMock(return_value={
+            "status": "ok",
+            "response": {"type": "cancel", "data": {"statuses": [{"success": False}]}},
+        })
+        self.exchange._bounded_reconcile_client_order_ids = AsyncMock()
+
+        self.exchange.batch_cancel_by_cloid([
+            HyperliquidBatchCancelRequest(client_order_id=order_id, trading_pair=self.trading_pair),
+        ])
+        self.async_run_with_timeout(asyncio.sleep(0))
+
+        self.assertIn(order_id, self.exchange.in_flight_orders)
+        self.exchange._bounded_reconcile_client_order_ids.assert_awaited_once_with([order_id])
+
+    def test_batch_cancel_by_cloid_transport_exception_reconciles_tracked_order(self):
+        self._simulate_trading_rules_initialized()
+        order_id = "0x00000000000000000000000000000001"
+        self.exchange.start_tracking_order(
+            order_id=order_id,
+            exchange_order_id=None,
+            trading_pair=self.trading_pair,
+            trade_type=TradeType.BUY,
+            price=Decimal("100"),
+            amount=Decimal("1"),
+            order_type=OrderType.LIMIT_MAKER,
+            position_action=PositionAction.OPEN,
+        )
+        self.exchange._api_post = AsyncMock(side_effect=OSError("cancel timeout"))
+        self.exchange._bounded_reconcile_client_order_ids = AsyncMock()
+
+        self.exchange.batch_cancel_by_cloid([
+            HyperliquidBatchCancelRequest(client_order_id=order_id, trading_pair=self.trading_pair),
+        ])
+        self.async_run_with_timeout(asyncio.sleep(0))
+
+        self.assertIn(order_id, self.exchange.in_flight_orders)
+        self.exchange._bounded_reconcile_client_order_ids.assert_awaited_once_with([order_id])
+
+    def test_batch_cancel_by_cloid_malformed_response_reconciles_tracked_order(self):
+        self._simulate_trading_rules_initialized()
+        order_id = "0x00000000000000000000000000000001"
+        self.exchange.start_tracking_order(
+            order_id=order_id,
+            exchange_order_id=None,
+            trading_pair=self.trading_pair,
+            trade_type=TradeType.BUY,
+            price=Decimal("100"),
+            amount=Decimal("1"),
+            order_type=OrderType.LIMIT_MAKER,
+            position_action=PositionAction.OPEN,
+        )
+        self.exchange._api_post = AsyncMock(return_value={"status": "ok"})
+        self.exchange._bounded_reconcile_client_order_ids = AsyncMock()
+
+        self.exchange.batch_cancel_by_cloid([
+            HyperliquidBatchCancelRequest(client_order_id=order_id, trading_pair=self.trading_pair),
+        ])
+        self.async_run_with_timeout(asyncio.sleep(0))
+
+        self.assertIn(order_id, self.exchange.in_flight_orders)
+        self.exchange._bounded_reconcile_client_order_ids.assert_awaited_once_with([order_id])
 
     @aioresponses()
     def test_create_buy_limit_order_successfully(self, mock_api):

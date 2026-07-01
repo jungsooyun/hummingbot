@@ -136,9 +136,12 @@ class HyperliquidPerpetualAuth(AuthBase):
         return payload
 
     def _sign_cancel_params(self, params, base_url, timestamp):
+        cancels = params["cancels"]
+        if not isinstance(cancels, list):
+            cancels = [cancels]
         order_action = {
             "type": "cancelByCloid",
-            "cancels": [params["cancels"]],
+            "cancels": cancels,
         }
         signature = self.sign_l1_action(
             self.wallet,
@@ -156,11 +159,13 @@ class HyperliquidPerpetualAuth(AuthBase):
         }
 
     def _sign_order_params(self, params, base_url, timestamp):
-        order = params["orders"]
+        orders = params["orders"]
+        if not isinstance(orders, list):
+            orders = [orders]
         grouping = params["grouping"]
         order_action = {
             "type": "order",
-            "orders": [order_spec_to_order_wire(order)],
+            "orders": [order_spec_to_order_wire(order) for order in orders],
             "grouping": grouping,
         }
         # The builder field is part of the signed payload. It must be added to the action dict

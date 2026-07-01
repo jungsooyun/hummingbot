@@ -61,6 +61,9 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
     # rung fills as a taker at a price >= its edge instead of being rejected; resting orders are
     # still maker fills. Only profitable immediate fills happen (the limit price is the floor).
     maker_post_only: bool = True
+    # JEP-290: opt-in Hyperliquid batch place/cancel for maker ladder orders. Default OFF until
+    # smoke evidence proves response ordering and orphan-free cancel behavior in live.
+    enable_hyperliquid_batch_orders: bool = False
 
     # Reprice guards
     min_reprice_interval_s: float = 0.75
