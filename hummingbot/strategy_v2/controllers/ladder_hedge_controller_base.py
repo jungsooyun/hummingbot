@@ -1,4 +1,5 @@
 import time
+from collections import deque
 from decimal import Decimal
 from typing import List, Optional
 
@@ -6,6 +7,7 @@ from pydantic import Field
 
 from hummingbot.core.data_type.common import MarketDict
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
+from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
 
@@ -52,6 +54,16 @@ class LadderHedgeControllerConfigBase(ControllerConfigBase):
     adopt_existing_inventory: bool = Field(default=False, json_schema_extra={"is_updatable": True})
     latency_profiling: bool = Field(default=False, json_schema_extra={"is_updatable": True})
     max_executors: int = Field(default=1, json_schema_extra={"is_updatable": True})
+    # JEP-272 IB circuit breaker (defense-in-depth vs the JEP-270 silent maker churn). Ships OFF
+    # (ib_breaker_enabled=False): _update_ib_breaker still COUNTS for observability but never pauses
+    # creation. Staged-enable = flip ib_breaker_enabled True live (is_updatable), observe for
+    # false-latches, tune window/backoff. All is_updatable so no cold boot. Read via the coercing
+    # accessors on the controller (a bad hot-edit must not crash the control loop — JEP-283 lesson).
+    ib_breaker_enabled: bool = Field(default=False, json_schema_extra={"is_updatable": True})
+    ib_breaker_threshold: int = Field(default=10, json_schema_extra={"is_updatable": True})
+    ib_breaker_window_s: float = Field(default=60.0, json_schema_extra={"is_updatable": True})
+    ib_breaker_probe_base_s: float = Field(default=15.0, json_schema_extra={"is_updatable": True})
+    ib_breaker_probe_max_s: float = Field(default=300.0, json_schema_extra={"is_updatable": True})
 
     def update_markets(self, markets: MarketDict) -> MarketDict:
         markets.add_or_update(self.maker_connector, self.maker_trading_pair)
@@ -86,6 +98,40 @@ class LadderHedgeControllerBase(ControllerBase):
 
     async def update_processed_data(self):
         pass
+
+    # ---- is_updatable config accessors with defensive coercion (a malformed hot-edit falls back to
+    # ---- the field default rather than raising inside the control loop — JEP-283 robust-coercion). ----
+    def _ib_breaker_enabled(self) -> bool:
+        return bool(getattr(self.config, "ib_breaker_enabled", False))
+
+    def _ib_threshold(self) -> int:
+        try:
+            v = int(getattr(self.config, "ib_breaker_threshold", 10))
+        except (TypeError, ValueError):
+            return 10
+        return v if v >= 1 else 10
+
+    def _ib_window_s(self) -> float:
+        try:
+            v = float(getattr(self.config, "ib_breaker_window_s", 60.0))
+        except (TypeError, ValueError):
+            return 60.0
+        return v if v > 0 else 60.0
+
+    def _ib_probe_base(self) -> float:
+        try:
+            v = float(getattr(self.config, "ib_breaker_probe_base_s", 15.0))
+        except (TypeError, ValueError):
+            return 15.0
+        return v if v > 0 else 15.0
+
+    def _ib_probe_max(self) -> float:
+        base = self._ib_probe_base()
+        try:
+            v = float(getattr(self.config, "ib_breaker_probe_max_s", 300.0))
+        except (TypeError, ValueError):
+            return max(base, 300.0)
+        return v if v >= base else max(base, 300.0)
 
     def _update_ib_breaker(self) -> None:
         # lazy-init (avoid touching ControllerBase.__init__ signature; codebase getattr pattern).

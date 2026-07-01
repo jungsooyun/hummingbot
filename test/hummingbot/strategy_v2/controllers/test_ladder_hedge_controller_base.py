@@ -114,3 +114,33 @@ def test_breaker_ships_off_by_default_observes_without_pausing():
         c.executors_info = [_done(f"e{i}", CloseType.INSUFFICIENT_BALANCE, float(i))]
         assert len(c.determine_executor_actions()) == 1  # never pauses while disabled
     assert c._consecutive_ib >= c._IB_BREAKER_THRESHOLD  # but still counts (observability preserved)
+
+
+def test_config_fields_default_off_and_tunable():
+    from hummingbot.strategy_v2.controllers.ladder_hedge_controller_base import (
+        LadderHedgeControllerConfigBase,
+    )
+    f = LadderHedgeControllerConfigBase.model_fields
+    assert f["ib_breaker_enabled"].default is False          # ships OFF (read the pydantic default)
+    assert f["ib_breaker_threshold"].default == 10
+    assert f["ib_breaker_window_s"].default == 60.0
+    assert f["ib_breaker_probe_base_s"].default == 15.0
+    assert f["ib_breaker_probe_max_s"].default == 300.0
+    for name in ("ib_breaker_enabled", "ib_breaker_threshold", "ib_breaker_window_s",
+                 "ib_breaker_probe_base_s", "ib_breaker_probe_max_s"):
+        assert f[name].json_schema_extra == {"is_updatable": True}
+
+
+def test_accessors_coerce_malformed_config_without_crashing():
+    c = _ctl()
+    c.config.ib_breaker_threshold = 0            # < 1 -> default 10
+    c.config.ib_breaker_window_s = -5.0          # <= 0 -> default 60.0
+    c.config.ib_breaker_probe_base_s = "oops"    # non-numeric -> default 15.0
+    c.config.ib_breaker_probe_max_s = 5.0        # < base -> max(base, 300.0)
+    assert c._ib_threshold() == 10
+    assert c._ib_window_s() == 60.0
+    assert c._ib_probe_base() == 15.0
+    assert c._ib_probe_max() == 300.0
+    c.config.ib_breaker_probe_base_s = 40.0      # valid base
+    c.config.ib_breaker_probe_max_s = 20.0       # < base -> max(40, 300)
+    assert c._ib_probe_max() == 300.0
