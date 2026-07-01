@@ -1937,27 +1937,32 @@ class HyperliquidPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpe
         })
         self.exchange._api_post = api_post_mock
 
-        order_ids = self.exchange.batch_place_orders([
-            HyperliquidBatchOrderRequest(
-                trading_pair=self.trading_pair,
-                amount=Decimal("1"),
-                trade_type=TradeType.BUY,
-                order_type=OrderType.LIMIT_MAKER,
-                price=Decimal("100"),
-                position_action=PositionAction.OPEN,
-            ),
-            HyperliquidBatchOrderRequest(
-                trading_pair=self.trading_pair,
-                amount=Decimal("2"),
-                trade_type=TradeType.SELL,
-                order_type=OrderType.LIMIT_MAKER,
-                price=Decimal("101"),
-                position_action=PositionAction.OPEN,
-            ),
-        ])
-        self.async_run_with_timeout(asyncio.sleep(0))
+        with self.assertLogs(self.exchange.logger(), level="INFO") as log_records:
+            order_ids = self.exchange.batch_place_orders([
+                HyperliquidBatchOrderRequest(
+                    trading_pair=self.trading_pair,
+                    amount=Decimal("1"),
+                    trade_type=TradeType.BUY,
+                    order_type=OrderType.LIMIT_MAKER,
+                    price=Decimal("100"),
+                    position_action=PositionAction.OPEN,
+                ),
+                HyperliquidBatchOrderRequest(
+                    trading_pair=self.trading_pair,
+                    amount=Decimal("2"),
+                    trade_type=TradeType.SELL,
+                    order_type=OrderType.LIMIT_MAKER,
+                    price=Decimal("101"),
+                    position_action=PositionAction.OPEN,
+                ),
+            ])
+            self.async_run_with_timeout(asyncio.sleep(0))
 
         self.assertEqual(2, len(order_ids))
+        self.assertIn(
+            "Hyperliquid batch place accepted 2/2 LIMIT_MAKER orders",
+            "\n".join(log_records.output),
+        )
         api_post_mock.assert_awaited_once()
         submitted = api_post_mock.await_args.kwargs["data"]
         self.assertEqual("order", submitted["type"])
@@ -2006,6 +2011,51 @@ class HyperliquidPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpe
         submitted = api_post_mock.await_args.kwargs["data"]
         self.assertEqual(107, submitted["orders"][0]["asset"])
         self.assertEqual(order_ids[0], submitted["orders"][0]["cloid"])
+
+    def test_batch_place_orders_logs_only_resting_children_as_accepted(self):
+        self._simulate_trading_rules_initialized()
+        self.exchange._set_current_timestamp(1640780000)
+        self.exchange._perpetual_trading.set_leverage(self.trading_pair, 1)
+        self.exchange._api_post = AsyncMock(return_value={
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [
+                        {"resting": {"oid": 111}},
+                        {"error": "post only would cross"},
+                    ]
+                },
+            },
+        })
+
+        with self.assertLogs(self.exchange.logger(), level="INFO") as log_records:
+            order_ids = self.exchange.batch_place_orders([
+                HyperliquidBatchOrderRequest(
+                    trading_pair=self.trading_pair,
+                    amount=Decimal("1"),
+                    trade_type=TradeType.BUY,
+                    order_type=OrderType.LIMIT_MAKER,
+                    price=Decimal("100"),
+                    position_action=PositionAction.OPEN,
+                ),
+                HyperliquidBatchOrderRequest(
+                    trading_pair=self.trading_pair,
+                    amount=Decimal("2"),
+                    trade_type=TradeType.SELL,
+                    order_type=OrderType.LIMIT_MAKER,
+                    price=Decimal("101"),
+                    position_action=PositionAction.OPEN,
+                ),
+            ])
+            self.async_run_with_timeout(asyncio.sleep(0))
+
+        self.assertIn(
+            "Hyperliquid batch place accepted 1/2 LIMIT_MAKER orders",
+            "\n".join(log_records.output),
+        )
+        self.assertIn(order_ids[0], self.exchange.in_flight_orders)
+        self.assertNotIn(order_ids[1], self.exchange.in_flight_orders)
 
     def test_batch_place_orders_response_count_mismatch_reconciles_tracked_orders(self):
         self._simulate_trading_rules_initialized()
@@ -2160,19 +2210,56 @@ class HyperliquidPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpe
         })
         self.exchange._api_post = api_post_mock
 
-        returned_ids = self.exchange.batch_cancel_by_cloid([
-            HyperliquidBatchCancelRequest(client_order_id=order_ids[0], trading_pair=self.trading_pair),
-            HyperliquidBatchCancelRequest(client_order_id=order_ids[1], trading_pair=self.trading_pair),
-        ])
-        self.async_run_with_timeout(asyncio.sleep(0))
+        with self.assertLogs(self.exchange.logger(), level="INFO") as log_records:
+            returned_ids = self.exchange.batch_cancel_by_cloid([
+                HyperliquidBatchCancelRequest(client_order_id=order_ids[0], trading_pair=self.trading_pair),
+                HyperliquidBatchCancelRequest(client_order_id=order_ids[1], trading_pair=self.trading_pair),
+            ])
+            self.async_run_with_timeout(asyncio.sleep(0))
 
         self.assertEqual(order_ids, returned_ids)
+        self.assertIn("Hyperliquid batch cancel accepted 2/2 orders", "\n".join(log_records.output))
         api_post_mock.assert_awaited_once()
         submitted = api_post_mock.await_args.kwargs["data"]
         self.assertEqual("cancel", submitted["type"])
         self.assertEqual(order_ids[0], submitted["cancels"][0]["cloid"])
         self.assertEqual(order_ids[1], submitted["cancels"][1]["cloid"])
         self.assertEqual({}, self.exchange.in_flight_orders)
+
+    def test_batch_cancel_by_cloid_logs_only_success_children_as_accepted(self):
+        self._simulate_trading_rules_initialized()
+        self.exchange._set_current_timestamp(1640780000)
+        order_ids = ["0x00000000000000000000000000000001", "0x00000000000000000000000000000002"]
+        for order_id in order_ids:
+            self.exchange.start_tracking_order(
+                order_id=order_id,
+                exchange_order_id=None,
+                trading_pair=self.trading_pair,
+                trade_type=TradeType.BUY,
+                price=Decimal("100"),
+                amount=Decimal("1"),
+                order_type=OrderType.LIMIT_MAKER,
+                position_action=PositionAction.OPEN,
+            )
+        self.exchange._api_post = AsyncMock(return_value={
+            "status": "ok",
+            "response": {
+                "type": "cancel",
+                "data": {"statuses": ["success", {"error": CONSTANTS.UNKNOWN_ORDER_MESSAGE}]},
+            },
+        })
+        self.exchange._order_tracker.process_order_not_found = AsyncMock()
+
+        with self.assertLogs(self.exchange.logger(), level="INFO") as log_records:
+            self.exchange.batch_cancel_by_cloid([
+                HyperliquidBatchCancelRequest(client_order_id=order_ids[0], trading_pair=self.trading_pair),
+                HyperliquidBatchCancelRequest(client_order_id=order_ids[1], trading_pair=self.trading_pair),
+            ])
+            self.async_run_with_timeout(asyncio.sleep(0))
+
+        self.assertIn("Hyperliquid batch cancel accepted 1/2 orders", "\n".join(log_records.output))
+        self.assertNotIn(order_ids[0], self.exchange.in_flight_orders)
+        self.exchange._order_tracker.process_order_not_found.assert_awaited_once_with(order_ids[1])
 
     def test_batch_cancel_by_cloid_keeps_uncertain_error_children_tracked(self):
         self._simulate_trading_rules_initialized()

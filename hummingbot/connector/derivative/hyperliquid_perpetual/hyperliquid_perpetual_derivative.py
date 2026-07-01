@@ -711,6 +711,7 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         # length as the batched request and exposes per-child statuses as an array. Keep positional
         # mapping isolated here; any shape drift above is diverted to bounded reconciliation.
         # https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses
+        accepted_count = 0
         for cancel, status in zip(validated_cancels, statuses):
             client_order_id = cancel["client_order_id"]
             if status == "success" or (isinstance(status, dict) and status.get("success") is True):
@@ -721,6 +722,7 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
                     new_state=OrderState.CANCELED,
                 )
                 self._order_tracker.process_order_update(order_update)
+                accepted_count += 1
             elif isinstance(status, dict) and "error" in status and CONSTANTS.UNKNOWN_ORDER_MESSAGE in status["error"]:
                 await self._order_tracker.process_order_not_found(client_order_id)
             else:
@@ -731,6 +733,11 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
                     status,
                 )
                 await self._bounded_reconcile_client_order_ids([client_order_id])
+        self.logger().info(
+            "Hyperliquid batch cancel accepted %s/%s orders",
+            accepted_count,
+            len(validated_cancels),
+        )
 
     async def _execute_batch_place_orders(self, validated_orders: List[Dict[str, Any]]) -> None:
         api_orders = []
@@ -804,6 +811,7 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         # length as the batched request and exposes per-child statuses as an array. Keep positional
         # mapping isolated here; any shape drift above is diverted to bounded reconciliation.
         # https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses
+        accepted_count = 0
         for order, status in zip(validated_orders, statuses):
             client_order_id = order["client_order_id"]
             if "error" in status:
@@ -841,6 +849,12 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
                 new_state=OrderState.OPEN,
             )
             self._order_tracker.process_order_update(order_update)
+            accepted_count += 1
+        self.logger().info(
+            "Hyperliquid batch place accepted %s/%s LIMIT_MAKER orders",
+            accepted_count,
+            len(validated_orders),
+        )
 
     async def _bounded_reconcile_client_order_ids(self, client_order_ids: List[str]) -> None:
         unresolved_order_ids = [
