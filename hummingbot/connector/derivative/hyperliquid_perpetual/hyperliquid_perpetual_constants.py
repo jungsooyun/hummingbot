@@ -111,6 +111,9 @@ ORDER_STATE = {
     "liquidatedCanceled": OrderState.CANCELED,
 }
 
+# JEP-297 D2: seconds a modify-superseded old oid stays in the ignore-ledger before TTL purge.
+SUPERSEDED_OID_TTL_S = 120.0
+
 HEARTBEAT_TIME_INTERVAL = 30.0
 # Max time to wait for a websocket message before assuming the connection is half-open (no data, no close
 # frame) and forcing a keepalive ping / reconnection. Set above HEARTBEAT_TIME_INTERVAL so the periodic ping

@@ -96,6 +96,10 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         self._hyperliquid_batch_reconcile_order_ids = set()
         self._hyperliquid_batch_modify_ambiguous_order_ids = set()
         self._hyperliquid_batch_modify_rejected_order_ids = set()
+        # JEP-297 D2: old oids replaced by an in-flight/accepted batchModify. HL emits a WS
+        # "canceled" for the OLD oid while the SAME cloid lives on under a new oid; a canceled
+        # update matching one of these oids must not kill the live order's tracking.
+        self._hyperliquid_superseded_oids: Dict[str, float] = {}
         self._generated_cloids: Set[str] = set()
         # Builder code (HGP-87). Fee starts at 0 and is resolved at startup (_initialize_builder_fee).
         self._builder_address: str = CONSTANTS.FOUNDATION_BUILDER_ADDRESS.lower()
@@ -597,6 +601,20 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         """True iff this connector generated `cloid` this session."""
         return cloid in self._generated_cloids
 
+    def _record_superseded_oid(self, oid: str) -> None:
+        now = time.monotonic()
+        self._hyperliquid_superseded_oids[oid] = now
+        expired = [
+            k for k, ts in self._hyperliquid_superseded_oids.items()
+            if now - ts > CONSTANTS.SUPERSEDED_OID_TTL_S
+        ]
+        for k in expired:
+            self._hyperliquid_superseded_oids.pop(k, None)
+
+    def _unrecord_superseded_oid(self, oid: Optional[str]) -> None:
+        if oid is not None:
+            self._hyperliquid_superseded_oids.pop(oid, None)
+
     def _coin_from_trading_pair(self, trading_pair: str) -> str:
         exchange_symbol = self._trading_pair_to_exchange_symbol.get(trading_pair)
         if exchange_symbol is not None:
@@ -818,6 +836,22 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         self, validated_modifies: List[Dict[str, Any]]
     ) -> HyperliquidBatchModifyResult:
         submitted_order_ids = [modify["client_order_id"] for modify in validated_modifies]
+        # JEP-297 D2: record BEFORE the POST — closes the WS-before-REST-response race, where HL's
+        # WS "canceled" for the OLD oid can arrive before our own batchModify response is processed.
+        # Whole-batch failure paths below (transport except / malformed-response / count-mismatch)
+        # deliberately KEEP these records: those branches are all ambiguous — HL may have executed
+        # the batch anyway (e.g. timeout after acceptance) — so un-recording there would resurrect
+        # the original bug (unguarded WS canceled(old) -> false cancel -> orphan) with no self-heal.
+        # A stale record suppressing a genuine cancel of a never-superseded order DOES self-heal via
+        # the status-poll re-poll-by-cloid (Task 2) and the TTL. Only a per-slot "error" status
+        # proves supersession did not happen, so only that branch below un-records.
+        old_oid_by_client_id: Dict[str, str] = {}
+        for modify in validated_modifies:
+            tracked = self._order_tracker.fetch_tracked_order(modify["client_order_id"])
+            old_oid = getattr(tracked, "exchange_order_id", None)
+            if old_oid:
+                old_oid_by_client_id[modify["client_order_id"]] = str(old_oid)
+                self._record_superseded_oid(str(old_oid))
         api_modifies = [
             {
                 "oid": modify["client_order_id"],
@@ -894,6 +928,8 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
             elif isinstance(status, dict) and "error" in status:
                 self._hyperliquid_batch_modify_rejected_order_ids.add(client_order_id)
                 rejected_order_ids.append(client_order_id)
+                # Rejected slot -> supersession did not happen; the old oid is still the live oid.
+                self._unrecord_superseded_oid(old_oid_by_client_id.get(client_order_id))
             else:
                 self._hyperliquid_batch_modify_ambiguous_order_ids.add(client_order_id)
                 ambiguous_order_ids.append(client_order_id)
@@ -1504,7 +1540,19 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
             self.logger().debug(f"Ignoring order message with id {client_order_id}: not in in_flight_orders.")
             return
         current_state = order_msg["status"]
-        tracked_order.update_exchange_order_id(str(order_msg["order"]["oid"]))
+        msg_oid = str(order_msg["order"]["oid"])
+        if (
+            CONSTANTS.ORDER_STATE.get(current_state) == OrderState.CANCELED
+            and msg_oid in self._hyperliquid_superseded_oids
+        ):
+            self._hyperliquid_superseded_oids.pop(msg_oid, None)
+            self.logger().info(
+                "Ignoring modify-superseded WS cancel for oid %s (cloid %s lives on under a new oid).",
+                msg_oid,
+                client_order_id,
+            )
+            return
+        tracked_order.update_exchange_order_id(msg_oid)
         order_update: OrderUpdate = OrderUpdate(
             trading_pair=tracked_order.trading_pair,
             update_timestamp=order_msg["statusTimestamp"] * 1e-3,
