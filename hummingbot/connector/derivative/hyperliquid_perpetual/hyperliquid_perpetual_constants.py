@@ -54,6 +54,7 @@ TRADES_TYPE = "userFills"
 ORDER_STATUS_TYPE = "orderStatus"
 
 USER_STATE_TYPE = "clearinghouseState"
+FRONTEND_OPEN_ORDERS_TYPE = "frontendOpenOrders"
 SPOT_USER_STATE_TYPE = "spotClearinghouseState"
 USER_ABSTRACTION_TYPE = "userAbstraction"
 

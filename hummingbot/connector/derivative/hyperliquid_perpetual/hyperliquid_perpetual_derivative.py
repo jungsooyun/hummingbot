@@ -1,8 +1,9 @@
 import asyncio
 import hashlib
 import time
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, AsyncIterable, Dict, List, Literal, Mapping, Optional, Tuple
+from typing import Any, AsyncIterable, Dict, List, Literal, Mapping, Optional, Set, Tuple
 
 from bidict import bidict
 
@@ -39,6 +40,17 @@ from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 bpm_logger = None
+
+
+@dataclass
+class HyperliquidRestingOrder:
+    cloid: str
+    oid: int
+    coin: str
+    side: str
+    price: Decimal
+    size: Decimal
+    timestamp: float
 
 
 class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
@@ -84,6 +96,7 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         self._hyperliquid_batch_reconcile_order_ids = set()
         self._hyperliquid_batch_modify_ambiguous_order_ids = set()
         self._hyperliquid_batch_modify_rejected_order_ids = set()
+        self._generated_cloids: Set[str] = set()
         # Builder code (HGP-87). Fee starts at 0 and is resolved at startup (_initialize_builder_fee).
         self._builder_address: str = CONSTANTS.FOUNDATION_BUILDER_ADDRESS.lower()
         self._builder_fee_tenths_bps: int = 0
@@ -574,13 +587,55 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         )
         md5 = hashlib.md5()
         md5.update(order_id.encode('utf-8'))
-        return f"0x{md5.hexdigest()}"
+        cloid = f"0x{md5.hexdigest()}"
+        self._generated_cloids.add(cloid)
+        if len(self._generated_cloids) > 4096:
+            self._generated_cloids.pop()
+        return cloid
+
+    def is_own_cloid(self, cloid: str) -> bool:
+        """True iff this connector generated `cloid` this session."""
+        return cloid in self._generated_cloids
 
     def _coin_from_trading_pair(self, trading_pair: str) -> str:
         exchange_symbol = self._trading_pair_to_exchange_symbol.get(trading_pair)
         if exchange_symbol is not None:
             return exchange_symbol
         return trading_pair.rsplit("-", 1)[0]
+
+    def _dex_for_trading_pair(self, trading_pair: str) -> Optional[str]:
+        base = trading_pair.rsplit("-", 1)[0]
+        if ":" in base:
+            return base.split(":", 1)[0].lower()
+        return None
+
+    async def fetch_open_orders_by_cloid(self, trading_pair: str) -> List[HyperliquidRestingOrder]:
+        """Read-only resting-order enumeration for executor orphan sweep."""
+        coin = self._coin_from_trading_pair(trading_pair)
+        data = {
+            "type": CONSTANTS.FRONTEND_OPEN_ORDERS_TYPE,
+            "user": self.hyperliquid_perpetual_address,
+        }
+        dex = self._dex_for_trading_pair(trading_pair)
+        if dex:
+            data["dex"] = dex
+        raw = await self._api_post(path_url=CONSTANTS.EXCHANGE_INFO_URL, data=data)
+        orders: List[HyperliquidRestingOrder] = []
+        for order in raw or []:
+            if order.get("coin") != coin:
+                continue
+            if order.get("cloid") is None:
+                continue
+            orders.append(HyperliquidRestingOrder(
+                cloid=order["cloid"],
+                oid=int(order["oid"]),
+                coin=order["coin"],
+                side=order["side"],
+                price=Decimal(str(order["limitPx"])),
+                size=Decimal(str(order["sz"])),
+                timestamp=float(order.get("timestamp", 0)) * 1e-3,
+            ))
+        return orders
 
     def _validate_batch_order_requests(self, orders: List[HyperliquidBatchOrderRequest]) -> List[Dict[str, Any]]:
         if self._hyperliquid_batch_orders_disabled:
@@ -667,6 +722,34 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         order_ids = [cancel["client_order_id"] for cancel in validated_cancels]
         safe_ensure_future(self._execute_batch_cancel_by_cloid(validated_cancels))
         return order_ids
+
+    async def cancel_orders_by_cloid_unchecked(self, trading_pair: str, cloids: List[str]) -> None:
+        """Un-gated batch cancel for ORPHANS (untracked by design). SAFETY BOUNDARY:
+        every cloid MUST be one this connector generated this session (is_own_cloid) and
+        target this account's own asset. Session-scoped (in-memory ledger): within-session
+        orphans only; cross-boot orphans are the operator cancel-orphan path. Not reachable
+        from the normal cancel path."""
+        if not cloids:
+            return
+        for cloid in cloids:
+            if not self.is_own_cloid(cloid):
+                raise ValueError(f"cancel_orders_by_cloid_unchecked refused non-ledger cloid {cloid}.")
+        coin = self._coin_from_trading_pair(trading_pair)
+        if coin not in self.coin_to_asset:
+            raise ValueError(f"Coin {coin} not found in coin_to_asset mapping.")
+        asset = self.coin_to_asset[coin]
+        for i in range(0, len(cloids), 8):
+            chunk = cloids[i:i + 8]
+            api_cancels = [{"asset": asset, "cloid": cloid} for cloid in chunk]
+            try:
+                await self._api_post(
+                    path_url=CONSTANTS.CANCEL_ORDER_URL,
+                    data={"type": "cancel", "cancels": api_cancels},
+                    is_auth_required=True,
+                )
+            except Exception:
+                self.logger().exception("JEP-297 unchecked orphan cancel failed for %s.", chunk)
+        self.logger().info("JEP-297 swept %s orphan HL order(s) on %s.", len(cloids), trading_pair)
 
     def _validate_batch_modify_requests(self, modifies: List[HyperliquidBatchModifyRequest]) -> List[Dict[str, Any]]:
         if self._hyperliquid_batch_orders_disabled:

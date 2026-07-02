@@ -2226,6 +2226,55 @@ class HyperliquidPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpe
         self.assertEqual(order_ids[1], submitted["cancels"][1]["cloid"])
         self.assertEqual({}, self.exchange.in_flight_orders)
 
+    def test_fetch_open_orders_by_cloid_posts_frontend_type_and_filters_to_coin_dex(self):
+        # frontendOpenOrders returns ALL of the account's resting orders across coins/dexes;
+        # the method must POST type=frontendOpenOrders (+ user + dex) and filter to the maker coin.
+        from unittest.mock import AsyncMock
+        # HL frontendOpenOrders timestamps are MILLISECOND epochs (like every other HL ts).
+        self.coin = self.exchange._coin_from_trading_pair(self.trading_pair)
+        self.exchange._api_post = AsyncMock(return_value=[
+            {"coin": self.coin, "oid": 111, "cloid": "0xabc0000000000000000000000000dead", "side": "A",
+             "limitPx": "100.0", "sz": "1.0", "timestamp": 1_700_000_000_000},
+            {"coin": "OTHER", "oid": 222, "cloid": "0xdef0000000000000000000000000beef", "side": "B",
+             "limitPx": "5.0", "sz": "2.0", "timestamp": 1_700_000_000_000},
+        ])
+        result = self.async_run_with_timeout(
+            self.exchange.fetch_open_orders_by_cloid(self.trading_pair))
+        submitted = self.exchange._api_post.await_args.kwargs["data"]
+        self.assertEqual("frontendOpenOrders", submitted["type"])
+        self.assertIn("user", submitted)
+        # only the maker coin's order survives the filter
+        self.assertEqual(1, len(result))
+        self.assertEqual(111, result[0].oid)
+        self.assertEqual("0xabc0000000000000000000000000dead", result[0].cloid)
+        # timestamp normalized ms -> SECONDS (so the sweep age check compares like units)
+        self.assertEqual(1_700_000_000.0, result[0].timestamp)
+
+    def test_cancel_orders_by_cloid_unchecked_cancels_ledger_owned_untracked_cloid(self):
+        from unittest.mock import AsyncMock
+        self._simulate_trading_rules_initialized()
+        api = AsyncMock(return_value={"status": "ok",
+            "response": {"type": "cancel", "data": {"statuses": ["success"]}}})
+        self.exchange._api_post = api
+        # A cloid THIS connector generated (ledger) but which is NOT tracked (order lost/popped).
+        orphan = self.exchange._new_hyperliquid_client_order_id(is_buy=False, trading_pair=self.trading_pair)
+        self.assertTrue(self.exchange.is_own_cloid(orphan))   # generation recorded it
+        # (not in _order_tracker — the whole point is it is untracked)
+        self.async_run_with_timeout(
+            self.exchange.cancel_orders_by_cloid_unchecked(self.trading_pair, [orphan]))
+        submitted = api.await_args.kwargs["data"]
+        self.assertEqual("cancel", submitted["type"])
+        self.assertEqual(orphan, submitted["cancels"][0]["cloid"])
+
+    def test_cancel_orders_by_cloid_unchecked_rejects_non_ledger_cloid(self):
+        self.exchange._api_post = AsyncMock()
+        foreign = "0xdeadbeef00000000000000000000000000000000000000000000000000000001"  # never generated here
+        self.assertFalse(self.exchange.is_own_cloid(foreign))
+        with self.assertRaises(ValueError):
+            self.async_run_with_timeout(
+                self.exchange.cancel_orders_by_cloid_unchecked(self.trading_pair, [foreign]))
+        self.exchange._api_post.assert_not_awaited()
+
     def test_batch_cancel_by_cloid_logs_only_success_children_as_accepted(self):
         self._simulate_trading_rules_initialized()
         self.exchange._set_current_timestamp(1640780000)
