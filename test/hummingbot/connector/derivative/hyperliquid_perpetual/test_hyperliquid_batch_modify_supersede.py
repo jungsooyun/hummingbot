@@ -211,3 +211,57 @@ class HyperliquidBatchModifySupersedeTests(TestCase):
         self.exchange._process_order_message(ws_canceled_msg(OLD_OID, CLOID))
         self.assertNotIn(OLD_OID_STR, self.exchange._hyperliquid_superseded_oids)  # consumed
         self.assertEqual(0, len(self.order_cancelled_logger.event_log))            # and ignored
+
+    def test_request_order_status_repolls_by_cloid_for_superseded_oid(self):
+        self._track_open_order(CLOID, OLD_OID)
+        self.exchange._record_superseded_oid(str(OLD_OID))
+
+        def order_status_response(oid_or_cloid):
+            if oid_or_cloid == int(OLD_OID) or oid_or_cloid == str(OLD_OID):
+                return {"order": {"status": "canceled",
+                                  "order": {"oid": OLD_OID, "cloid": CLOID, "timestamp": 1782965273000}}}
+            return {"order": {"status": "open",
+                              "order": {"oid": NEW_OID, "cloid": CLOID, "timestamp": 1782965273500}}}
+
+        async def api_post_side_effect(*args, **kwargs):
+            return order_status_response(kwargs["data"]["oid"])
+
+        self.exchange._api_post = AsyncMock(side_effect=api_post_side_effect)
+
+        update = self._run(self.exchange._request_order_status(
+            self.exchange._order_tracker.fetch_tracked_order(CLOID)))
+
+        self.assertEqual(OrderState.OPEN, update.new_state)
+        self.assertEqual(str(NEW_OID), update.exchange_order_id)
+        # finding #1: the ledger entry must SURVIVE the re-poll (a late WS canceled(old)
+        # can still arrive; only the WS guard or the TTL may remove it)
+        self.assertIn(OLD_OID_STR, self.exchange._hyperliquid_superseded_oids)
+
+    def test_request_order_status_applies_genuine_cancel_when_no_successor_exists(self):
+        # stale ledger entry (e.g. modify transport failure, nothing superseded) must not
+        # strand tracking: re-poll by cloid returns the SAME canceled order -> CANCELED applies
+        self._track_open_order(CLOID, OLD_OID)
+        self.exchange._record_superseded_oid(OLD_OID_STR)
+        # _api_post: BOTH the oid-poll and the cloid-re-poll return canceled with oid=OLD_OID
+        self.exchange._api_post = AsyncMock(return_value={
+            "order": {"status": "canceled",
+                      "order": {"oid": OLD_OID, "cloid": CLOID, "timestamp": 1782965273000}}})
+
+        update = self._run(self.exchange._request_order_status(
+            self.exchange._order_tracker.fetch_tracked_order(CLOID)))
+
+        self.assertEqual(OrderState.CANCELED, update.new_state)
+
+    def test_request_order_status_genuine_cancel_still_cancels(self):
+        # no supersession recorded -> normal single-poll canceled path, no re-poll
+        self._track_open_order(CLOID, OLD_OID)
+        api_post_mock = AsyncMock(return_value={
+            "order": {"status": "canceled",
+                      "order": {"oid": OLD_OID, "cloid": CLOID, "timestamp": 1782965273000}}})
+        self.exchange._api_post = api_post_mock
+
+        update = self._run(self.exchange._request_order_status(
+            self.exchange._order_tracker.fetch_tracked_order(CLOID)))
+
+        self.assertEqual(OrderState.CANCELED, update.new_state)
+        api_post_mock.assert_awaited_once()  # no re-poll needed

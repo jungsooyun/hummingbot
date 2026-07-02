@@ -1423,8 +1423,30 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
                 "oid": int(exchange_order_id) if exchange_order_id else client_order_id
             })
         current_state = order_update["order"]["status"]
-        _exchange_order_id = str(tracked_order.exchange_order_id) if tracked_order.exchange_order_id else str(
-            order_update["order"]["order"]["oid"])
+        polled_oid = str(exchange_order_id) if exchange_order_id else None
+        repolled_by_cloid = False
+        if (
+            CONSTANTS.ORDER_STATE.get(current_state) == OrderState.CANCELED
+            and polled_oid is not None
+            and polled_oid in self._hyperliquid_superseded_oids
+        ):
+            # JEP-297 D2: the polled oid was replaced by a modify; re-resolve by cloid, which
+            # HL maps to the LATEST order carrying it (the live successor).
+            order_update = await self._api_post(
+                path_url=CONSTANTS.ORDER_URL,
+                data={
+                    "type": CONSTANTS.ORDER_STATUS_TYPE,
+                    "user": self.hyperliquid_perpetual_address,
+                    "oid": client_order_id,
+                })
+            current_state = order_update["order"]["status"]
+            repolled_by_cloid = True
+            # Do NOT un-record here (Codex review finding #1): a late WS canceled(old oid) may
+            # still arrive after this re-poll; the ledger entry must stay so the WS guard catches
+            # it. The WS guard consumes it; otherwise the TTL purges it.
+        _exchange_order_id = str(order_update["order"]["order"]["oid"]) if repolled_by_cloid else (
+            str(tracked_order.exchange_order_id) if tracked_order.exchange_order_id else str(
+                order_update["order"]["order"]["oid"]))
         _order_update: OrderUpdate = OrderUpdate(
             trading_pair=tracked_order.trading_pair,
             update_timestamp=order_update["order"]["order"]["timestamp"] * 1e-3,
