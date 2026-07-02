@@ -92,6 +92,20 @@ class Hip3KisLadderControllerConfig(LadderHedgeControllerConfigBase):
     hedge_fill_timeout_s: float = 6.0
     enable_hyperliquid_batch_orders: bool = False
 
+    # JEP-297 batch orphan-hardening knobs. These MUST be declared here AND forwarded in
+    # _build_executor_config, or setting them in the controller YAML is rejected (extra="forbid")
+    # and they stay pinned at the LadderMakerExecutorConfig defaults — the same "dead knob" failure
+    # mode noted for session_halt_cooldown_s / the pnl_breaker fields. Defaults mirror the executor
+    # (sweep OFF, backoff OFF, headroom OFF, cap 1, auction-disable True) so a batch-OFF controller
+    # is behavior-identical; set to non-default values only for a controlled batch re-smoke.
+    batch_sweep_interval_s: float = 0.0
+    batch_sweep_min_age_s: float = 5.0
+    batch_max_generations_per_side: int = 1
+    batch_margin_headroom_quote: Decimal = Decimal("0")
+    post_only_reject_backoff_count: int = 0
+    post_only_reject_window_s: float = 10.0
+    batch_disable_in_auction: bool = True
+
     # Two-sided MM
     two_sided: bool = False
     k_open_skew_bps: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
@@ -193,6 +207,13 @@ class Hip3KisLadderController(LadderHedgeControllerBase):
             min_reprice_delta_ticks=self.config.min_reprice_delta_ticks,
             maker_post_only=self.config.maker_post_only,
             enable_hyperliquid_batch_orders=self.config.enable_hyperliquid_batch_orders,
+            batch_sweep_interval_s=self.config.batch_sweep_interval_s,
+            batch_sweep_min_age_s=self.config.batch_sweep_min_age_s,
+            batch_max_generations_per_side=self.config.batch_max_generations_per_side,
+            batch_margin_headroom_quote=self.config.batch_margin_headroom_quote,
+            post_only_reject_backoff_count=self.config.post_only_reject_backoff_count,
+            post_only_reject_window_s=self.config.post_only_reject_window_s,
+            batch_disable_in_auction=self.config.batch_disable_in_auction,
             leverage=self.config.leverage,
             kill_switch=self.config.kill_switch,
             ws_staleness_kill_switch_enabled=self.config.ws_staleness_kill_switch_enabled,

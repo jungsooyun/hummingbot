@@ -158,6 +158,41 @@ class TestHip3KisLadderController(IsolatedAsyncioWrapperTestCase):
 
         self.assertIs(executor_config.enable_hyperliquid_batch_orders, True)
 
+    def test_jep297_batch_hardening_knobs_default_neutral(self):
+        # JEP-297: the orphan-sweep / cap / backoff / auction-gate knobs must REACH the executor
+        # config, or a batch re-smoke runs with every protection dead (the 22-orphan failure mode).
+        # Defaults mirror LadderMakerExecutorConfig: sweep OFF, backoff OFF, headroom OFF, cap 1,
+        # auction-disable True -> a batch-OFF controller is behavior-identical.
+        self.controller.executors_info = []
+        ec = self.controller.determine_executor_actions()[0].executor_config
+        self.assertEqual(0.0, ec.batch_sweep_interval_s)
+        self.assertEqual(5.0, ec.batch_sweep_min_age_s)
+        self.assertEqual(1, ec.batch_max_generations_per_side)
+        self.assertEqual(Decimal("0"), ec.batch_margin_headroom_quote)
+        self.assertEqual(0, ec.post_only_reject_backoff_count)
+        self.assertEqual(10.0, ec.post_only_reject_window_s)
+        self.assertIs(ec.batch_disable_in_auction, True)
+
+    def test_jep297_batch_hardening_knobs_passthrough(self):
+        # Without forwarding, setting these in the controller YAML is dead (or rejected by
+        # extra="forbid"); a re-smoke that assumes sweep=15/backoff=5 took effect would be invalid.
+        self.config.batch_sweep_interval_s = 15.0
+        self.config.batch_sweep_min_age_s = 3.0
+        self.config.batch_max_generations_per_side = 2
+        self.config.batch_margin_headroom_quote = Decimal("2500")
+        self.config.post_only_reject_backoff_count = 5
+        self.config.post_only_reject_window_s = 8.0
+        self.config.batch_disable_in_auction = False
+        self.controller.executors_info = []
+        ec = self.controller.determine_executor_actions()[0].executor_config
+        self.assertEqual(15.0, ec.batch_sweep_interval_s)
+        self.assertEqual(3.0, ec.batch_sweep_min_age_s)
+        self.assertEqual(2, ec.batch_max_generations_per_side)
+        self.assertEqual(Decimal("2500"), ec.batch_margin_headroom_quote)
+        self.assertEqual(5, ec.post_only_reject_backoff_count)
+        self.assertEqual(8.0, ec.post_only_reject_window_s)
+        self.assertIs(ec.batch_disable_in_auction, False)
+
     def test_adopt_existing_inventory_defaults_false(self):
         self.controller.executors_info = []
 
