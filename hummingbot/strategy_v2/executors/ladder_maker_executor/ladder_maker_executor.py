@@ -21,7 +21,7 @@ readiness check is kept as an explicit data gate to preserve current behavior.
 import math
 import logging
 from decimal import Decimal
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
@@ -145,6 +145,9 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         self._last_reprice_ts = 0.0
         self._last_observe_log_ts = 0.0
         self._last_observe: Optional[Dict] = None
+        self._last_orphan_sweep_ts = 0.0
+        self._submitted_maker_cloids: Set[str] = set()
+        self._post_only_reject_ts: List[float] = []
         # Kill-switch flows through the composable chain; JEP-133 appends the
         # staleness / trading-hours / order-cap gates to this same chain.
         # KillSwitchGate (manual + auto hedge kill-switch) AND a HARD inventory cap:
@@ -525,6 +528,8 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         if self._rate_halted:
             # JEP-221 breaker latched: makers already cancelled on trip; place nothing.
             return
+        if self._in_post_only_backoff():
+            return
         if self._is_two_sided() and getattr(self.config, "wind_down", False):
             targets = self._compute_targets()
             if not self._should_reprice(targets):
@@ -533,6 +538,9 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             self._place_targets(targets)
             return
         targets = self._compute_targets()
+        self._target_count_by_side = {}
+        for target in targets:
+            self._target_count_by_side[target.side] = self._target_count_by_side.get(target.side, 0) + 1
         if self._try_hyperliquid_batch_modify(targets):
             return
         return super()._reconcile_maker()
@@ -553,17 +561,170 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         self._last_reprice_ts = self._strategy.current_timestamp
 
     def _hyperliquid_batch_orders_enabled(self) -> bool:
-        if not getattr(self.config, "enable_hyperliquid_batch_orders", False):
+        if getattr(self.config, "enable_hyperliquid_batch_orders", False) is not True:
             return False
         if not getattr(self.config, "maker_post_only", True):
             return False
         connector = self.connectors.get(self.maker_connector)
-        return (
+        supported = (
             self.maker_connector == "hyperliquid_perpetual"
             and connector is not None
             and hasattr(connector, "batch_place_orders")
             and hasattr(connector, "batch_cancel_by_cloid")
         )
+        if not supported:
+            return False
+        if self._batch_disabled_by_auction_or_halt():
+            return False
+        return True
+
+    def _batch_disabled_by_auction_or_halt(self) -> bool:
+        if not getattr(self.config, "batch_disable_in_auction", True):
+            return False
+        halt_state = getattr(self, "_session_halt_state", None)
+        if getattr(halt_state, "halted", False):
+            return True
+        calendar = getattr(self, "_calendar", None)
+        if calendar is not None and hasattr(calendar, "in_auction_window"):
+            return bool(calendar.in_auction_window(getattr(self._strategy, "current_timestamp", 0.0)))
+        return False
+
+    def _stuck_maker_adoption_enabled(self) -> bool:
+        if self._hyperliquid_batch_orders_enabled():
+            return True
+        return getattr(self.config, "reconcile_stuck_makers_enabled", False)
+
+    def _hyperliquid_orphan_sweep_enabled(self) -> bool:
+        if getattr(self.config, "batch_sweep_interval_s", 0.0) <= 0:
+            return False
+        if getattr(self.config, "enable_hyperliquid_batch_orders", False) is not True:
+            return False
+        connector = self.connectors.get(self.maker_connector)
+        return (
+            self.maker_connector == "hyperliquid_perpetual"
+            and connector is not None
+            and hasattr(connector, "fetch_open_orders_by_cloid")
+            and hasattr(connector, "cancel_orders_by_cloid_unchecked")
+            and hasattr(connector, "is_own_cloid")
+        )
+
+    def _select_orphans(self, resting: list, now: float) -> list:
+        owned = getattr(self, "_submitted_maker_cloids", set())
+        grace = getattr(self.config, "batch_sweep_min_age_s", 5.0)
+        orphans = []
+        for order in resting:
+            if order.cloid not in owned:
+                continue
+            if order.cloid in self.maker_orders:
+                continue
+            if (now - float(order.timestamp)) < grace:
+                continue
+            orphans.append(order.cloid)
+        return orphans
+
+    def _run_orphan_sweep(self) -> None:
+        if not self._hyperliquid_orphan_sweep_enabled():
+            return
+        safe_ensure_future(self._async_orphan_sweep())
+
+    async def _async_orphan_sweep(self) -> None:
+        connector = self.connectors[self.maker_connector]
+        resting = await connector.fetch_open_orders_by_cloid(self.maker_trading_pair)
+        now = self._strategy.current_timestamp
+        orphans = self._select_orphans(resting, now)
+        if orphans:
+            self.logger().warning("JEP-297 sweeping %s orphan HL order(s): %s", len(orphans), orphans)
+            await connector.cancel_orders_by_cloid_unchecked(self.maker_trading_pair, orphans)
+            for cloid in orphans:
+                self._submitted_maker_cloids.discard(cloid)
+
+    def _maybe_sweep_orphan_makers(self) -> None:
+        interval = getattr(self.config, "batch_sweep_interval_s", 0.0)
+        if interval <= 0:
+            return
+        now = self._strategy.current_timestamp
+        last = getattr(self, "_last_orphan_sweep_ts", 0.0)
+        if now - last < interval:
+            return
+        self._last_orphan_sweep_ts = now
+        self._run_orphan_sweep()
+
+    def _side_order_counts(self) -> dict:
+        counts = {}
+        placed = getattr(self, "_maker_placed_rung", {})
+        for order_id in self.maker_orders:
+            side = placed.get(order_id, (None,))[0]
+            if side is not None:
+                counts[side] = counts.get(side, 0) + 1
+        return counts
+
+    def _maker_quote_asset(self) -> str:
+        return str(self.maker_trading_pair).rsplit("-", 1)[1]
+
+    def _has_batch_margin_headroom(self) -> bool:
+        reserve = _as_decimal_or_none(getattr(self.config, "batch_margin_headroom_quote", Decimal("0"))) or ZERO
+        if reserve <= ZERO:
+            return True
+        connector = self.connectors[self.maker_connector]
+        free = connector.get_available_balance(self._maker_quote_asset())
+        if free < reserve:
+            self.logger().warning(
+                "Skipping HL batch place: free maker collateral %s below JEP-297 headroom %s.",
+                free,
+                reserve,
+            )
+            return False
+        return True
+
+    def _filter_targets_by_batch_capacity(self, targets: List[RungTarget]) -> List[RungTarget]:
+        generation_cap = getattr(self.config, "batch_max_generations_per_side", 1)
+        full_counts = getattr(self, "_target_count_by_side", {})
+        current_counts = self._side_order_counts()
+        incoming_counts = {}
+        for target in targets:
+            incoming_counts[target.side] = incoming_counts.get(target.side, 0) + 1
+
+        remaining_by_side = {}
+        for side, incoming_count in incoming_counts.items():
+            allowed = full_counts.get(side, incoming_count) * generation_cap
+            remaining_by_side[side] = max(0, allowed - current_counts.get(side, 0))
+
+        kept = []
+        used_by_side = {}
+        for target in targets:
+            used = used_by_side.get(target.side, 0)
+            if used >= remaining_by_side.get(target.side, 0):
+                continue
+            kept.append(target)
+            used_by_side[target.side] = used + 1
+        return kept
+
+    def _note_post_only_reject(self) -> None:
+        timestamps = getattr(self, "_post_only_reject_ts", None)
+        if timestamps is None:
+            timestamps = []
+            self._post_only_reject_ts = timestamps
+        timestamps.append(self._strategy.current_timestamp)
+
+    def _in_post_only_backoff(self) -> bool:
+        threshold = getattr(self.config, "post_only_reject_backoff_count", 0)
+        if threshold <= 0:
+            return False
+        window = getattr(self.config, "post_only_reject_window_s", 10.0)
+        now = self._strategy.current_timestamp
+        timestamps = [ts for ts in getattr(self, "_post_only_reject_ts", []) if now - ts < window]
+        self._post_only_reject_ts = timestamps
+        return len(timestamps) >= threshold
+
+    def process_order_failed_event(self, event_tag, market, event):
+        if getattr(event, "order_type", None) is OrderType.LIMIT_MAKER:
+            message = " ".join(
+                str(part or "")
+                for part in (getattr(event, "error_message", None), getattr(event, "error_type", None))
+            ).lower()
+            if "post only" in message or "immediately match" in message or "immediately matched" in message:
+                self._note_post_only_reject()
+        return super().process_order_failed_event(event_tag, market, event)
 
     def _hyperliquid_batch_modify_enabled(self) -> bool:
         if not self._hyperliquid_batch_orders_enabled():
@@ -586,8 +747,6 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
 
         connector = self.connectors[self.maker_connector]
         open_makers = self._open_maker_orders()
-        if len(open_makers) != len(targets):
-            return False
 
         pending_ids = getattr(self, "_hyperliquid_batch_modify_pending_order_ids", set())
         current_order_ids = [order.order_id for order in open_makers]
@@ -623,28 +782,55 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
         targets_by_side = {}
         for target in targets:
             targets_by_side.setdefault(target.side, []).append(target)
-        if set(maker_by_side.keys()) != set(targets_by_side.keys()):
-            return False
 
         matched = []
-        for side in targets_by_side:
-            side_makers = sorted(maker_by_side[side], key=lambda tracked: tracked.order.price)
-            side_targets = sorted(targets_by_side[side], key=lambda target: target.price)
-            if len(side_makers) != len(side_targets):
-                return False
-            for tracked, target in zip(side_makers, side_targets):
-                order = tracked.order
+        unmatched_targets = []
+        unmatched_makers = []
+        for side, side_makers_raw in maker_by_side.items():
+            side_makers = sorted(side_makers_raw, key=lambda tracked: tracked.order.price)
+            side_targets = sorted(targets_by_side.get(side, []), key=lambda target: target.price)
+            used_makers = set()
+            for target in side_targets:
                 trade_type, position_action = self._target_side_and_position_action(target)
-                if (
-                    order.amount != target.size
-                    or order.trade_type is not trade_type
-                    or order.position != position_action
-                ):
-                    return False
+                found = None
+                for index, tracked in enumerate(side_makers):
+                    if index in used_makers:
+                        continue
+                    order = tracked.order
+                    if (
+                        order.amount == target.size
+                        and order.trade_type is trade_type
+                        and order.position == position_action
+                    ):
+                        found = (index, tracked, trade_type, position_action)
+                        break
+                if found is None:
+                    unmatched_targets.append(target)
+                    continue
+                index, tracked, trade_type, position_action = found
+                used_makers.add(index)
                 matched.append((tracked.order_id, target, trade_type, position_action))
+            for index, tracked in enumerate(side_makers):
+                if index not in used_makers:
+                    unmatched_makers.append(tracked.order_id)
+        for side, side_targets in targets_by_side.items():
+            if side not in maker_by_side:
+                unmatched_targets.extend(side_targets)
 
         if not matched:
             return False
+
+        for order_id, target, trade_type, position_action in matched:
+            tracked = next((maker for maker in open_makers if maker.order_id == order_id), None)
+            if tracked is None:
+                return False
+            order = tracked.order
+            if (
+                order.amount != target.size
+                or order.trade_type is not trade_type
+                or order.position != position_action
+            ):
+                return False
 
         if marked_for_repair:
             fallback_ids = [
@@ -662,6 +848,11 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             if hasattr(connector, "clear_hyperliquid_batch_modify_ambiguous"):
                 connector.clear_hyperliquid_batch_modify_ambiguous(fallback_ids)
             return True
+
+        if unmatched_makers:
+            self._cancel_maker_order_ids(unmatched_makers)
+        if unmatched_targets:
+            self._place_targets_subset(unmatched_targets)
 
         requests = [
             HyperliquidBatchModifyRequest(
@@ -722,6 +913,11 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             return
         if not self._hyperliquid_batch_orders_enabled():
             return super()._place_targets_subset(targets)
+        if not self._has_batch_margin_headroom():
+            return
+        targets = self._filter_targets_by_batch_capacity(targets)
+        if not targets:
+            return
 
         connector = self.connectors[self.maker_connector]
         for i in range(0, len(targets), 8):
@@ -756,6 +952,9 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
                 return
             for order_id, (target, _side, position_action) in zip(order_ids, request_contexts):
                 self.maker_orders[order_id] = TrackedOrder(order_id=order_id)
+                if not hasattr(self, "_submitted_maker_cloids"):
+                    self._submitted_maker_cloids = set()
+                self._submitted_maker_cloids.add(order_id)
                 self._record_placed_rung(order_id, target)
                 if position_action == PositionAction.OPEN:
                     if not hasattr(self, "_maker_placed_edge_bps"):
@@ -771,10 +970,14 @@ class LadderMakerExecutor(CrossVenueHedgedExecutorBase):
             return super()._cancel_maker_order_ids(order_ids)
         connector = self.connectors[self.maker_connector]
         try:
-            connector.batch_cancel_by_cloid([
+            cancelled = connector.batch_cancel_by_cloid([
                 HyperliquidBatchCancelRequest(client_order_id=order_id, trading_pair=self.maker_trading_pair)
                 for order_id in order_ids
             ])
+            submitted = getattr(self, "_submitted_maker_cloids", set())
+            for order_id in cancelled:
+                submitted.discard(order_id)
+            self._submitted_maker_cloids = submitted
         except Exception:
             self.logger().exception("Hyperliquid batch cancel validation failed; falling back to single-order path.")
             return super()._cancel_maker_order_ids(order_ids)

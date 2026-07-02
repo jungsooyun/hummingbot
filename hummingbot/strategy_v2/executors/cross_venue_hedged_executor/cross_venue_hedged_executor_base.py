@@ -537,6 +537,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
             # blocks or raises into the loop.
             self._record_heartbeat()
             self._maybe_snapshot_account_truth(getattr(getattr(self, "_strategy", None), "current_timestamp", None))
+            self._maybe_sweep_orphan_makers()
             # JEP-233: the maker-side path (seed / session+staleness evaluation /
             # _reconcile_maker) must never skip hedging. A persistent exception here would
             # otherwise leave maker fills unhedged -> a naked perp leg, with no kill-switch
@@ -1399,7 +1400,7 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
         Net invariant: this only ever ADOPTS orders the connector is actually tracking; it never
         places, re-places, or cancels a maker -> no over-quote, no orphan, no naked exposure.
         """
-        if not getattr(self.config, "reconcile_stuck_makers_enabled", False):
+        if not self._stuck_maker_adoption_enabled():
             return
         for order_id, tracked in list(self.maker_orders.items()):
             if tracked.order is not None:
@@ -1410,6 +1411,12 @@ class CrossVenueHedgedExecutorBase(ExecutorBase):
                 # Never reap/cancel here — see docstring. Wait for the next tick.
                 continue
             tracked.order = in_flight
+
+    def _stuck_maker_adoption_enabled(self) -> bool:
+        return getattr(self.config, "reconcile_stuck_makers_enabled", False)
+
+    def _maybe_sweep_orphan_makers(self) -> None:
+        return
 
     def _process_hedges(self) -> None:
         self._ensure_direction_accounting()

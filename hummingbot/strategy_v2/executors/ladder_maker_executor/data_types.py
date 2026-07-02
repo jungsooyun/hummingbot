@@ -85,6 +85,22 @@ class LadderMakerExecutorConfig(ExecutorConfigBase):
     # orphaned). False (default) = current behavior (resolve only on a created/filled/cancelled
     # event). Mirrors the hedge leg's always-on _reconcile_stuck_hedges.
     reconcile_stuck_makers_enabled: bool = False
+    # JEP-297: HL batch orphan-hardening knobs (all additive, default off/neutral).
+    # 0b exchange open-order sweep cadence. 0.0 = OFF (only runs when > 0 AND batch enabled).
+    batch_sweep_interval_s: float = 0.0
+    # 0b anti-race: only sweep-cancel a resting orphan older than this (never a fresh place).
+    batch_sweep_min_age_s: float = 5.0
+    # 0c over-commit cap: max concurrent (resting + inflight) maker generations per side vs the
+    # target count. 1 = never hold more than the target set (the primary margin-exhaustion guard).
+    batch_max_generations_per_side: int = 1
+    # 0c margin headroom: skip a batch place if free maker collateral < this reserve. 0 = OFF.
+    batch_margin_headroom_quote: Decimal = Decimal("0")
+    # 1a post_only reject-rate backoff: after this many LIMIT_MAKER rejects within the window,
+    # skip reprice (place nothing new) until the window clears. 0 = OFF.
+    post_only_reject_backoff_count: int = 0
+    post_only_reject_window_s: float = 10.0
+    # 1b: disable the batch path (fall back to single-order) during an auction/halt window.
+    batch_disable_in_auction: bool = True
 
     # Perp leverage (HIP-3 markets: isolated only)
     leverage: int = 1
